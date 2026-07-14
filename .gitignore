@@ -2,7 +2,8 @@ runs/
 __pycache__/
 *.pyc
 caption_caches/
-mixed_views/
+visual_indexes/
+query_caches/
 .pytest_cache/
 *.egg-info/
 .env

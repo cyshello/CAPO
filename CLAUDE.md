@@ -814,29 +814,31 @@ large experiment.
 
 Follow this sequence.
 
-### Phase 0: inspect and preserve baseline
+### Phase 0: inspect and preserve baseline [Done]
 
 - inspect DVD;
 - inspect installed official GEPA API;
 - run and save one unchanged DVD baseline;
 - write a concrete integration plan before editing core logic.
 
-### Phase 1: instrumentation
+### Phase 1: instrumentation [Done]
 
 - standardize QA run records;
 - expose trajectories and exact segment IDs;
 - add prompt-versioned caption caching;
 - save split manifests.
 
-### Phase 2: evaluator abstraction
+### Phase 2: evaluator abstraction [Code done — see §29]
 
-- implement one shared DVD candidate-evaluation interface;
-- implement full rollout;
-- implement selective surrogate rollout;
-- add cache and reference tests.
+- Refer to @PHASE2_3_SURROGATE.md
+- implement one shared DVD candidate-evaluation interface; [Done]
+- implement full rollout; [Done]
+- implement selective surrogate rollout; [Done]
+- add cache and reference tests. [Done — 78 tests pass]
 
-### Phase 3: fidelity experiment
+### Phase 3: fidelity experiment [Runner ready — GPU run pending]
 
+- Refer to @PHASE2_3_SURROGATE.md
 - freeze one candidate list;
 - run the same candidates in both modes;
 - produce ranking, fidelity, and cost reports.
@@ -946,3 +948,69 @@ Complete when:
 - held-out test evaluation uses full rollout;
 - accuracy, fidelity, and cost results are reproducible;
 - no test example influenced GEPA reflection or selection.
+
+---
+
+## 29. Phase 2 implementation notes (2026-07-14)
+
+Implemented per @PHASE2_3_SURROGATE.md. Layout:
+
+```text
+evaluation/rollout_evaluator.py   EvaluationRequest/EvaluationResult, SelectionBudget,
+                                  RolloutEvaluator protocol, fallback constants
+evaluation/dvd_qa.py              THE shared DVD reasoning path (both evaluators call
+                                  run_dvd_qa over a materialized captions.json; vector DB
+                                  keyed database_c{content_hash16}.json because DVD's
+                                  init_single_video_db blindly reuses an existing DB file)
+evaluation/full_rollout.py        FullRolloutEvaluator (ground truth)
+evaluation/selective_rollout.py   SelectiveSurrogateRolloutEvaluator
+captioning/candidate_captions.py  candidate-prompt clip captioning via vendored
+                                  _pending_tasks/_caption_inprocess with set_prompts/reset;
+                                  strong-key harness cache (caption_caches/<vid>/p*_d*_s*/ckpt),
+                                  legacy ckpt prefill (read-only source), placeholder validation
+mixed_views/builder.py            MixedViewBuilder + write_captions_json (assert_writable
+                                  guard); registry re-merged over mixed per-clip registries,
+                                  merge_fn injectable (default codex merge)
+selection/{base,trace,union,budget}.py  ClipSelector protocol, TraceReferenceSelector,
+                                  6 SELECTION_POLICIES, provenance-priority budget enforcement,
+                                  RandomBudgetMatchedSelector (deterministic seed)
+retrieval/visual_index.py         cached SigLIP index (google/siglip-so400m-patch14-384,
+                                  already in HF cache); frame-source-hashed cache key
+retrieval/{question,prompt_delta}_queries.py  codex text LLM -> JSON queries, file-cached
+retrieval/clip_retriever.py       max-over-frames/queries cosine retrieval
+scripts/build_visual_index.py     precompute per-video index (--split train --gpu N)
+scripts/run_phase2_sanity_check.py  PHASE2_3 §13 runner (resumable results.jsonl)
+```
+
+Key facts for future sessions:
+
+- One reasoning path: `run_dvd_qa` replicates run_dvd steps 3-5 only; captioning
+  happens in the evaluators. Reasoning-side prompts are reset to DVD defaults.
+- Frames are prompt-independent: legacy `run_workspace/<vid>/frames_fps1` is reused
+  (read-only) via symlink `work_root/<vid>/frames` for frame_inspect.
+- Fallback taxonomy recorded per result: none / clip_only / full_rollout / unsupported.
+  Zero-trace QAs (browse-only trajectories, 2 of 6 in Phase 1) go clip_only when the
+  policy has retrieval, else configured full_rollout/unsupported.
+- random_budget_matched is budget-matched to trace_plus_prompt_delta_clip's selected
+  count per (QA, candidate) by the sanity runner.
+- Baseline snapshot + baseline trajectories come from stage 0 of the sanity runner
+  (FullRolloutEvaluator with the baseline prompt; legacy ckpt prefill makes it caption-free).
+- Candidate prompt set for the sanity check: 6 caption_prompt variants in
+  prompt_sensitivity/prompts/DVD/captioner_drift/prompts.json (all contain the 3
+  required placeholders).
+- Tests: 78 passing (`conda run -n local_llm_vllm python -m pytest surrogate_rollout/tests`
+  from the parent directory).
+
+Next step (Phase 2/3 GPU run):
+
+```bash
+conda run -n local_llm_vllm python -m surrogate_rollout.scripts.build_visual_index \
+    --indices 9,12 --gpu 2
+conda run -n local_llm_vllm python -m surrogate_rollout.scripts.run_phase2_sanity_check \
+    --indices 9,10,11,12,13,14 --gpu 2 \
+    --candidate-names "Perceptual only,Entity centric,Dense exhaustive"
+```
+
+Costs to expect: full rollout re-captions every clip per candidate x video (~184-190
+clips/video); the codex subject-registry merge runs once per materialized caption view
+(full and mixed). vLLM engine is shared in-process across the whole sanity run.

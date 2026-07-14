@@ -1,0 +1,222 @@
+"""The single shared DVD reasoning path for Phase 2 evaluators.
+
+Both FullRolloutEvaluator and SelectiveSurrogateRolloutEvaluator run QA through
+`run_dvd_qa` over an already-materialized captions.json view — the only thing
+that differs between modes is how that view was produced (CLAUDE.md §8/§10:
+never duplicate the agent loop per mode).
+
+This reproduces steps 3-5 of prompt_sensitivity.dvd_prompt.run_dvd (frames
+link, VIDEO_FPS, vector DB, DVDCoreAgent) without the captioning step, and with
+the vector DB keyed by the exact captions.json content hash (PHASE2_3 §2:
+init_single_video_db reuses an existing DB file blindly, so the path must be
+unique per caption content). Prompt overrides are reset first: candidate
+caption prompts influence captions only, never the reasoning-side prompts.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+from surrogate_rollout import config
+from surrogate_rollout.cache.caption_cache import captions_content_hash
+from surrogate_rollout.evaluation.qa_metrics import score_mcq
+from surrogate_rollout.schemas import DVDRunResult, ReferenceSets
+
+for _p in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+_BACKEND_INSTALLED = False
+
+
+def ensure_backend(
+    gpu: str | None = None,
+    *,
+    tool_calling_model: str = config.ORCHESTRATOR_TOOL_MODEL,
+    inference_model: str = config.TEXT_FALLBACK_MODEL,
+    use_openai_tools: bool = True,
+) -> None:
+    """Install the codex+Qwen+BGE backend once per process (idempotent).
+
+    Must run before any captioning or QA call; the vLLM engine itself is still
+    lazy (built on first vision call)."""
+    global _BACKEND_INSTALLED
+    if gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    if _BACKEND_INSTALLED:
+        return
+    import dvd.config as dvd_config
+    from dvd_backend import install_backend
+
+    dvd_config.LITE_MODE = False
+    install_backend(
+        inference_model,
+        tool_vlm_max_frames=config.TOOL_VLM_MAX_FRAMES,
+        tool_calling_model=tool_calling_model,
+        use_openai_tools=use_openai_tools,
+        tensor_parallel_size=1,
+    )
+    _BACKEND_INSTALLED = True
+
+
+def resolve_frames_dir(sample: dict, video_id: str) -> str:
+    """Decoded-frame directory for the video: reuse the legacy workspace's
+    frames_fps{f} (read-only) when present, else decode into the legacy
+    workspace layout once. Frames are prompt-independent, so sharing them
+    across candidates is safe."""
+    fps_tag = f"fps{config.SAMPLE_FPS:g}"
+    legacy = os.path.join(config.DVD_RUN_WORKSPACE, video_id, f"frames_{fps_tag}")
+    if os.path.isdir(legacy) and os.listdir(legacy):
+        return legacy
+    from dvd_captioning import decode_frames_at_fps
+
+    decode_frames_at_fps(sample["video_path"], legacy, config.SAMPLE_FPS)
+    return legacy
+
+
+def prepare_video_workdir(work_root: str, video_id: str, sample: dict) -> str:
+    """Create work_root/<video_id> with a `frames` symlink so frame_inspect
+    (video_file_root = dirname(dirname(captions.json))) finds decoded frames."""
+    workdir = os.path.join(work_root, video_id)
+    os.makedirs(workdir, exist_ok=True)
+    frames_dir = resolve_frames_dir(sample, video_id)
+    link = os.path.join(workdir, "frames")
+    if os.path.islink(link):
+        if os.readlink(link) != frames_dir:
+            os.unlink(link)
+            os.symlink(frames_dir, link)
+    elif not os.path.exists(link):
+        os.symlink(frames_dir, link)
+    return workdir
+
+
+def effective_fps_for(sample: dict, video_id: str) -> float:
+    from dvd_captioning import video_duration_seconds
+
+    frames_dir = resolve_frames_dir(sample, video_id)
+    n = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+    return n / video_duration_seconds(sample["video_path"])
+
+
+def database_path_for(captions_path: str) -> str:
+    """Vector-DB path keyed by the exact captions.json content hash."""
+    h = captions_content_hash(captions_path)
+    workdir = os.path.dirname(os.path.dirname(captions_path))
+    return os.path.join(workdir, f"database_c{h[:16]}.json")
+
+
+def format_question(sample: dict) -> str:
+    from dvd_prompt import DEFAULT_MCQ_INSTRUCTION, _format_question
+
+    return _format_question(sample, DEFAULT_MCQ_INSTRUCTION)
+
+
+def run_dvd_qa(
+    *,
+    captions_path: str,
+    sample: dict,
+    run_dir: str,
+    question_id: str,
+    database_path: str | None = None,
+    max_iterations: int = config.MAX_ITERATIONS,
+    gpu: str | None = None,
+) -> DVDRunResult:
+    """Run one QA through the unchanged DVD agent over `captions_path`.
+
+    Writes the same artifact set as dvd_runner.run_qa_instrumented
+    (result.json / trajectory.jsonl / tool_events.jsonl / llm_calls.jsonl /
+    references.json). Failures land as machine-readable error records with a
+    0.0 score (CLAUDE.md §24)."""
+    ensure_backend(gpu)
+    import dvd.config as dvd_config
+    from dvd.dvd_core import DVDCoreAgent
+    from dvd.utils import extract_answer
+    from dvd_prompt import reset_prompts
+
+    from surrogate_rollout import instrumentation
+    from surrogate_rollout.references.extractor import extract_references
+
+    os.makedirs(run_dir, exist_ok=True)
+    video_id = sample.get("extra", {}).get("videoID") or sample["sample_id"]
+    reset_prompts()  # reasoning-side prompts stay DVD defaults in Phase 2
+
+    # frames link must exist next to the captions dir (frame_inspect resolves
+    # video_file_root = dirname(dirname(captions_path)))
+    workdir = os.path.dirname(os.path.dirname(captions_path))
+    link = os.path.join(workdir, "frames")
+    if not os.path.exists(link):
+        os.makedirs(workdir, exist_ok=True)
+        os.symlink(resolve_frames_dir(sample, video_id), link)
+
+    dvd_config.VIDEO_FPS = effective_fps_for(sample, video_id)
+    db_path = database_path or database_path_for(captions_path)
+    question = format_question(sample)
+
+    with open(captions_path) as f:
+        captions = json.load(f)
+    clip_keys = [k for k in captions
+                 if k not in ("subject_registry", "character_registry")]
+
+    recorder = instrumentation.install()
+    t0 = time.time()
+    messages: list[dict] = []
+    errors: list[dict] = []
+    try:
+        agent = DVDCoreAgent(db_path, captions_path, max_iterations)
+        messages = agent.run(question)
+    except Exception as e:
+        import traceback
+
+        errors.append({"stage": "dvd_qa", "type": type(e).__name__,
+                       "error": str(e), "traceback": traceback.format_exc()})
+    finally:
+        latency = time.time() - t0
+        recorder.uninstall()
+
+    try:
+        refs = extract_references(messages, recorder.tool_events, clip_keys)
+    except Exception as e:
+        refs = ReferenceSets()
+        errors.append({"stage": "reference_extraction",
+                       "type": type(e).__name__, "error": str(e)})
+
+    raw_answer = extract_answer(messages[-1]) if messages else None
+    gold = sample.get("answer")
+    score, parsed, failure_kind = score_mcq(raw_answer, gold)
+    if failure_kind == "parse_failure":
+        errors.append({"stage": "answer_parsing", "type": "ParseFailure",
+                       "error": f"no option letter in {raw_answer!r}"})
+
+    result = DVDRunResult(
+        question_id=question_id,
+        video_id=video_id,
+        prediction=raw_answer,
+        parsed_answer=parsed,
+        ground_truth=gold,
+        score=score,
+        trajectory=messages,
+        references=refs,
+        total_segments=len(clip_keys),
+        token_usage=recorder.token_usage_summary(),
+        latency_seconds=latency,
+        caption_cache_tag=os.path.basename(os.path.dirname(captions_path)),
+        captions_path=captions_path,
+        database_path=db_path,
+        errors=errors,
+    )
+
+    recorder.dump(os.path.join(run_dir, "tool_events.jsonl"),
+                  os.path.join(run_dir, "llm_calls.jsonl"))
+    with open(os.path.join(run_dir, "trajectory.jsonl"), "w") as f:
+        for m in messages:
+            f.write(json.dumps(m, default=str) + "\n")
+    with open(os.path.join(run_dir, "references.json"), "w") as f:
+        json.dump(refs.as_json(), f, indent=2)
+    result_json = result.as_json()
+    result_json.pop("trajectory")
+    with open(os.path.join(run_dir, "result.json"), "w") as f:
+        json.dump(result_json, f, indent=2, default=str)
+    return result

@@ -117,6 +117,30 @@ REFERENCE_POLICIES: dict[str, ReferencePolicy] = {
 DEFAULT_REFERENCE_POLICY = "all_returned"
 
 
+# --------------------------- Phase 2: retrieval ---------------------------- #
+# Cached visual index (PHASE2_3 §6) — SigLIP text+image encoders, local HF cache.
+VISUAL_INDEX_MODEL_ID = "google/siglip-so400m-patch14-384"
+VISUAL_INDEX_PREPROCESSING_VERSION = "vi_v1"
+VISUAL_INDEX_ROOT = os.environ.get(
+    "SR_VISUAL_INDEX_ROOT", os.path.join(HARNESS_ROOT, "visual_indexes")
+)
+VISUAL_INDEX_BATCH_SIZE = 64
+
+# Query generators (PHASE2_3 §7-8) — text-only LLM via codex CLI.
+QUERY_GENERATOR_MODEL = TEXT_FALLBACK_MODEL
+QUERY_CACHE_ROOT = os.environ.get(
+    "SR_QUERY_CACHE_ROOT", os.path.join(HARNESS_ROOT, "query_caches")
+)
+QUESTION_QUERY_PROMPT_VERSION = "qq_v1"
+PROMPT_DELTA_QUERY_PROMPT_VERSION = "pdq_v1"
+MAX_RETRIEVAL_QUERIES = 8
+
+# CLIP retrieval defaults (PHASE2_3 §9-10)
+RETRIEVAL_TOP_K = 8
+DEFAULT_SELECTION_POLICY = "trace_plus_prompt_delta_clip"
+DEFAULT_TRACE_POLICY_PHASE2 = "returned_and_frame_inspection"
+
+
 def decoding_hash() -> str:
     from surrogate_rollout.schemas import sha256_json
 
