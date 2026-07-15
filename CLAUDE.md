@@ -71,15 +71,23 @@ Alternative feedback policies must be usable without modifying rollout
 evaluation or evidence collection.
 
 ## ScaffoldApplier
-Converts structured feedback and prompt-bank state into prompt-bank update
-operations.
+Inference-time composer. Combines the prompt-bank entries selected by the
+router with the fixed scaffold contract into one final captioning prompt.
+It does not update the prompt bank.
 The initial implementation may use a deterministic scaffold or a large
 language model.
 It must later be replaceable by a small language model without modifying the
 optimization loop, feedback generator, or rollout evaluator.
 
+## Update proposers
+PromptBankUpdateProposer is a separate optimization-time component that
+proposes changes to the prompt bank. RouterUpdateProposer and
+ScaffoldUpdateProposer are likewise separate optimization-time components.
+None of these compose captioning prompts; they must never be conflated with
+ScaffoldApplier.
+
 ## PromptRouter
-Chooses a prompt-bank entry for each video segment.
+Selects zero or more prompt-bank entries for each video segment.
 The initial implementation may use a deterministic or scaffold-based policy.
 It must later support an SLM implementation behind the same interface.
 

@@ -161,6 +161,23 @@ touch: none identified; `mixed_views/builder.py` helpers are already importable.
     parent directory of the repo (conftest inserts parent on sys.path;
     package name is `surrogate_rollout`). The `youngseo` env lacks pytest.
 
+## 8b. Recorded Stage 4.6 invariant (subject registry; do NOT implement before 4.6)
+
+Per Stage 4.1 review clarifications (2026-07-15):
+
+- routed clips may be captioned in groups based on composed-prompt hash;
+- after captioning, all per-clip outputs must be restored to the original
+  temporal order (clip-key order from `_build_clips`);
+- the existing DVD whole-video subject-registry merge path must then be
+  reused unchanged (one merge over the whole video's per-clip registries);
+- per-prompt-group merged registries must NOT be treated as final video
+  registries;
+- a deterministic injected `merge_fn` is used only in unit tests to avoid
+  nondeterministic LLM calls.
+
+Subject-registry merging is existing DVD functionality, not a Phase 4
+component — never redesign, duplicate, or optimize it.
+
 ## 9. Proposed Stage 4.1 file list (schemas only — pending approval)
 
 ```text
