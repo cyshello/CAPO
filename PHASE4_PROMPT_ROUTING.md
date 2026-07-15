@@ -29,9 +29,10 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 | 4.8 | Offline counterfactual evidence builder (`optimization/evidence_builder.py`) over saved Stage 4.7, Phase 2–3, or normalized artifacts | `166d19f` |
 | 4.9 | Deterministic feedback, structured failure attribution, and candidate meta-knowledge boundary | `5eafc6d` |
 | 4.10 | Independent preview-only prompt-bank, router, and scaffold update proposers | `d113927` |
-| 4.11 | Meta-knowledge review, rollback-safe candidate previews, and saved-fixture empirical validation | this commit |
+| 4.11 | Meta-knowledge review, rollback-safe candidate previews, and saved-fixture empirical validation | `82b0f9c` |
+| 4.12 | Complete saved-fixture one-iteration dry run with fixed/optimized scaffold ablation | this commit |
 
-Stages 4.12+ NOT started. Stop-gate protocol: after each stage, run tests,
+Stages 4.13+ NOT started. Stop-gate protocol: after each stage, run tests,
 produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Current configuration state
@@ -95,9 +96,10 @@ produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Exact next step (pending approval)
 
-Stage 4.12: connect one complete saved-fixture optimization iteration and run
-it once with scaffold optimization disabled and once enabled. No captioning,
-DVD reasoning, model calls, canonical commits, or real evaluation.
+Stage 4.13: run exactly one real fixed-scaffold iteration from frozen input
+components and frozen evidence/confirmation/regression batches, using real
+structured feedback and the existing routed evaluation path. No Stage 4.14 or
+multiple iterations.
 
 ### Test commands
 
@@ -116,12 +118,23 @@ DVD reasoning, model calls, canonical commits, or real evaluation.
     surrogate_rollout/tests/test_failure_attributor.py \
     surrogate_rollout/tests/test_meta_knowledge.py \
     surrogate_rollout/tests/test_update_proposers.py \
-    surrogate_rollout/tests/test_update_review_validation.py -q
+    surrogate_rollout/tests/test_update_review_validation.py \
+    surrogate_rollout/tests/test_offline_iteration.py -q
 # complete suite (run from /home/intern/youngseo, the repo parent)
 /home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest surrogate_rollout/tests -q
+
+# Stage 4.12 saved-fixture one-iteration ablation
+/home/intern/.conda/envs/local_llm_vllm/bin/python -m \
+    surrogate_rollout.scripts.run_phase4_offline_iteration \
+    --optimize-scaffold false \
+    --output-dir surrogate_rollout/runs/phase4_stage4_12_checkpoint/scaffold_disabled
+/home/intern/.conda/envs/local_llm_vllm/bin/python -m \
+    surrogate_rollout.scripts.run_phase4_offline_iteration \
+    --optimize-scaffold true \
+    --output-dir surrogate_rollout/runs/phase4_stage4_12_checkpoint/scaffold_enabled
 ```
 
-Suite status after Stage 4.11: 269 passed (78 Phase 0–3 + 191 Phase 4).
+Suite status after Stage 4.12: 276 passed (78 Phase 0–3 + 198 Phase 4).
 
 ---
 

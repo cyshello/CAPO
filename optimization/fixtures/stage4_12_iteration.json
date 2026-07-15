@@ -1,0 +1,82 @@
+{
+  "schema_version": "phase4_stage4.12_fixture_v1",
+  "config_fingerprint": "stage4_12_saved_fixture_v1",
+  "examples": [
+    {
+      "video_id": "proposal_bank_video",
+      "question_id": "proposal_bank_1",
+      "component": "prompt_bank",
+      "baseline_selected_prompt_ids": ["pe_default"],
+      "candidate_selected_prompt_ids": ["pe_default", "pe_text"]
+    },
+    {
+      "video_id": "proposal_router_video",
+      "question_id": "proposal_router_1",
+      "component": "router",
+      "baseline_selected_prompt_ids": ["pe_default"],
+      "candidate_selected_prompt_ids": ["pe_default", "pe_text"]
+    },
+    {
+      "video_id": "proposal_scaffold_video_1",
+      "question_id": "proposal_scaffold_1",
+      "component": "scaffold",
+      "baseline_selected_prompt_ids": ["pe_default", "pe_temporal", "pe_text"],
+      "candidate_selected_prompt_ids": ["pe_default", "pe_temporal", "pe_text"]
+    },
+    {
+      "video_id": "proposal_scaffold_video_2",
+      "question_id": "proposal_scaffold_2",
+      "component": "scaffold",
+      "baseline_selected_prompt_ids": ["pe_default", "pe_temporal", "pe_text"],
+      "candidate_selected_prompt_ids": ["pe_default", "pe_temporal", "pe_text"]
+    },
+    {
+      "video_id": "proposal_scaffold_video_3",
+      "question_id": "proposal_scaffold_3",
+      "component": "scaffold",
+      "baseline_selected_prompt_ids": ["pe_default", "pe_temporal", "pe_text"],
+      "candidate_selected_prompt_ids": ["pe_default", "pe_temporal", "pe_text"]
+    }
+  ],
+  "feedback_overrides": {
+    "proposal_bank_1": {
+      "targets": ["prompt_bank"],
+      "failure_modes": ["missing_reusable_instruction"],
+      "desired_behaviors": ["Transcribe short visible text exactly when legible."],
+      "avoid_behaviors": ["invent unreadable text"],
+      "applicable_segment_traits": {"text_visible": true},
+      "confidence": 0.9
+    },
+    "proposal_router_1": {
+      "targets": ["router"],
+      "failure_modes": ["missing_text_route"],
+      "desired_behaviors": ["Select the text entry for text-heavy segments."],
+      "applicable_segment_traits": {
+        "routing_conditions": {"text_visible": true},
+        "target_prompt_ids": ["pe_text"]
+      },
+      "confidence": 0.9
+    },
+    "proposal_scaffold_1": {
+      "targets": ["scaffold"],
+      "failure_modes": ["selected_instruction_omitted"],
+      "desired_behaviors": ["Group related selected instructions before applying them."],
+      "applicable_segment_traits": {"multi_entry": true},
+      "confidence": 0.9
+    },
+    "proposal_scaffold_2": {
+      "targets": ["scaffold"],
+      "failure_modes": ["selected_instruction_omitted"],
+      "desired_behaviors": ["Group related selected instructions before applying them."],
+      "applicable_segment_traits": {"multi_entry": true},
+      "confidence": 0.9
+    },
+    "proposal_scaffold_3": {
+      "targets": ["scaffold"],
+      "failure_modes": ["selected_instruction_omitted"],
+      "desired_behaviors": ["Group related selected instructions before applying them."],
+      "applicable_segment_traits": {"multi_entry": true},
+      "confidence": 0.9
+    }
+  }
+}

@@ -1,8 +1,7 @@
 """Phase 4 optimization data boundaries.
 
-Stage 4.11 adds deterministic proposal review, isolated candidate previews,
-and rollback-safe validation over saved metrics. Canonical commit and the
-connected optimization loop are intentionally absent.
+Stage 4.12 connects one deterministic saved-fixture iteration while keeping
+captioning, reasoning, model calls, and canonical component commits absent.
 """
 
 from surrogate_rollout.optimization.candidate_preview import (
@@ -30,6 +29,7 @@ from surrogate_rollout.optimization.schemas import (
     FeedbackBatch,
     FeedbackItem,
     MetaKnowledgeItem,
+    OptimizationIterationResult,
     PromptBankOperation,
     PromptBankUpdateProposal,
     RouterUpdateProposal,
@@ -50,6 +50,9 @@ from surrogate_rollout.optimization.feedback_generator import (
     write_feedback_batch,
 )
 from surrogate_rollout.optimization.meta_knowledge import MetaKnowledgeStore
+from surrogate_rollout.optimization.offline_iteration import (
+    PromptRoutingOptimizationLoop,
+)
 from surrogate_rollout.optimization.prompt_bank_update_proposer import (
     DeterministicPromptBankUpdateProposer,
     PromptBankUpdateProposer,
@@ -107,6 +110,8 @@ __all__ = [
     "PromptBankUpdateProposer",
     "PromptBankOperation",
     "PromptBankUpdateProposal",
+    "PromptRoutingOptimizationLoop",
+    "OptimizationIterationResult",
     "RouterUpdateProposer",
     "RouterUpdateProposal",
     "ScaffoldUpdateProposer",

@@ -49,6 +49,10 @@ SCAFFOLD_SKIP_REASONS = (
 REVIEW_DECISIONS = ("accept_for_validation", "revise", "reject", "defer")
 VALIDATION_DECISIONS = ("accept", "reject", "defer", "evaluation_failed")
 UPDATE_COMPONENTS = ("prompt_bank", "router", "scaffold")
+ITERATION_STATUSES = (
+    "dry_run", "partially_committed", "committed", "all_rejected",
+    "evaluation_failed",
+)
 
 
 def _freeze_json(value: Any, where: str) -> Any:
@@ -513,3 +517,64 @@ class ComponentValidationResult:
                     for value in metrics.values()):
                 raise TypeError(f"{name} must map strings to numeric values")
             _freeze_mapping(self, name)
+
+
+@dataclass(frozen=True)
+class OptimizationIterationResult:
+    iteration_id: str
+    input_bank_version: str
+    input_router_version: str
+    input_scaffold_version: str
+    optimize_prompt_bank: bool
+    optimize_router: bool
+    optimize_scaffold: bool
+    evidence_artifact: str
+    feedback_artifact: str
+    meta_knowledge_artifact: str
+    bank_proposal_artifact: str | None
+    router_proposal_artifact: str | None
+    scaffold_proposal_artifact: str | None
+    review_artifacts: Mapping[str, str]
+    validation_artifacts: Mapping[str, str]
+    committed_bank_version: str | None
+    committed_router_version: str | None
+    committed_scaffold_version: str | None
+    status: Literal[
+        "dry_run", "partially_committed", "committed", "all_rejected",
+        "evaluation_failed",
+    ]
+    errors: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "iteration_id", "evidence_artifact", "feedback_artifact",
+            "meta_knowledge_artifact",
+        ):
+            _require_nonempty_str(getattr(self, name), name)
+        validate_component_version(
+            "bank", self.input_bank_version,
+            field_name="OptimizationIterationResult.input_bank_version")
+        validate_component_version(
+            "router", self.input_router_version,
+            field_name="OptimizationIterationResult.input_router_version")
+        validate_component_version(
+            "scaffold", self.input_scaffold_version,
+            field_name="OptimizationIterationResult.input_scaffold_version")
+        for name in (
+            "optimize_prompt_bank", "optimize_router", "optimize_scaffold",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be bool")
+        for name in (
+            "bank_proposal_artifact", "router_proposal_artifact",
+            "scaffold_proposal_artifact", "committed_bank_version",
+            "committed_router_version", "committed_scaffold_version",
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{name} must be str or None")
+        if self.status not in ITERATION_STATUSES:
+            raise ValueError("OptimizationIterationResult.status is invalid")
+        _require_str_tuple(self.errors, "errors")
+        _freeze_mapping(self, "review_artifacts")
+        _freeze_mapping(self, "validation_artifacts")
