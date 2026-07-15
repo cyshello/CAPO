@@ -11,6 +11,105 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 
 ---
 
+## Implementation progress (updated 2026-07-15)
+
+### Completed stages and commits
+
+| Stage | Content | Commit |
+|---|---|---|
+| 4.0 | Inspection + integration map (`PHASE4_STAGE40_INTEGRATION_MAP.md`) | `c6e8bd2` (baseline), `69bca67` (CLAUDE.md role fix) |
+| 4.1 | Foundational schemas (`prompt_routing/schemas.py`) | `668f54f` |
+| 4.1h | Hardening: opaque `segment_id`, recursive deep-freeze, version/digest + `prompt_scores` semantics documented | `4d5c416` |
+| 4.2 | Versioned persistence (`persistence.py`) + cross-record validation (`validators.py`) | `bcc5bdb` |
+| 4.3 | Multi-entry rule-based router (`router.py`, `policies/rule_based_router.py`) + numeric `list_versions` sort | `ce8c776` |
+
+Stages 4.4+ NOT started. Stop-gate protocol: after each stage, run tests,
+produce the Section 20 checkpoint report, stop, wait for approval.
+
+### Current configuration state
+
+`Phase4Config` defaults (typed only; no YAML yet, deferred by review):
+`optimize_prompt_bank=True`, `optimize_router=True`, `optimize_scaffold=False`,
+`dry_run=True`, `commit=False`. `optimize_scaffold` exposed as top-level
+`Phase4Config.optimize_scaffold` property.
+
+### Fixed interfaces and invariants (do not change without review)
+
+- Records: frozen dataclasses in `prompt_routing/schemas.py`; structured
+  values recursively frozen (mappings→MappingProxyType, lists→tuples,
+  sets→sorted tuples); only JSON-vocabulary leaves accepted;
+  `as_json_dict`/`dumps_canonical` = deterministic serialization.
+- `segment_id` is opaque non-empty; clip-key format ("{start}_{end}")
+  validated later by the DVD/routed-caption adapter, not the schema.
+- Versions: `<kind>_v<NNNN>[_<digest8>]`, kinds bank/router/scaffold/contract;
+  monotonic component-local number; digest = sha256 over canonical record
+  JSON with the record's own version field removed; versions are provenance
+  IDs, never caption-cache keys; caption-cache identity = composed prompt
+  text/hash only (byte-identical composed text may share a cache entry across
+  component versions).
+- Persistence: `ComponentSnapshotStore` — write-once
+  `<root>/snapshots/<version>.json` + `current.json` pointer manifest
+  ({component, version, updated_at} only); same-dir tmp + `os.replace`
+  everywhere; identical re-save = idempotent no-op; different content under
+  existing version = `VersionConflictError`; `write_preview` only outside the
+  store root, never touches committed state; `list_versions` sorts by parsed
+  numeric version.
+- Validators: duplicate ACTIVE prompt hashes rejected; scaffold-policy
+  configuration must not carry contract-owned keys (`CONTRACT_OWNED_KEYS`);
+  router-vs-bank: targets/fallbacks must exist, enabled-rule targets and
+  fallbacks must be active (retired tolerated only in disabled rules),
+  `router.max_selected_entries <= bank.max_selected_entries`.
+- Router: `PromptRouter` protocol `route(context, bank, policy) ->
+  RoutingDecision`. RuleBasedPromptRouter: (priority asc, rule_id) order;
+  first-appearance dedup; bidirectional `conflicts_with`, earlier wins, drops
+  recorded in `decision_payload`; budget truncation recorded; fallback only
+  on empty selection (`used_fallback` + reason); `prompt_scores` covers all
+  considered candidates (rule 1.0, fallback 0.5); question conditions skipped
+  unless policy configuration `question_conditioned: true` (only
+  `question_contains` supported).
+- Stage 4.6 subject-registry invariant recorded in
+  `PHASE4_STAGE40_INTEGRATION_MAP.md` §8b (group captioning by composed-prompt
+  hash, restore temporal order, reuse unchanged whole-video DVD merge).
+
+### Unresolved assumptions
+
+- Canonical repo locations for committed component state (e.g.
+  `artifacts/prompt_banks/`) not yet created — decided at optimization-loop/CLI
+  stage.
+- `max_prompt_tokens=2048` in the Stage 4.2 example contract is a placeholder;
+  production value must be derived from the actual captioner configuration.
+- Rule-condition semantics = exact equality only; router scores are
+  uncalibrated membership constants (1.0/0.5).
+- `current.json` `updated_at` is intentionally nondeterministic pointer
+  metadata.
+- Tests run from the repo parent dir with the `local_llm_vllm` conda env
+  (the `youngseo` env lacks pytest).
+
+### Exact next step (pending approval)
+
+Stage 4.4: fixed scaffold application — `ScaffoldApplier` protocol (§11.2),
+`DeterministicScaffoldApplier`, initial real applier behind configuration,
+composed-prompt validation against `ScaffoldContract` (reuse
+`REQUIRED_PLACEHOLDERS` semantics from `captioning/candidate_captions.py`),
+composition-trace logging, interface-compatible SLM stub that fails clearly.
+Scaffold policy frozen; no scaffold updates; 12 tests per Stage 4.4 list.
+
+### Test commands
+
+```bash
+# focused (per stage)
+/home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest \
+    surrogate_rollout/tests/test_phase4_schemas.py \
+    surrogate_rollout/tests/test_phase4_persistence.py \
+    surrogate_rollout/tests/test_prompt_router.py -q
+# complete suite (run from /home/intern/youngseo, the repo parent)
+/home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest surrogate_rollout/tests -q
+```
+
+Suite status at `ce8c776`: 167 passed (78 Phase 0–3 + 89 Phase 4).
+
+---
+
 ## 1. Correct system interpretation
 
 The prompt bank does **not** contain only mutually exclusive complete captioning prompts.
