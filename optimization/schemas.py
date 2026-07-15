@@ -520,6 +520,51 @@ class ComponentValidationResult:
 
 
 @dataclass(frozen=True)
+class NoChangeEvaluationResult:
+    status: Literal["no_change"]
+    reason: Literal["equivalent_components_and_composed_prompts"]
+    component_equivalence: Mapping[str, bool]
+    incumbent_composed_prompt_hashes: Mapping[str, tuple[str, ...]]
+    candidate_composed_prompt_hashes: Mapping[str, tuple[str, ...]]
+    candidate_dvd_executed: bool
+    eligible_for_validation: bool
+    eligible_for_regression_evidence: bool
+
+    def __post_init__(self) -> None:
+        if self.status != "no_change":
+            raise ValueError("NoChangeEvaluationResult.status must be no_change")
+        if self.reason != "equivalent_components_and_composed_prompts":
+            raise ValueError("NoChangeEvaluationResult.reason is invalid")
+        expected = {"prompt_bank", "router", "scaffold", "contract"}
+        if set(self.component_equivalence) != expected or any(
+                not isinstance(value, bool)
+                for value in self.component_equivalence.values()):
+            raise ValueError(
+                "component_equivalence must contain four boolean component flags")
+        for name in (
+            "incumbent_composed_prompt_hashes",
+            "candidate_composed_prompt_hashes",
+        ):
+            values = getattr(self, name)
+            if any(not isinstance(video_id, str)
+                   or not isinstance(hashes, tuple)
+                   or any(not isinstance(value, str) for value in hashes)
+                   for video_id, hashes in values.items()):
+                raise TypeError(f"{name} must map video IDs to prompt-hash tuples")
+            _freeze_mapping(self, name)
+        for name in (
+            "candidate_dvd_executed", "eligible_for_validation",
+            "eligible_for_regression_evidence",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be bool")
+        if self.candidate_dvd_executed or self.eligible_for_validation or \
+                self.eligible_for_regression_evidence:
+            raise ValueError("a no-change result cannot be evaluated or reused")
+        _freeze_mapping(self, "component_equivalence")
+
+
+@dataclass(frozen=True)
 class OptimizationIterationResult:
     iteration_id: str
     input_bank_version: str

@@ -1,4 +1,4 @@
-"""Exactly one real fixed-scaffold optimization iteration for Stage 4.13."""
+"""Exactly one real prompt-routing optimization iteration for Stages 4.13-4.14."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ from surrogate_rollout.optimization.scaffold_update_proposer import (
 )
 from surrogate_rollout.optimization.schemas import (
     CounterfactualEvidence,
+    NoChangeEvaluationResult,
     OptimizationIterationResult,
 )
 from surrogate_rollout.optimization.update_reviewer import (
@@ -74,6 +75,14 @@ class RealEvaluationResult:
     candidate_artifact: str
     comparison_artifact: str
     timing: Mapping[str, float]
+    no_change: NoChangeEvaluationResult | None = None
+
+
+def _prompt_hashes(offline_by_video: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    return {
+        video_id: tuple(item.prompt_hash for item in result.composed_prompts)
+        for video_id, result in sorted(offline_by_video.items())
+    }
 
 
 def evaluate_routed_states(
@@ -82,49 +91,99 @@ def evaluate_routed_states(
     incumbent_router: RouterPolicySnapshot,
     candidate_bank: PromptBankSnapshot,
     candidate_router: RouterPolicySnapshot,
-    scaffold_policy: ScaffoldPolicySnapshot,
-    scaffold_contract: ScaffoldContract,
+    incumbent_scaffold: ScaffoldPolicySnapshot,
+    candidate_scaffold: ScaffoldPolicySnapshot,
+    incumbent_contract: ScaffoldContract,
+    candidate_contract: ScaffoldContract,
     qa_samples: Sequence[tuple[QAExample, dict]],
     base_prompt_template: str,
     merge_prompt: str,
+    phase4_config: Phase4Config,
     output_dir: str,
     source_revision: str,
     gpu: str,
     dvd_max_iterations: int,
 ) -> RealEvaluationResult:
     """Evaluate two component states through existing routed/DVD services."""
-    ensure_backend(gpu, preload_captioner=True)
     states = {
-        "incumbent": (incumbent_bank, incumbent_router),
-        "candidate": (candidate_bank, candidate_router),
+        "incumbent": (
+            incumbent_bank, incumbent_router, incumbent_scaffold,
+            incumbent_contract),
+        "candidate": (
+            candidate_bank, candidate_router, candidate_scaffold,
+            candidate_contract),
     }
-    score_maps = {}
-    error_maps = {}
-    artifacts = {}
-    timing = {}
-    for state_name, (bank, router) in states.items():
-        started = time.monotonic()
-        state_dir = os.path.join(output_dir, state_name)
-        by_video: dict[str, list[tuple[QAExample, dict]]] = {}
-        for example, sample in qa_samples:
-            by_video.setdefault(example.video_id, []).append((example, sample))
-        rows = []
+    by_video: dict[str, list[tuple[QAExample, dict]]] = {}
+    for example, sample in qa_samples:
+        by_video.setdefault(example.video_id, []).append((example, sample))
+
+    offline_results: dict[str, dict[str, Any]] = {}
+    for state_name, (bank, router, scaffold, contract) in states.items():
+        offline_results[state_name] = {}
         for video_id, video_qas in by_video.items():
             sample = video_qas[0][1]
             clip_keys = tuple(key for key, _ in build_clip_index(sample, video_id))
             contexts = tuple(SegmentContext(
                 video_id=video_id, segment_id=segment_id,
                 segment_features={"smoke_route": "multi_entry"},
-                metadata={"stage": "4.13", "state": state_name},
+                metadata={"stage": "4.14", "state": state_name},
             ) for segment_id in clip_keys)
-            routing_dir = os.path.join(state_dir, "routing", video_id)
-            offline = run_offline_dry_run(
+            offline_results[state_name][video_id] = run_offline_dry_run(
                 contexts=contexts, prompt_bank=bank, router_policy=router,
-                scaffold_policy=scaffold_policy,
-                scaffold_contract=scaffold_contract,
-                phase4_config=Phase4Config(),
+                scaffold_policy=scaffold, scaffold_contract=contract,
+                phase4_config=phase4_config,
                 base_prompt_template=base_prompt_template,
-                output_dir=routing_dir, source_revision=source_revision)
+                output_dir=os.path.join(
+                    output_dir, state_name, "routing", video_id),
+                source_revision=source_revision)
+
+    incumbent_hashes = _prompt_hashes(offline_results["incumbent"])
+    candidate_hashes = _prompt_hashes(offline_results["candidate"])
+    component_equivalence = {
+        "prompt_bank": dumps_canonical(incumbent_bank) ==
+        dumps_canonical(candidate_bank),
+        "router": dumps_canonical(incumbent_router) ==
+        dumps_canonical(candidate_router),
+        "scaffold": dumps_canonical(incumbent_scaffold) ==
+        dumps_canonical(candidate_scaffold),
+        "contract": dumps_canonical(incumbent_contract) ==
+        dumps_canonical(candidate_contract),
+    }
+    equivalent = all(component_equivalence.values()) and \
+        incumbent_hashes == candidate_hashes
+    no_change = None
+    if equivalent:
+        no_change = NoChangeEvaluationResult(
+            status="no_change",
+            reason="equivalent_components_and_composed_prompts",
+            component_equivalence=component_equivalence,
+            incumbent_composed_prompt_hashes=incumbent_hashes,
+            candidate_composed_prompt_hashes=candidate_hashes,
+            candidate_dvd_executed=False,
+            eligible_for_validation=False,
+            eligible_for_regression_evidence=False,
+        )
+
+    ensure_backend(gpu, preload_captioner=True)
+    score_maps = {}
+    error_maps = {}
+    artifacts = {}
+    timing = {}
+    for state_name, (bank, router, scaffold, contract) in states.items():
+        if state_name == "candidate" and no_change is not None:
+            score_maps[state_name] = {}
+            error_maps[state_name] = {}
+            artifacts[state_name] = _write(os.path.join(
+                output_dir, "candidate", "no_change.json"), no_change)
+            timing[state_name] = 0.0
+            continue
+        started = time.monotonic()
+        state_dir = os.path.join(output_dir, state_name)
+        rows = []
+        for video_id, video_qas in by_video.items():
+            sample = video_qas[0][1]
+            routing_dir = os.path.join(state_dir, "routing", video_id)
+            offline = offline_results[state_name][video_id]
             caption_view = RoutedCaptionViewBuilder().build(
                 sample=sample,
                 segment_composed_prompt_map={
@@ -165,8 +224,8 @@ def evaluate_routed_states(
                     "component_versions": {
                         "bank": bank.bank_version,
                         "router": router.router_version,
-                        "scaffold": scaffold_policy.scaffold_version,
-                        "contract": scaffold_contract.contract_version,
+                        "scaffold": scaffold.scaffold_version,
+                        "contract": contract.contract_version,
                     },
                 })
         result_path = os.path.join(state_dir, "results.jsonl")
@@ -182,12 +241,15 @@ def evaluate_routed_states(
 
     comparison_path = _write(os.path.join(output_dir, "comparison.json"), {
         "incumbent_scores": score_maps["incumbent"],
-        "candidate_scores": score_maps["candidate"],
-        "score_deltas": {
+        "candidate_scores": (score_maps["candidate"]
+                             if no_change is None else None),
+        "score_deltas": ({
             key: score_maps["candidate"][key] - score_maps["incumbent"][key]
-            for key in score_maps["incumbent"]},
-        "fixed_scaffold_version": scaffold_policy.scaffold_version,
-        "contract_version": scaffold_contract.contract_version,
+            for key in score_maps["incumbent"]} if no_change is None else None),
+        "incumbent_scaffold_version": incumbent_scaffold.scaffold_version,
+        "candidate_scaffold_version": candidate_scaffold.scaffold_version,
+        "contract_version": incumbent_contract.contract_version,
+        "no_change": no_change,
     })
     return RealEvaluationResult(
         incumbent_scores=score_maps["incumbent"],
@@ -196,7 +258,8 @@ def evaluate_routed_states(
         candidate_errors=error_maps["candidate"],
         incumbent_artifact=artifacts["incumbent"],
         candidate_artifact=artifacts["candidate"],
-        comparison_artifact=comparison_path, timing=timing)
+        comparison_artifact=comparison_path, timing=timing,
+        no_change=no_change)
 
 
 class RealFixedScaffoldIterationRunner:
@@ -205,9 +268,13 @@ class RealFixedScaffoldIterationRunner:
         *,
         feedback_generator: FeedbackGenerator,
         evaluation_fn: Callable[..., RealEvaluationResult] = evaluate_routed_states,
+        optimize_scaffold: bool = False,
+        stage: str = "4.13",
     ) -> None:
         self.feedback_generator = feedback_generator
         self.evaluation_fn = evaluation_fn
+        self.optimize_scaffold = optimize_scaffold
+        self.stage = stage
 
     def run(
         self,
@@ -231,13 +298,15 @@ class RealFixedScaffoldIterationRunner:
         dvd_max_iterations: int,
     ) -> OptimizationIterationResult:
         if config.commit or config.dry_run is False:
-            raise ValueError("Stage 4.13 is preview-only")
+            raise ValueError(f"Stage {self.stage} is preview-only")
         if config.optimization.max_iterations != 1:
-            raise ValueError("Stage 4.13 requires max_iterations=1")
+            raise ValueError(f"Stage {self.stage} requires max_iterations=1")
         if not config.optimization.optimize_prompt_bank or \
                 not config.optimization.optimize_router or \
-                config.optimize_scaffold:
-            raise ValueError("Stage 4.13 requires bank/router on, scaffold off")
+                config.optimize_scaffold != self.optimize_scaffold:
+            raise ValueError(
+                f"Stage {self.stage} requires bank/router on and "
+                f"optimize_scaffold={self.optimize_scaffold}")
         verify_frozen()
 
         feedback = self.feedback_generator.generate(evidence, ())
@@ -265,7 +334,7 @@ class RealFixedScaffoldIterationRunner:
             "scaffold": DeterministicScaffoldUpdateProposer().propose(
                 scaffold_policy=input_scaffold,
                 scaffold_contract=scaffold_contract, feedback=feedback,
-                meta_knowledge=knowledge, enabled=False),
+                meta_knowledge=knowledge, enabled=config.optimize_scaffold),
         }
         proposal_paths = {key: _write(os.path.join(
             output_dir, "proposals", f"{key}.json"), value)
@@ -297,6 +366,15 @@ class RealFixedScaffoldIterationRunner:
                 preview_errors["router"] = str(exc)
         candidate_router = (previews["router"].candidate_state
                             if "router" in previews else input_router)
+        if reviews["scaffold"].decision == "accept_for_validation":
+            try:
+                previews["scaffold"] = preview_builder.build_scaffold(
+                    input_scaffold, proposals["scaffold"],
+                    scaffold_contract=scaffold_contract)
+            except CandidatePreviewError as exc:
+                preview_errors["scaffold"] = str(exc)
+        candidate_scaffold = (previews["scaffold"].candidate_state
+                              if "scaffold" in previews else input_scaffold)
         preview_paths = {key: _write(os.path.join(
             output_dir, "output_state", f"preview_{key}.json"), value)
             for key, value in previews.items()}
@@ -310,10 +388,12 @@ class RealFixedScaffoldIterationRunner:
         evaluation = self.evaluation_fn(
             incumbent_bank=input_bank, incumbent_router=input_router,
             candidate_bank=candidate_bank, candidate_router=candidate_router,
-            scaffold_policy=input_scaffold,
-            scaffold_contract=scaffold_contract, qa_samples=qa_samples,
+            incumbent_scaffold=input_scaffold,
+            candidate_scaffold=candidate_scaffold,
+            incumbent_contract=scaffold_contract,
+            candidate_contract=scaffold_contract, qa_samples=qa_samples,
             base_prompt_template=base_prompt_template,
-            merge_prompt=merge_prompt,
+            merge_prompt=merge_prompt, phase4_config=config,
             output_dir=os.path.join(output_dir, "evaluation"),
             source_revision=source_revision, gpu=gpu,
             dvd_max_iterations=dvd_max_iterations)
@@ -325,8 +405,11 @@ class RealFixedScaffoldIterationRunner:
         versions = {
             "prompt_bank": input_bank.bank_version,
             "router": input_router.router_version,
+            "scaffold": input_scaffold.scaffold_version,
         }
-        for component, preview in previews.items():
+        validation_previews = (() if evaluation.no_change is not None
+                               else previews.items())
+        for component, preview in validation_previews:
             source_feedback_ids = (
                 tuple(value for op in proposals[component].operations
                       for value in op.source_feedback_ids)
@@ -347,6 +430,8 @@ class RealFixedScaffoldIterationRunner:
                     "contract_version": scaffold_contract.contract_version,
                     "proposal_example_ids": source_evidence_ids,
                     "proposal_video_ids": source_videos,
+                    "support_video_ids": (source_videos
+                                          if component == "scaffold" else ()),
                     "scores": evaluation.candidate_scores,
                     "errors": evaluation.candidate_errors},
                 component=component,
@@ -374,7 +459,7 @@ class RealFixedScaffoldIterationRunner:
             input_router_version=input_router.router_version,
             input_scaffold_version=input_scaffold.scaffold_version,
             optimize_prompt_bank=True, optimize_router=True,
-            optimize_scaffold=False,
+            optimize_scaffold=config.optimize_scaffold,
             evidence_artifact=os.path.join(
                 output_dir, "frozen_batches", "evidence.jsonl"),
             feedback_artifact=feedback_path,
@@ -388,7 +473,8 @@ class RealFixedScaffoldIterationRunner:
             committed_scaffold_version=None, status="dry_run", errors=())
         _write(os.path.join(output_dir, "iteration_result.json"), result)
         _write(os.path.join(output_dir, "run_summary.json"), {
-            "stage": "4.13", "max_iterations": 1,
+            "stage": self.stage, "max_iterations": 1,
+            "optimize_scaffold": config.optimize_scaffold,
             "fixed_scaffold_version": input_scaffold.scaffold_version,
             "frozen_manifest": frozen_manifest_path,
             "feedback_policy": feedback.feedback_policy,
@@ -405,8 +491,12 @@ class RealFixedScaffoldIterationRunner:
                 "candidate": evaluation.candidate_artifact,
                 "comparison": evaluation.comparison_artifact},
             "evaluation_timing": evaluation.timing,
+            "no_change": evaluation.no_change,
+            "candidate_validation_eligible": evaluation.no_change is None,
+            "candidate_regression_evidence_eligible": evaluation.no_change is None,
             "canonical_commits": 0,
-            "scaffold_candidate_created": False,
+            "scaffold_candidate_created": (
+                proposals["scaffold"].candidate_policy is not None),
             "scaffold_skipped_reason": proposals["scaffold"].skipped_reason,
         })
         return result

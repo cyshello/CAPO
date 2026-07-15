@@ -1,7 +1,9 @@
 """Stage 4.13 fixed-scaffold iteration boundary tests without real calls."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,8 +14,12 @@ from surrogate_rollout.optimization.policies.codex_feedback import (
 from surrogate_rollout.optimization.real_fixed_scaffold_iteration import (
     RealEvaluationResult,
     RealFixedScaffoldIterationRunner,
+    evaluate_routed_states,
 )
-from surrogate_rollout.optimization.schemas import CounterfactualEvidence
+from surrogate_rollout.optimization.schemas import (
+    CounterfactualEvidence,
+    NoChangeEvaluationResult,
+)
 from surrogate_rollout.prompt_routing.persistence import (
     prompt_bank_from_json,
     router_policy_from_json,
@@ -126,6 +132,56 @@ def test_fixed_scaffold_runner_emits_skip_and_one_evaluation(tmp_path):
     assert result.committed_scaffold_version is None
 
 
+def test_stage4_14_preserves_scaffold_support_threshold(tmp_path):
+    bank, router, scaffold, contract = components()
+    feedback_data = json.loads(FEEDBACK.read_text())["feedback"]
+
+    def evaluate(**kwargs):
+        return RealEvaluationResult(
+            incumbent_scores={"confirmation": 1.0, "regression": 1.0},
+            candidate_scores={}, incumbent_errors={}, candidate_errors={},
+            incumbent_artifact="incumbent.jsonl",
+            candidate_artifact="no_change.json",
+            comparison_artifact="comparison.json", timing={"incumbent": 0.0},
+            no_change=NoChangeEvaluationResult(
+                status="no_change",
+                reason="equivalent_components_and_composed_prompts",
+                component_equivalence={
+                    "prompt_bank": True, "router": True,
+                    "scaffold": True, "contract": True},
+                incumbent_composed_prompt_hashes={"v": ("hash",)},
+                candidate_composed_prompt_hashes={"v": ("hash",)},
+                candidate_dvd_executed=False,
+                eligible_for_validation=False,
+                eligible_for_regression_evidence=False))
+
+    result = RealFixedScaffoldIterationRunner(
+        feedback_generator=type("Feedback", (), {
+            "generate": lambda self, *_: feedback_batch_from_json(feedback_data),
+        })(), evaluation_fn=evaluate, optimize_scaffold=True,
+        stage="4.14").run(
+            input_bank=bank, input_router=router, input_scaffold=scaffold,
+            scaffold_contract=contract,
+            evidence=(evidence("evidence_bank", "prompt_bank", "v1"),
+                      evidence("evidence_router", "router", "v2"),
+                      evidence("evidence_scaffold", "scaffold", "v3")),
+            confirmation_examples=(example("confirmation"),),
+            regression_examples=(example("regression"),), qa_samples=(),
+            base_prompt_template="base", merge_prompt="merge",
+            config=config(optimize_scaffold=True), output_dir=str(tmp_path),
+            source_revision="abc", frozen_manifest_path="manifest.json",
+            verify_frozen=lambda: None, gpu="0", dvd_max_iterations=1)
+
+    scaffold_proposal = json.loads(Path(
+        result.scaffold_proposal_artifact).read_text())
+    scaffold_review = json.loads(Path(
+        result.review_artifacts["scaffold"]).read_text())
+    assert scaffold_proposal["skipped_reason"] == "insufficient_support"
+    assert scaffold_proposal["provenance"]["proposal_policy_calls"] == 0
+    assert scaffold_review["decision"] == "defer"
+    assert result.validation_artifacts == {}
+
+
 @pytest.mark.parametrize("bad", [
     {"max_iterations": 2}, {"optimize_scaffold": True},
     {"optimize_prompt_bank": False}, {"optimize_router": False},
@@ -158,6 +214,96 @@ def test_codex_feedback_provider_allows_one_real_call(monkeypatch):
     assert provider.metadata()["call_count"] == 1
     with pytest.raises(RuntimeError, match="exactly one"):
         provider(request)
+
+
+def test_equivalent_candidate_skips_repeated_dvd_and_records_no_change(
+    tmp_path, monkeypatch,
+):
+    import surrogate_rollout.optimization.real_fixed_scaffold_iteration as module
+
+    bank, router, scaffold, contract = components()
+    dvd_calls = []
+    monkeypatch.setattr(module, "build_clip_index", lambda *_: (("0_10", {}),))
+    monkeypatch.setattr(module, "ensure_backend", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "run_offline_dry_run", lambda **kwargs:
+                        SimpleNamespace(composed_prompts=(SimpleNamespace(
+                            segment_id="0_10", prompt_hash="same"),)))
+    monkeypatch.setattr(module, "RoutedCaptionViewBuilder", lambda: SimpleNamespace(
+        build=lambda **kwargs: SimpleNamespace(
+            captions_path="captions.json", database_path="database.json",
+            routed_view_path="routed_view.json", caption_call_count=1,
+            caption_cache_hits=0, caption_seconds=0.1)))
+
+    def fake_dvd(**kwargs):
+        dvd_calls.append(kwargs)
+        return SimpleNamespace(
+            score=1.0, prediction="A", parsed_answer="A", ground_truth="A",
+            errors=(), token_usage={}, latency_seconds=0.2,
+            captions_path="captions.json", database_path="database.json")
+
+    monkeypatch.setattr(module, "run_dvd_qa", fake_dvd)
+    qa = example("confirmation")
+    result = evaluate_routed_states(
+        incumbent_bank=bank, incumbent_router=router,
+        candidate_bank=bank, candidate_router=router,
+        incumbent_scaffold=scaffold, candidate_scaffold=scaffold,
+        incumbent_contract=contract, candidate_contract=contract,
+        qa_samples=((qa, {"sample_id": qa.video_id}),),
+        base_prompt_template="base", merge_prompt="merge",
+        phase4_config=config(optimize_scaffold=True),
+        output_dir=str(tmp_path), source_revision="abc", gpu="0",
+        dvd_max_iterations=1)
+
+    assert isinstance(result.no_change, NoChangeEvaluationResult)
+    assert result.no_change.candidate_dvd_executed is False
+    assert result.no_change.eligible_for_validation is False
+    assert result.no_change.eligible_for_regression_evidence is False
+    assert result.candidate_scores == {}
+    assert len(dvd_calls) == 1
+    assert json.loads(Path(result.candidate_artifact).read_text())["status"] == \
+        "no_change"
+
+
+def test_changed_component_does_not_trigger_equivalence_guard(tmp_path, monkeypatch):
+    import surrogate_rollout.optimization.real_fixed_scaffold_iteration as module
+
+    bank, router, scaffold, contract = components()
+    candidate_bank = replace(
+        bank, bank_version="bank_v0003", parent_bank_version=bank.bank_version)
+    dvd_calls = []
+    monkeypatch.setattr(module, "build_clip_index", lambda *_: (("0_10", {}),))
+    monkeypatch.setattr(module, "ensure_backend", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "run_offline_dry_run", lambda **kwargs:
+                        SimpleNamespace(composed_prompts=(SimpleNamespace(
+                            segment_id="0_10", prompt_hash="same"),)))
+    monkeypatch.setattr(module, "RoutedCaptionViewBuilder", lambda: SimpleNamespace(
+        build=lambda **kwargs: SimpleNamespace(
+            captions_path="captions.json", database_path="database.json",
+            routed_view_path="routed_view.json", caption_call_count=1,
+            caption_cache_hits=0, caption_seconds=0.1)))
+
+    def fake_dvd(**kwargs):
+        dvd_calls.append(kwargs)
+        return SimpleNamespace(
+            score=1.0, prediction="A", parsed_answer="A", ground_truth="A",
+            errors=(), token_usage={}, latency_seconds=0.2,
+            captions_path="captions.json", database_path="database.json")
+
+    monkeypatch.setattr(module, "run_dvd_qa", fake_dvd)
+    qa = example("confirmation")
+    result = evaluate_routed_states(
+        incumbent_bank=bank, incumbent_router=router,
+        candidate_bank=candidate_bank, candidate_router=router,
+        incumbent_scaffold=scaffold, candidate_scaffold=scaffold,
+        incumbent_contract=contract, candidate_contract=contract,
+        qa_samples=((qa, {"sample_id": qa.video_id}),),
+        base_prompt_template="base", merge_prompt="merge",
+        phase4_config=config(optimize_scaffold=True),
+        output_dir=str(tmp_path), source_revision="abc", gpu="0",
+        dvd_max_iterations=1)
+
+    assert result.no_change is None
+    assert len(dvd_calls) == 2
 
 
 def test_real_iteration_does_not_import_canonical_store():

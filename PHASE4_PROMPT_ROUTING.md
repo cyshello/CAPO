@@ -31,10 +31,12 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 | 4.10 | Independent preview-only prompt-bank, router, and scaffold update proposers | `d113927` |
 | 4.11 | Meta-knowledge review, rollback-safe candidate previews, and saved-fixture empirical validation | `82b0f9c` |
 | 4.12 | Complete saved-fixture one-iteration dry run with fixed/optimized scaffold ablation | `3f35786` |
-| 4.13 | One real fixed-scaffold iteration from frozen inputs with routed DVD evaluation | this commit |
+| 4.13 | One real fixed-scaffold iteration from frozen inputs with routed DVD evaluation | `d11ffe1` |
+| 4.14 | One real scaffold-enabled iteration with matched frozen inputs and typed no-change guard | this commit |
 
-Stages 4.14+ are NOT started. Stop-gate protocol: after each stage, run tests,
-produce the Section 20 checkpoint report, stop, wait for approval.
+Multi-iteration optimization is NOT started. Stop-gate protocol: after each
+stage, run tests, produce the Section 20 checkpoint report, stop, wait for
+approval.
 
 ### Current configuration state
 
@@ -80,6 +82,10 @@ produce the Section 20 checkpoint report, stop, wait for approval.
 - Stage 4.6 subject-registry invariant recorded in
   `PHASE4_STAGE40_INTEGRATION_MAP.md` §8b (group captioning by composed-prompt
   hash, restore temporal order, reuse unchanged whole-video DVD merge).
+- Real-evaluation no-change guard: identical bank/router/scaffold/contract
+  records plus identical per-segment composed-prompt hashes produce a typed
+  `no_change` result; candidate DVD is not executed and the result is not
+  eligible for validation or regression evidence.
 
 ### Unresolved assumptions
 
@@ -97,9 +103,9 @@ produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Exact next step (pending approval)
 
-Stage 4.14: run one separately reviewed real iteration with scaffold
-optimization enabled, using the frozen Stage 4.13 starting state and matched
-data budget where possible. No multi-iteration optimization.
+Create the separate matched multi-iteration experiment plan required after
+Stage 4.14. Do not implement or execute multi-iteration optimization until
+that plan is reviewed and approved.
 
 ### Test commands
 
@@ -135,7 +141,7 @@ data budget where possible. No multi-iteration optimization.
     --output-dir surrogate_rollout/runs/phase4_stage4_12_checkpoint/scaffold_enabled
 ```
 
-Suite status after Stage 4.13: 283 passed (78 Phase 0–3 + 205 Phase 4).
+Suite status after Stage 4.14: 286 passed (78 Phase 0–3 + 208 Phase 4).
 
 ---
 

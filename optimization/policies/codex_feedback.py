@@ -9,13 +9,23 @@ from typing import Sequence
 from surrogate_rollout import config
 from surrogate_rollout.optimization.schemas import CounterfactualEvidence
 FEEDBACK_POLICY_VERSION = "codex_structured_feedback_v0001"
+SCAFFOLD_FEEDBACK_POLICY_VERSION = "codex_structured_feedback_v0002_scaffold"
 
 
 class CodexStructuredFeedbackProvider:
     """Callable response provider for ``LLMFeedbackGenerator``."""
 
-    def __init__(self, *, model: str = config.TEXT_FALLBACK_MODEL) -> None:
+    def __init__(
+        self,
+        *,
+        model: str = config.TEXT_FALLBACK_MODEL,
+        allow_scaffold_updates: bool = False,
+    ) -> None:
         self.model = model
+        self.allow_scaffold_updates = allow_scaffold_updates
+        self.policy_version = (SCAFFOLD_FEEDBACK_POLICY_VERSION
+                               if allow_scaffold_updates
+                               else FEEDBACK_POLICY_VERSION)
         self.call_count = 0
 
     def __call__(self, request: str) -> str:
@@ -25,16 +35,27 @@ class CodexStructuredFeedbackProvider:
         payload = json.loads(request)
         evidence: Sequence[dict] = payload["evidence"]
         evidence_ids = [item["evidence_id"] for item in evidence]
+        scaffold_instruction = (
+            "Scaffold attribution is permitted only when complete composition "
+            "traces and an explicit structured scaffold-failure fact support it. "
+            "Do not combine unrelated videos to fabricate a global pattern."
+            if self.allow_scaffold_updates else
+            "Do not propose scaffold changes in this fixed-scaffold iteration."
+        )
+        allowed_targets = (
+            "prompt_bank OR router OR scaffold OR insufficient_evidence"
+            if self.allow_scaffold_updates else
+            "prompt_bank OR router OR insufficient_evidence")
         prompt = f"""You are the real structured-feedback policy for one offline prompt-routing optimization iteration.
 
 Analyze only the supplied frozen counterfactual evidence. Do not claim causal component attribution when the records do not support it. Legacy records without composition traces cannot support scaffold attribution. A neutral or ambiguous comparison may be insufficient evidence.
 
-Current reusable prompt IDs are pe_default, pe_temporal, and pe_text. For a supported prompt-bank revision, put the existing target in applicable_segment_traits.target_prompt_id. For a supported router change, put a JSON object in applicable_segment_traits.routing_conditions and a list of existing prompt IDs in applicable_segment_traits.target_prompt_ids. Keep desired behaviors reusable and concise. Do not propose scaffold changes in this fixed-scaffold iteration.
+Current reusable prompt IDs are pe_default, pe_temporal, and pe_text. For a supported prompt-bank revision, put the existing target in applicable_segment_traits.target_prompt_id. For a supported router change, put a JSON object in applicable_segment_traits.routing_conditions and a list of existing prompt IDs in applicable_segment_traits.target_prompt_ids. Keep desired behaviors reusable and concise. {scaffold_instruction}
 
 Return ONLY one JSON object with exactly this top-level structure:
 {{
   "feedback_policy": "real_codex_structured",
-  "feedback_policy_version": "{FEEDBACK_POLICY_VERSION}",
+  "feedback_policy_version": "{self.policy_version}",
   "input_evidence_ids": {json.dumps(evidence_ids)},
   "attributions": [],
   "items": [
@@ -42,7 +63,7 @@ Return ONLY one JSON object with exactly this top-level structure:
       "feedback_id": "feedback_real_unique_id",
       "evidence_ids": ["one or more exact evidence IDs"],
       "attribution_id": "attribution_real_matching_unique_id",
-      "target_components": ["prompt_bank OR router OR insufficient_evidence"],
+      "target_components": ["{allowed_targets}"],
       "failure_modes": ["typed_snake_case_label"],
       "successful_behaviors": [],
       "desired_behaviors": ["one reusable behavior"],
@@ -77,7 +98,8 @@ Frozen request:
         return {
             "provider": "codex_cli",
             "model": self.model,
-            "policy_version": FEEDBACK_POLICY_VERSION,
+            "policy_version": self.policy_version,
+            "allow_scaffold_updates": self.allow_scaffold_updates,
             "call_count": self.call_count,
             "real_model": True,
         }
