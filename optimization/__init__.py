@@ -53,6 +53,11 @@ from surrogate_rollout.optimization.meta_knowledge import MetaKnowledgeStore
 from surrogate_rollout.optimization.offline_iteration import (
     PromptRoutingOptimizationLoop,
 )
+from surrogate_rollout.optimization.real_fixed_scaffold_iteration import (
+    RealEvaluationResult,
+    RealFixedScaffoldIterationRunner,
+    evaluate_routed_states,
+)
 from surrogate_rollout.optimization.prompt_bank_update_proposer import (
     DeterministicPromptBankUpdateProposer,
     PromptBankUpdateProposer,
@@ -107,6 +112,8 @@ __all__ = [
     "MetaKnowledgeStore",
     "MockFeedbackGenerator",
     "RealFeedbackDisabledError",
+    "RealEvaluationResult",
+    "RealFixedScaffoldIterationRunner",
     "PromptBankUpdateProposer",
     "PromptBankOperation",
     "PromptBankUpdateProposal",
@@ -131,4 +138,5 @@ __all__ = [
     "write_evidence_jsonl",
     "write_feedback_batch",
     "write_normalized_evaluations",
+    "evaluate_routed_states",
 ]

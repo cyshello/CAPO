@@ -30,9 +30,10 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 | 4.9 | Deterministic feedback, structured failure attribution, and candidate meta-knowledge boundary | `5eafc6d` |
 | 4.10 | Independent preview-only prompt-bank, router, and scaffold update proposers | `d113927` |
 | 4.11 | Meta-knowledge review, rollback-safe candidate previews, and saved-fixture empirical validation | `82b0f9c` |
-| 4.12 | Complete saved-fixture one-iteration dry run with fixed/optimized scaffold ablation | this commit |
+| 4.12 | Complete saved-fixture one-iteration dry run with fixed/optimized scaffold ablation | `3f35786` |
+| 4.13 | One real fixed-scaffold iteration from frozen inputs with routed DVD evaluation | this commit |
 
-Stages 4.13+ NOT started. Stop-gate protocol: after each stage, run tests,
+Stages 4.14+ are NOT started. Stop-gate protocol: after each stage, run tests,
 produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Current configuration state
@@ -96,10 +97,9 @@ produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Exact next step (pending approval)
 
-Stage 4.13: run exactly one real fixed-scaffold iteration from frozen input
-components and frozen evidence/confirmation/regression batches, using real
-structured feedback and the existing routed evaluation path. No Stage 4.14 or
-multiple iterations.
+Stage 4.14: run one separately reviewed real iteration with scaffold
+optimization enabled, using the frozen Stage 4.13 starting state and matched
+data budget where possible. No multi-iteration optimization.
 
 ### Test commands
 
@@ -119,7 +119,8 @@ multiple iterations.
     surrogate_rollout/tests/test_meta_knowledge.py \
     surrogate_rollout/tests/test_update_proposers.py \
     surrogate_rollout/tests/test_update_review_validation.py \
-    surrogate_rollout/tests/test_offline_iteration.py -q
+    surrogate_rollout/tests/test_offline_iteration.py \
+    surrogate_rollout/tests/test_real_fixed_scaffold_iteration.py -q
 # complete suite (run from /home/intern/youngseo, the repo parent)
 /home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest surrogate_rollout/tests -q
 
@@ -134,7 +135,7 @@ multiple iterations.
     --output-dir surrogate_rollout/runs/phase4_stage4_12_checkpoint/scaffold_enabled
 ```
 
-Suite status after Stage 4.12: 276 passed (78 Phase 0–3 + 198 Phase 4).
+Suite status after Stage 4.13: 283 passed (78 Phase 0–3 + 205 Phase 4).
 
 ---
 
