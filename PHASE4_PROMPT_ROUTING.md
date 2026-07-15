@@ -23,9 +23,10 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 | 4.2 | Versioned persistence (`persistence.py`) + cross-record validation (`validators.py`) | `bcc5bdb` |
 | 4.3 | Multi-entry rule-based router (`router.py`, `policies/rule_based_router.py`) + numeric `list_versions` sort | `ce8c776` |
 | 4.4 | Fixed scaffold application (`scaffold_applier.py`, deterministic applier, SLM stub) | `cad027a` |
-| 4.5 | Offline routing-to-composition dry run (`offline_dry_run.py`, deterministic fixture CLI) | this commit |
+| 4.5 | Offline routing-to-composition dry run (`offline_dry_run.py`, deterministic fixture CLI) | `f192433` |
+| 4.6 | Routed caption-view adapter (`routed_caption_view.py`) with temporal whole-video registry merge | this commit |
 
-Stages 4.6+ NOT started. Stop-gate protocol: after each stage, run tests,
+Stages 4.7+ NOT started. Stop-gate protocol: after each stage, run tests,
 produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Current configuration state
@@ -89,11 +90,11 @@ produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Exact next step (pending approval)
 
-Stage 4.6: routed caption-view adapter — accept a per-segment
-`ComposedCaptionPrompt` map, group captioning calls by composed-prompt hash,
-restore per-clip outputs to temporal order, and reuse the unchanged existing
-whole-video subject-registry merge. Preserve cache isolation and component
-version provenance; do not implement routed DVD evaluation.
+Stage 4.7: routed evaluator smoke test — freeze one bank, router policy,
+scaffold policy, and scaffold contract; compare fallback/default composition
+against routed multi-entry composition on one small video and one to three QAs
+through existing DVD reasoning. Record routing, composition, cache, prediction,
+score, cost, and timing artifacts; do not implement evidence or updates.
 
 ### Test commands
 
@@ -104,12 +105,13 @@ version provenance; do not implement routed DVD evaluation.
     surrogate_rollout/tests/test_phase4_persistence.py \
     surrogate_rollout/tests/test_prompt_router.py \
     surrogate_rollout/tests/test_scaffold_applier.py \
-    surrogate_rollout/tests/test_offline_dry_run.py -q
+    surrogate_rollout/tests/test_offline_dry_run.py \
+    surrogate_rollout/tests/test_routed_caption_view.py -q
 # complete suite (run from /home/intern/youngseo, the repo parent)
 /home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest surrogate_rollout/tests -q
 ```
 
-Suite status after Stage 4.5: 198 passed (78 Phase 0–3 + 120 Phase 4).
+Suite status after Stage 4.6: 208 passed (78 Phase 0–3 + 130 Phase 4).
 
 ---
 

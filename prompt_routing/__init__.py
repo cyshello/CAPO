@@ -41,6 +41,14 @@ from surrogate_rollout.prompt_routing.router import (
     routing_decision_from_json,
     write_routing_decisions,
 )
+from surrogate_rollout.prompt_routing.routed_caption_view import (
+    ROUTED_PROMPT_VIEW,
+    RoutedCaptionViewArtifact,
+    RoutedCaptionViewBuilder,
+    RoutedCaptionViewError,
+    RoutedPromptGroup,
+    RoutedSegmentProvenance,
+)
 from surrogate_rollout.prompt_routing.persistence import (
     ComponentSnapshotStore,
     SnapshotStoreError,
@@ -90,6 +98,12 @@ __all__ = [
     "OfflineDryRunResult",
     "PromptRouter",
     "RuleBasedPromptRouter",
+    "ROUTED_PROMPT_VIEW",
+    "RoutedCaptionViewArtifact",
+    "RoutedCaptionViewBuilder",
+    "RoutedCaptionViewError",
+    "RoutedPromptGroup",
+    "RoutedSegmentProvenance",
     "SLMScaffoldApplier",
     "ScaffoldApplier",
     "composed_prompt_from_json",
