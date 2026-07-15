@@ -1,12 +1,30 @@
 """Phase 4 prompt-routing package (PHASE4_PROMPT_ROUTING.md).
 
 Stage 4.1: foundational typed records. Stage 4.2: versioned component
-persistence and cross-record validation. Routing logic, scaffold application,
-and caption integration arrive in later stages.
+persistence and cross-record validation. Stage 4.3: routing. Stage 4.4:
+scaffold application. Caption integration arrives in later stages.
 """
 
+from surrogate_rollout.prompt_routing.policies.deterministic_scaffold import (
+    INSERTION_MARKER,
+    DeterministicScaffoldApplier,
+)
 from surrogate_rollout.prompt_routing.policies.rule_based_router import (
     RuleBasedPromptRouter,
+)
+from surrogate_rollout.prompt_routing.policies.slm_scaffold import (
+    SLMScaffoldApplier,
+)
+from surrogate_rollout.prompt_routing.scaffold_applier import (
+    ScaffoldApplier,
+    composed_prompt_from_json,
+    composition_trace_from_json,
+    create_scaffold_applier,
+    estimate_prompt_tokens,
+    finalize_composed_prompt,
+    read_composed_prompts,
+    validate_composed_text,
+    write_composed_prompts,
 )
 from surrogate_rollout.prompt_routing.router import (
     PromptRouter,
@@ -57,8 +75,20 @@ from surrogate_rollout.prompt_routing.schemas import (
 __all__ = [
     "COMPONENT_KINDS",
     "ComponentSnapshotStore",
+    "DeterministicScaffoldApplier",
+    "INSERTION_MARKER",
     "PromptRouter",
     "RuleBasedPromptRouter",
+    "SLMScaffoldApplier",
+    "ScaffoldApplier",
+    "composed_prompt_from_json",
+    "composition_trace_from_json",
+    "create_scaffold_applier",
+    "estimate_prompt_tokens",
+    "finalize_composed_prompt",
+    "read_composed_prompts",
+    "validate_composed_text",
+    "write_composed_prompts",
     "read_routing_decisions",
     "routing_decision_from_json",
     "write_routing_decisions",
