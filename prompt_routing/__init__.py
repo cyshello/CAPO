@@ -1,9 +1,30 @@
 """Phase 4 prompt-routing package (PHASE4_PROMPT_ROUTING.md).
 
-Stage 4.1: foundational typed records only. Routing logic, scaffold
-application, persistence, and caption integration arrive in later stages.
+Stage 4.1: foundational typed records. Stage 4.2: versioned component
+persistence and cross-record validation. Routing logic, scaffold application,
+and caption integration arrive in later stages.
 """
 
+from surrogate_rollout.prompt_routing.persistence import (
+    ComponentSnapshotStore,
+    SnapshotStoreError,
+    SnapshotValidationError,
+    VersionConflictError,
+    prompt_bank_from_json,
+    prompt_bank_store,
+    router_policy_from_json,
+    router_policy_store,
+    scaffold_contract_from_json,
+    scaffold_contract_store,
+    scaffold_policy_from_json,
+    scaffold_policy_store,
+)
+from surrogate_rollout.prompt_routing.validators import (
+    assert_router_compatible,
+    validate_prompt_bank,
+    validate_router_against_bank,
+    validate_scaffold_policy,
+)
 from surrogate_rollout.prompt_routing.schemas import (
     COMPONENT_KINDS,
     ComposedCaptionPrompt,
@@ -26,6 +47,22 @@ from surrogate_rollout.prompt_routing.schemas import (
 
 __all__ = [
     "COMPONENT_KINDS",
+    "ComponentSnapshotStore",
+    "SnapshotStoreError",
+    "SnapshotValidationError",
+    "VersionConflictError",
+    "assert_router_compatible",
+    "prompt_bank_from_json",
+    "prompt_bank_store",
+    "router_policy_from_json",
+    "router_policy_store",
+    "scaffold_contract_from_json",
+    "scaffold_contract_store",
+    "scaffold_policy_from_json",
+    "scaffold_policy_store",
+    "validate_prompt_bank",
+    "validate_router_against_bank",
+    "validate_scaffold_policy",
     "ComposedCaptionPrompt",
     "CompositionTrace",
     "Phase4Config",
