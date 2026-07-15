@@ -1,9 +1,15 @@
 """Phase 4 optimization data boundaries.
 
-Stage 4.10 adds preview-only component proposals to the offline evidence,
-feedback, attribution, and candidate meta-knowledge boundaries. Review,
-validation, commit, and optimization are intentionally absent.
+Stage 4.11 adds deterministic proposal review, isolated candidate previews,
+and rollback-safe validation over saved metrics. Canonical commit and the
+connected optimization loop are intentionally absent.
 """
+
+from surrogate_rollout.optimization.candidate_preview import (
+    CandidatePreview,
+    CandidatePreviewBuilder,
+    CandidatePreviewError,
+)
 
 from surrogate_rollout.optimization.evidence_builder import (
     CounterfactualEvidenceBuilder,
@@ -28,6 +34,8 @@ from surrogate_rollout.optimization.schemas import (
     PromptBankUpdateProposal,
     RouterUpdateProposal,
     ScaffoldUpdateProposal,
+    ComponentValidationResult,
+    UpdateReview,
 )
 from surrogate_rollout.optimization.failure_attributor import (
     AttributionError,
@@ -59,15 +67,30 @@ from surrogate_rollout.optimization.policies import (
     MockFeedbackGenerator,
     RealFeedbackDisabledError,
 )
+from surrogate_rollout.optimization.update_reviewer import (
+    DeterministicUpdateReviewer,
+    UpdateReviewer,
+)
+from surrogate_rollout.optimization.update_validator import (
+    DeterministicUpdateValidator,
+    UpdateValidator,
+    ValidationThresholds,
+)
 
 __all__ = [
     "CaptionDifference",
+    "CandidatePreview",
+    "CandidatePreviewBuilder",
+    "CandidatePreviewError",
+    "ComponentValidationResult",
     "CounterfactualEvidence",
     "CounterfactualEvidenceBuilder",
     "DeterministicFailureAttributor",
     "DeterministicPromptBankUpdateProposer",
     "DeterministicRouterUpdateProposer",
     "DeterministicScaffoldUpdateProposer",
+    "DeterministicUpdateReviewer",
+    "DeterministicUpdateValidator",
     "EvidenceBuildError",
     "FailureAttribution",
     "FailureAttributor",
@@ -88,6 +111,10 @@ __all__ = [
     "RouterUpdateProposal",
     "ScaffoldUpdateProposer",
     "ScaffoldUpdateProposal",
+    "UpdateReview",
+    "UpdateReviewer",
+    "UpdateValidator",
+    "ValidationThresholds",
     "SavedEvaluationArtifact",
     "attach_attributions",
     "load_normalized_evaluations",

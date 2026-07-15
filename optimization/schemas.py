@@ -46,6 +46,9 @@ PROMPT_BANK_OPERATION_TYPES = (
 SCAFFOLD_SKIP_REASONS = (
     "disabled_by_config", "no_scaffold_attribution", "insufficient_support", "none",
 )
+REVIEW_DECISIONS = ("accept_for_validation", "revise", "reject", "defer")
+VALIDATION_DECISIONS = ("accept", "reject", "defer", "evaluation_failed")
+UPDATE_COMPONENTS = ("prompt_bank", "router", "scaffold")
 
 
 def _freeze_json(value: Any, where: str) -> Any:
@@ -431,3 +434,82 @@ class ScaffoldUpdateProposal:
         if not self.is_valid and not self.validation_errors:
             raise ValueError("invalid scaffold proposal requires validation_errors")
         _freeze_mapping(self, "provenance")
+
+
+@dataclass(frozen=True)
+class UpdateReview:
+    review_id: str
+    component: Literal["prompt_bank", "router", "scaffold"]
+    proposal_id: str
+    decision: Literal["accept_for_validation", "revise", "reject", "defer"]
+    recommended_scope: Literal[
+        "local_prompt", "routing", "global_scaffold", "meta_only",
+    ]
+    conflicts: tuple[str, ...]
+    required_confirmations: tuple[str, ...]
+    supporting_knowledge_ids: tuple[str, ...]
+    rationale: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.review_id, "review_id")
+        _require_nonempty_str(self.proposal_id, "proposal_id")
+        if self.component not in UPDATE_COMPONENTS:
+            raise ValueError("UpdateReview.component is invalid")
+        if self.decision not in REVIEW_DECISIONS:
+            raise ValueError("UpdateReview.decision is invalid")
+        if self.recommended_scope not in KNOWLEDGE_SCOPES:
+            raise ValueError("UpdateReview.recommended_scope is invalid")
+        for name in (
+            "conflicts", "required_confirmations", "supporting_knowledge_ids",
+        ):
+            _require_str_tuple(getattr(self, name), name)
+        if not isinstance(self.rationale, str):
+            raise TypeError("UpdateReview.rationale must be a string")
+
+
+@dataclass(frozen=True)
+class ComponentValidationResult:
+    validation_id: str
+    component: Literal["prompt_bank", "router", "scaffold"]
+    incumbent_version: str
+    candidate_version: str | None
+    evidence_example_ids: tuple[str, ...]
+    confirmation_example_ids: tuple[str, ...]
+    regression_example_ids: tuple[str, ...]
+    incumbent_metrics: Mapping[str, float]
+    candidate_metrics: Mapping[str, float]
+    regressions: tuple[str, ...]
+    decision: Literal["accept", "reject", "defer", "evaluation_failed"]
+    reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.validation_id, "validation_id")
+        _require_nonempty_str(self.incumbent_version, "incumbent_version")
+        if self.component not in UPDATE_COMPONENTS:
+            raise ValueError("ComponentValidationResult.component is invalid")
+        kind = {"prompt_bank": "bank", "router": "router",
+                "scaffold": "scaffold"}[self.component]
+        validate_component_version(
+            kind, self.incumbent_version,
+            field_name="ComponentValidationResult.incumbent_version")
+        validate_component_version(
+            kind, self.candidate_version,
+            field_name="ComponentValidationResult.candidate_version",
+            allow_none=True)
+        if self.decision not in VALIDATION_DECISIONS:
+            raise ValueError("ComponentValidationResult.decision is invalid")
+        if self.candidate_version is not None and not isinstance(
+                self.candidate_version, str):
+            raise TypeError("candidate_version must be str or None")
+        for name in (
+            "evidence_example_ids", "confirmation_example_ids",
+            "regression_example_ids", "regressions", "reasons",
+        ):
+            _require_str_tuple(getattr(self, name), name)
+        for name in ("incumbent_metrics", "candidate_metrics"):
+            metrics = getattr(self, name)
+            if not isinstance(metrics, Mapping) or any(
+                    not isinstance(value, (int, float)) or isinstance(value, bool)
+                    for value in metrics.values()):
+                raise TypeError(f"{name} must map strings to numeric values")
+            _freeze_mapping(self, name)

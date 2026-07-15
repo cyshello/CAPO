@@ -28,9 +28,10 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 | 4.7 | Routed evaluator smoke (`routed_smoke_test.py`) over frozen fallback and multi-entry conditions | `5331558` |
 | 4.8 | Offline counterfactual evidence builder (`optimization/evidence_builder.py`) over saved Stage 4.7, Phase 2–3, or normalized artifacts | `166d19f` |
 | 4.9 | Deterministic feedback, structured failure attribution, and candidate meta-knowledge boundary | `5eafc6d` |
-| 4.10 | Independent preview-only prompt-bank, router, and scaffold update proposers | this commit |
+| 4.10 | Independent preview-only prompt-bank, router, and scaffold update proposers | `d113927` |
+| 4.11 | Meta-knowledge review, rollback-safe candidate previews, and saved-fixture empirical validation | this commit |
 
-Stages 4.11+ NOT started. Stop-gate protocol: after each stage, run tests,
+Stages 4.12+ NOT started. Stop-gate protocol: after each stage, run tests,
 produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Current configuration state
@@ -94,10 +95,9 @@ produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Exact next step (pending approval)
 
-Stage 4.11: meta-knowledge review and empirical validation — review synthetic
-proposals, build rollback-safe candidate previews, enforce video-separated
-confirmation/regression examples and component thresholds, and write validation
-reports. No canonical commit or optimization loop.
+Stage 4.12: connect one complete saved-fixture optimization iteration and run
+it once with scaffold optimization disabled and once enabled. No captioning,
+DVD reasoning, model calls, canonical commits, or real evaluation.
 
 ### Test commands
 
@@ -115,12 +115,13 @@ reports. No canonical commit or optimization loop.
     surrogate_rollout/tests/test_feedback_generator.py \
     surrogate_rollout/tests/test_failure_attributor.py \
     surrogate_rollout/tests/test_meta_knowledge.py \
-    surrogate_rollout/tests/test_update_proposers.py -q
+    surrogate_rollout/tests/test_update_proposers.py \
+    surrogate_rollout/tests/test_update_review_validation.py -q
 # complete suite (run from /home/intern/youngseo, the repo parent)
 /home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest surrogate_rollout/tests -q
 ```
 
-Suite status after Stage 4.10: 257 passed (78 Phase 0–3 + 179 Phase 4).
+Suite status after Stage 4.11: 269 passed (78 Phase 0–3 + 191 Phase 4).
 
 ---
 

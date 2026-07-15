@@ -1,0 +1,111 @@
+{
+  "review_knowledge": [
+    {
+      "knowledge_id": "knowledge_bank_review_fixture",
+      "knowledge_type": "successful_behavior",
+      "condition": {"component": "prompt_bank"},
+      "principle": "Use a reusable instruction for precise visible-text transcription.",
+      "positive_support_ids": ["proposal_bank_1"],
+      "negative_support_ids": [],
+      "distinct_video_ids": ["proposal_bank_video"],
+      "scope": "local_prompt",
+      "confidence": 0.9,
+      "status": "confirmed",
+      "provenance": {"fixture": "stage4_11"}
+    },
+    {
+      "knowledge_id": "knowledge_router_review_fixture",
+      "knowledge_type": "routing_pattern",
+      "condition": {"component": "router"},
+      "principle": "Route text-visible segments to the text instruction.",
+      "positive_support_ids": ["proposal_router_1"],
+      "negative_support_ids": [],
+      "distinct_video_ids": ["proposal_router_video"],
+      "scope": "routing",
+      "confidence": 0.9,
+      "status": "confirmed",
+      "provenance": {"fixture": "stage4_11"}
+    },
+    {
+      "knowledge_id": "knowledge_scaffold_review_fixture",
+      "knowledge_type": "composition_pattern",
+      "condition": {"component": "scaffold", "multi_entry": true},
+      "principle": "Group related selected instructions without changing the contract.",
+      "positive_support_ids": ["proposal_scaffold_1", "proposal_scaffold_2", "proposal_scaffold_3"],
+      "negative_support_ids": [],
+      "distinct_video_ids": ["proposal_scaffold_video_1", "proposal_scaffold_video_2", "proposal_scaffold_video_3"],
+      "scope": "global_scaffold",
+      "confidence": 0.9,
+      "status": "confirmed",
+      "provenance": {"fixture": "stage4_11"}
+    }
+  ],
+  "proposal_lineage": {
+    "prompt_bank": {
+      "example_ids": ["proposal_bank_1"],
+      "video_ids": ["proposal_bank_video"]
+    },
+    "router": {
+      "example_ids": ["proposal_router_1"],
+      "video_ids": ["proposal_router_video"]
+    },
+    "scaffold": {
+      "example_ids": ["proposal_scaffold_1", "proposal_scaffold_2", "proposal_scaffold_3"],
+      "video_ids": ["proposal_scaffold_video_1", "proposal_scaffold_video_2", "proposal_scaffold_video_3"]
+    }
+  },
+  "confirmation_examples": [
+    {
+      "video_id": "confirmation_video_1",
+      "question_id": "confirmation_1",
+      "question": "Which visible text is shown?",
+      "ground_truth": "A",
+      "provider_index": 1,
+      "options": ["A", "B"],
+      "subtitle_available": false
+    },
+    {
+      "video_id": "confirmation_video_2",
+      "question_id": "confirmation_2",
+      "question": "What happens next?",
+      "ground_truth": "A",
+      "provider_index": 2,
+      "options": ["A", "B"],
+      "subtitle_available": false
+    }
+  ],
+  "regression_examples": [
+    {
+      "video_id": "regression_video_1",
+      "question_id": "regression_1",
+      "question": "Who enters the room?",
+      "ground_truth": "A",
+      "provider_index": 3,
+      "options": ["A", "B"],
+      "subtitle_available": false
+    },
+    {
+      "video_id": "regression_video_2",
+      "question_id": "regression_2",
+      "question": "Which object moves?",
+      "ground_truth": "A",
+      "provider_index": 4,
+      "options": ["A", "B"],
+      "subtitle_available": false
+    }
+  ],
+  "saved_scores": {
+    "prompt_bank": {
+      "incumbent": {"confirmation_1": 0.0, "confirmation_2": 0.0, "regression_1": 1.0, "regression_2": 1.0},
+      "candidate": {"confirmation_1": 1.0, "confirmation_2": 1.0, "regression_1": 1.0, "regression_2": 1.0}
+    },
+    "router": {
+      "incumbent": {"confirmation_1": 0.0, "confirmation_2": 0.0, "regression_1": 1.0, "regression_2": 1.0},
+      "candidate": {"confirmation_1": 1.0, "confirmation_2": 1.0, "regression_1": 0.0, "regression_2": 1.0}
+    },
+    "scaffold": {
+      "incumbent": {"confirmation_1": 0.0, "confirmation_2": 0.0, "regression_1": 1.0, "regression_2": 1.0},
+      "candidate": {"confirmation_1": 1.0, "confirmation_2": 1.0, "regression_1": 1.0, "regression_2": 1.0}
+    }
+  }
+}
