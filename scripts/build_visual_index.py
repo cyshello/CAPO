@@ -16,8 +16,9 @@ import sys
 
 from surrogate_rollout import config
 
-if config.PROMPT_SENS_ROOT not in sys.path:
-    sys.path.insert(0, config.PROMPT_SENS_ROOT)
+for _p in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 def main() -> None:

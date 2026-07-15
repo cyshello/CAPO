@@ -38,28 +38,36 @@ def ensure_backend(
     tool_calling_model: str = config.ORCHESTRATOR_TOOL_MODEL,
     inference_model: str = config.TEXT_FALLBACK_MODEL,
     use_openai_tools: bool = True,
+    preload_captioner: bool = False,
 ) -> None:
     """Install the codex+Qwen+BGE backend once per process (idempotent).
 
-    Must run before any captioning or QA call; the vLLM engine itself is still
-    lazy (built on first vision call)."""
+    Must run before any captioning or QA call. With `preload_captioner` the
+    vLLM engine is built immediately; otherwise it stays lazy. Long-running
+    drivers that will caption at all MUST preload: building the engine after
+    BGE/DB work has spawned thread pools deadlocks vLLM's forked EngineCore in
+    futex_wait (observed 2026-07-14; legacy run_dvd always built the engine
+    first, via before_merge)."""
     global _BACKEND_INSTALLED
     if gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu
-    if _BACKEND_INSTALLED:
-        return
-    import dvd.config as dvd_config
-    from dvd_backend import install_backend
+    if not _BACKEND_INSTALLED:
+        import dvd.config as dvd_config
+        from dvd_backend import install_backend
 
-    dvd_config.LITE_MODE = False
-    install_backend(
-        inference_model,
-        tool_vlm_max_frames=config.TOOL_VLM_MAX_FRAMES,
-        tool_calling_model=tool_calling_model,
-        use_openai_tools=use_openai_tools,
-        tensor_parallel_size=1,
-    )
-    _BACKEND_INSTALLED = True
+        dvd_config.LITE_MODE = False
+        install_backend(
+            inference_model,
+            tool_vlm_max_frames=config.TOOL_VLM_MAX_FRAMES,
+            tool_calling_model=tool_calling_model,
+            use_openai_tools=use_openai_tools,
+            tensor_parallel_size=1,
+        )
+        _BACKEND_INSTALLED = True
+    if preload_captioner:
+        from dvd_backend import get_captioner
+
+        get_captioner()  # build the vLLM engine before any thread pools exist
 
 
 def resolve_frames_dir(sample: dict, video_id: str) -> str:

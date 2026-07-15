@@ -32,8 +32,9 @@ import time
 
 from surrogate_rollout import config
 
-if config.PROMPT_SENS_ROOT not in sys.path:
-    sys.path.insert(0, config.PROMPT_SENS_ROOT)
+for _p in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 DEFAULT_CANDIDATES_FILE = os.path.join(
     config.PROMPT_SENS_ROOT, "prompts", "DVD", "captioner_drift", "prompts.json")
@@ -155,7 +156,8 @@ def main() -> None:
     results_path = os.path.join(args.work_root, "results.jsonl")
     done = load_done(results_path)
 
-    ensure_backend(args.gpu)
+    # preload: the vLLM engine must exist before BGE/DB threads (fork-safety)
+    ensure_backend(args.gpu, preload_captioner=True)
     provider = get_provider(config.BENCHMARK, split=config.BENCHMARK_SPLIT)
     indices = [int(i) for i in args.indices.split(",") if i.strip()]
     policies = [p.strip() for p in args.policies.split(",") if p.strip()]
@@ -179,7 +181,13 @@ def main() -> None:
         }, f, indent=2, default=str)
 
     full_eval = FullRolloutEvaluator()
-    sel_eval = SelectiveSurrogateRolloutEvaluator(retrieval_top_k=args.retrieval_top_k)
+    # text encoder on CPU: the vLLM engine fills the whole GPU; query embedding
+    # is a handful of short strings (image embeddings are precomputed)
+    from surrogate_rollout.retrieval.visual_index import SiglipEmbedder
+
+    sel_eval = SelectiveSurrogateRolloutEvaluator(
+        embedder=SiglipEmbedder(device="cpu"),
+        retrieval_top_k=args.retrieval_top_k)
 
     def make_request(sample, idx, candidate_prompt, policy,
                      baseline_captions, baseline_traj_dir, matched=None):
