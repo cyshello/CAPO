@@ -25,9 +25,10 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 | 4.4 | Fixed scaffold application (`scaffold_applier.py`, deterministic applier, SLM stub) | `cad027a` |
 | 4.5 | Offline routing-to-composition dry run (`offline_dry_run.py`, deterministic fixture CLI) | `f192433` |
 | 4.6 | Routed caption-view adapter (`routed_caption_view.py`) with temporal whole-video registry merge | `1f24dc1` |
-| 4.7 | Routed evaluator smoke (`routed_smoke_test.py`) over frozen fallback and multi-entry conditions | this commit |
+| 4.7 | Routed evaluator smoke (`routed_smoke_test.py`) over frozen fallback and multi-entry conditions | `5331558` |
+| 4.8 | Offline counterfactual evidence builder (`optimization/evidence_builder.py`) over saved Stage 4.7, Phase 2–3, or normalized artifacts | this commit |
 
-Stages 4.8+ NOT started. Stop-gate protocol: after each stage, run tests,
+Stages 4.9+ NOT started. Stop-gate protocol: after each stage, run tests,
 produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Current configuration state
@@ -91,11 +92,10 @@ produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Exact next step (pending approval)
 
-Stage 4.8: offline counterfactual evidence builder — match saved Stage 4.7 or
-Phase 2–3 artifacts, construct deterministic caption differences and evidence
-IDs, retain every correctness transition plus component/selection/composition
-provenance, and write evidence JSONL. No captioning, reasoning, feedback, or
-optimization calls.
+Stage 4.9: feedback, attribution, and meta-knowledge boundary — add typed
+records, deterministic mock feedback, isolated disabled real-feedback parsing,
+failure attribution, and deduplicated candidate knowledge. No update proposals,
+review, validation, model calls, or optimization.
 
 ### Test commands
 
@@ -108,12 +108,13 @@ optimization calls.
     surrogate_rollout/tests/test_scaffold_applier.py \
     surrogate_rollout/tests/test_offline_dry_run.py \
     surrogate_rollout/tests/test_routed_caption_view.py \
-    surrogate_rollout/tests/test_routed_smoke_test.py -q
+    surrogate_rollout/tests/test_routed_smoke_test.py \
+    surrogate_rollout/tests/test_evidence_builder.py -q
 # complete suite (run from /home/intern/youngseo, the repo parent)
 /home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest surrogate_rollout/tests -q
 ```
 
-Suite status after Stage 4.7: 215 passed (78 Phase 0–3 + 137 Phase 4).
+Suite status after Stage 4.8: 229 passed (78 Phase 0–3 + 151 Phase 4).
 
 ---
 
