@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
+from surrogate_rollout.prompt_routing.schemas import (
+    ScaffoldPolicySnapshot,
+    validate_component_version,
+)
+
 
 OUTCOME_TRANSITIONS = (
     "correct_to_correct",
@@ -35,6 +40,12 @@ KNOWLEDGE_TYPES = (
 
 KNOWLEDGE_SCOPES = ("local_prompt", "routing", "global_scaffold", "meta_only")
 KNOWLEDGE_STATUSES = ("candidate", "confirmed", "rejected", "deprecated")
+PROMPT_BANK_OPERATION_TYPES = (
+    "add_entry", "revise_entry", "merge_entries", "retire_entry", "no_op",
+)
+SCAFFOLD_SKIP_REASONS = (
+    "disabled_by_config", "no_scaffold_attribution", "insufficient_support", "none",
+)
 
 
 def _freeze_json(value: Any, where: str) -> Any:
@@ -300,3 +311,123 @@ class MetaKnowledgeItem:
         _freeze_mapping(self, "condition")
         _freeze_mapping(self, "provenance")
         _require_confidence(self.confidence, "MetaKnowledgeItem.confidence")
+
+
+@dataclass(frozen=True)
+class PromptBankOperation:
+    operation_id: str
+    operation_type: Literal[
+        "add_entry", "revise_entry", "merge_entries", "retire_entry", "no_op",
+    ]
+    target_ids: tuple[str, ...]
+    payload: Mapping[str, Any]
+    source_feedback_ids: tuple[str, ...]
+    confidence: float
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.operation_id, "operation_id")
+        if self.operation_type not in PROMPT_BANK_OPERATION_TYPES:
+            raise ValueError("PromptBankOperation.operation_type is invalid")
+        _require_str_tuple(self.target_ids, "target_ids")
+        _require_str_tuple(self.source_feedback_ids, "source_feedback_ids")
+        if not self.source_feedback_ids:
+            raise ValueError("PromptBankOperation.source_feedback_ids must not be empty")
+        if self.operation_type == "add_entry" and self.target_ids:
+            raise ValueError("add_entry must not specify existing target_ids")
+        if self.operation_type == "revise_entry" and len(self.target_ids) != 1:
+            raise ValueError("revise_entry requires exactly one target_id")
+        if self.operation_type == "merge_entries" and len(self.target_ids) < 2:
+            raise ValueError("merge_entries requires at least two target_ids")
+        if self.operation_type == "retire_entry" and not self.target_ids:
+            raise ValueError("retire_entry requires target_ids")
+        _freeze_mapping(self, "payload")
+        _require_confidence(self.confidence, "PromptBankOperation.confidence")
+
+
+@dataclass(frozen=True)
+class PromptBankUpdateProposal:
+    proposal_id: str
+    input_bank_version: str
+    operations: tuple[PromptBankOperation, ...]
+    validation_errors: tuple[str, ...]
+    is_valid: bool
+    provenance: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.proposal_id, "proposal_id")
+        validate_component_version(
+            "bank", self.input_bank_version,
+            field_name="PromptBankUpdateProposal.input_bank_version")
+        if not isinstance(self.operations, tuple) or any(
+                not isinstance(item, PromptBankOperation) for item in self.operations):
+            raise TypeError("operations must contain PromptBankOperation records")
+        _require_str_tuple(self.validation_errors, "validation_errors")
+        if self.is_valid and self.validation_errors:
+            raise ValueError("valid bank proposal cannot contain validation_errors")
+        if not self.is_valid and not self.validation_errors:
+            raise ValueError("invalid bank proposal requires validation_errors")
+        _freeze_mapping(self, "provenance")
+
+
+@dataclass(frozen=True)
+class RouterUpdateProposal:
+    proposal_id: str
+    input_router_version: str
+    operations: tuple[Mapping[str, Any], ...]
+    source_feedback_ids: tuple[str, ...]
+    validation_errors: tuple[str, ...]
+    is_valid: bool
+    provenance: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.proposal_id, "proposal_id")
+        validate_component_version(
+            "router", self.input_router_version,
+            field_name="RouterUpdateProposal.input_router_version")
+        if not isinstance(self.operations, tuple) or any(
+                not isinstance(item, Mapping) for item in self.operations):
+            raise TypeError("RouterUpdateProposal.operations must contain mappings")
+        object.__setattr__(self, "operations", _freeze_json(
+            self.operations, "RouterUpdateProposal.operations"))
+        _require_str_tuple(self.source_feedback_ids, "source_feedback_ids")
+        _require_str_tuple(self.validation_errors, "validation_errors")
+        if self.is_valid and self.validation_errors:
+            raise ValueError("valid router proposal cannot contain validation_errors")
+        if not self.is_valid and not self.validation_errors:
+            raise ValueError("invalid router proposal requires validation_errors")
+        _freeze_mapping(self, "provenance")
+
+
+@dataclass(frozen=True)
+class ScaffoldUpdateProposal:
+    proposal_id: str
+    input_scaffold_version: str
+    candidate_policy: ScaffoldPolicySnapshot | None
+    source_feedback_ids: tuple[str, ...]
+    validation_errors: tuple[str, ...]
+    is_valid: bool
+    skipped_reason: Literal[
+        "disabled_by_config", "no_scaffold_attribution",
+        "insufficient_support", "none",
+    ]
+    provenance: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.proposal_id, "proposal_id")
+        validate_component_version(
+            "scaffold", self.input_scaffold_version,
+            field_name="ScaffoldUpdateProposal.input_scaffold_version")
+        if self.candidate_policy is not None and not isinstance(
+                self.candidate_policy, ScaffoldPolicySnapshot):
+            raise TypeError("candidate_policy must be ScaffoldPolicySnapshot or None")
+        _require_str_tuple(self.source_feedback_ids, "source_feedback_ids")
+        _require_str_tuple(self.validation_errors, "validation_errors")
+        if self.skipped_reason not in SCAFFOLD_SKIP_REASONS:
+            raise ValueError("ScaffoldUpdateProposal.skipped_reason is invalid")
+        if self.skipped_reason != "none" and self.candidate_policy is not None:
+            raise ValueError("skipped scaffold proposal cannot carry candidate_policy")
+        if self.is_valid and self.validation_errors:
+            raise ValueError("valid scaffold proposal cannot contain validation_errors")
+        if not self.is_valid and not self.validation_errors:
+            raise ValueError("invalid scaffold proposal requires validation_errors")
+        _freeze_mapping(self, "provenance")

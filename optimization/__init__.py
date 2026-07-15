@@ -1,8 +1,8 @@
 """Phase 4 optimization data boundaries.
 
-Stage 4.9 provides offline evidence, deterministic feedback, attribution, and
-candidate meta-knowledge. Proposals, review, validation, and optimization are
-intentionally absent until later stop-gated stages.
+Stage 4.10 adds preview-only component proposals to the offline evidence,
+feedback, attribution, and candidate meta-knowledge boundaries. Review,
+validation, commit, and optimization are intentionally absent.
 """
 
 from surrogate_rollout.optimization.evidence_builder import (
@@ -24,6 +24,10 @@ from surrogate_rollout.optimization.schemas import (
     FeedbackBatch,
     FeedbackItem,
     MetaKnowledgeItem,
+    PromptBankOperation,
+    PromptBankUpdateProposal,
+    RouterUpdateProposal,
+    ScaffoldUpdateProposal,
 )
 from surrogate_rollout.optimization.failure_attributor import (
     AttributionError,
@@ -38,6 +42,18 @@ from surrogate_rollout.optimization.feedback_generator import (
     write_feedback_batch,
 )
 from surrogate_rollout.optimization.meta_knowledge import MetaKnowledgeStore
+from surrogate_rollout.optimization.prompt_bank_update_proposer import (
+    DeterministicPromptBankUpdateProposer,
+    PromptBankUpdateProposer,
+)
+from surrogate_rollout.optimization.router_update_proposer import (
+    DeterministicRouterUpdateProposer,
+    RouterUpdateProposer,
+)
+from surrogate_rollout.optimization.scaffold_update_proposer import (
+    DeterministicScaffoldUpdateProposer,
+    ScaffoldUpdateProposer,
+)
 from surrogate_rollout.optimization.policies import (
     LLMFeedbackGenerator,
     MockFeedbackGenerator,
@@ -49,6 +65,9 @@ __all__ = [
     "CounterfactualEvidence",
     "CounterfactualEvidenceBuilder",
     "DeterministicFailureAttributor",
+    "DeterministicPromptBankUpdateProposer",
+    "DeterministicRouterUpdateProposer",
+    "DeterministicScaffoldUpdateProposer",
     "EvidenceBuildError",
     "FailureAttribution",
     "FailureAttributor",
@@ -62,6 +81,13 @@ __all__ = [
     "MetaKnowledgeStore",
     "MockFeedbackGenerator",
     "RealFeedbackDisabledError",
+    "PromptBankUpdateProposer",
+    "PromptBankOperation",
+    "PromptBankUpdateProposal",
+    "RouterUpdateProposer",
+    "RouterUpdateProposal",
+    "ScaffoldUpdateProposer",
+    "ScaffoldUpdateProposal",
     "SavedEvaluationArtifact",
     "attach_attributions",
     "load_normalized_evaluations",
