@@ -324,6 +324,14 @@ def test_parent_version_provenance_round_trip(tmp_path):
     assert store.load_version(BANK_V1).parent_bank_version is None  # history intact
 
 
+def test_list_versions_sorts_numerically(tmp_path):
+    store = prompt_bank_store(str(tmp_path))
+    for n in (10, 2, 10000, 9999):
+        store.save_snapshot(bank(version=make_component_version("bank", n)))
+    assert store.list_versions() == (
+        "bank_v0002", "bank_v0010", "bank_v9999", "bank_v10000")
+
+
 # ------------------------------ digest semantics ---------------------------- #
 def test_assign_version_digest_suffix_round_trip(tmp_path):
     store = prompt_bank_store(str(tmp_path))

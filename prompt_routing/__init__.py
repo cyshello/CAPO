@@ -5,6 +5,15 @@ persistence and cross-record validation. Routing logic, scaffold application,
 and caption integration arrive in later stages.
 """
 
+from surrogate_rollout.prompt_routing.policies.rule_based_router import (
+    RuleBasedPromptRouter,
+)
+from surrogate_rollout.prompt_routing.router import (
+    PromptRouter,
+    read_routing_decisions,
+    routing_decision_from_json,
+    write_routing_decisions,
+)
 from surrogate_rollout.prompt_routing.persistence import (
     ComponentSnapshotStore,
     SnapshotStoreError,
@@ -48,6 +57,11 @@ from surrogate_rollout.prompt_routing.schemas import (
 __all__ = [
     "COMPONENT_KINDS",
     "ComponentSnapshotStore",
+    "PromptRouter",
+    "RuleBasedPromptRouter",
+    "read_routing_decisions",
+    "routing_decision_from_json",
+    "write_routing_decisions",
     "SnapshotStoreError",
     "SnapshotValidationError",
     "VersionConflictError",

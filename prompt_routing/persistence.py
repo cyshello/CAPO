@@ -34,6 +34,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
@@ -313,11 +314,19 @@ class ComponentSnapshotStore:
         return self.load_version(version)
 
     def list_versions(self) -> tuple[str, ...]:
+        """Versions ordered by the parsed numeric component version (then the
+        full string as tie-break), not lexicographically — 'v0002' sorts
+        before 'v0010' and 'v10000' after 'v9999'."""
         if not os.path.isdir(self.snapshots_dir):
             return ()
-        return tuple(sorted(
-            name[:-len(".json")] for name in os.listdir(self.snapshots_dir)
-            if name.endswith(".json") and not name.startswith(".tmp_")))
+        names = [name[:-len(".json")] for name in os.listdir(self.snapshots_dir)
+                 if name.endswith(".json") and not name.startswith(".tmp_")]
+
+        def numeric_key(version: str) -> tuple[int, str]:
+            m = re.search(r"_v(\d+)", version)
+            return (int(m.group(1)) if m else -1, version)
+
+        return tuple(sorted(names, key=numeric_key))
 
     # ------------------------------ preview ------------------------------- #
     def write_preview(self, record: Any, preview_dir: str) -> str:
