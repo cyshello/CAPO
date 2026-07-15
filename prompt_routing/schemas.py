@@ -9,9 +9,11 @@ the two schema modules).
 
 Design constraints enforced here:
 
-- Records are frozen dataclasses; mapping fields are wrapped in
-  MappingProxyType at construction so neither attributes nor mappings can be
-  mutated in place (§21.2/§21.9).
+- Records are frozen dataclasses; structured fields are recursively frozen at
+  construction (mappings -> MappingProxyType copies, lists -> tuples, sets ->
+  deterministically ordered tuples), so neither attributes nor nested values
+  can be mutated in place, and later mutation of the caller's source objects
+  cannot reach a constructed record (§21.2/§21.9).
 - Hashes and version identifiers are validated at construction so no record
   can exist with an inconsistent prompt_hash or a version string of the wrong
   component kind (§21.3).
@@ -41,9 +43,16 @@ from surrogate_rollout.schemas import sha256_text
 #                        component-version identifiers                         #
 # --------------------------------------------------------------------------- #
 # Format: "<kind>_v<NNNN>" with an optional content suffix "_<hex8..16>",
-# e.g. "bank_v0001", "scaffold_v0002_ab12cd34". The numeric part orders
-# versions; the optional suffix ties a version to content without replacing
-# the lineage number.
+# e.g. "bank_v0001", "scaffold_v0002_ab12cd34".
+#
+# Semantics (binding for Stage 4.2 persistence):
+# - the numeric portion is a component-local, monotonically increasing
+#   version number (lineage order within one component kind);
+# - the optional hex suffix is a snapshot-content digest;
+# - component versions are provenance identifiers, NOT caption-cache keys
+#   (caption-cache identity derives from composed prompt text/hash only);
+# - changed content must receive a new version;
+# - an existing version ID must never be overwritten with different content.
 
 COMPONENT_KINDS = ("bank", "router", "scaffold", "contract")
 
@@ -52,8 +61,6 @@ _VERSION_RE = {
     for kind in COMPONENT_KINDS
 }
 
-# Existing repo clip key, e.g. "0_10" (PHASE4 segment == Phase 0-3 clip).
-_SEGMENT_ID_RE = re.compile(r"^\d+_\d+$")
 
 
 def make_component_version(kind: str, number: int, content_hash: str | None = None) -> str:
@@ -89,14 +96,32 @@ def validate_component_version(kind: str, version: str | None, *,
 # --------------------------------------------------------------------------- #
 #                              internal helpers                                #
 # --------------------------------------------------------------------------- #
+def _deep_freeze(value: Any, where: str) -> Any:
+    """Recursively copy-and-freeze a schema-owned structured value: mappings
+    become MappingProxyType copies, lists/tuples become tuples, sets become
+    deterministically ordered tuples. Only JSON-vocabulary leaves are accepted
+    so no raw object can hide inside a record."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _deep_freeze(v, f"{where}[{k!r}]")
+                                 for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v, f"{where}[{i}]") for i, v in enumerate(value))
+    if isinstance(value, (set, frozenset)):
+        frozen = tuple(_deep_freeze(v, where) for v in value)
+        return tuple(sorted(frozen, key=lambda v: (type(v).__name__, repr(v))))
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"{where}: not a schema-serializable value "
+                    f"({type(value).__name__})")
+
+
 def _freeze_mapping(record: Any, name: str) -> None:
     value = getattr(record, name)
-    if isinstance(value, MappingProxyType):
-        return
     if not isinstance(value, Mapping):
         raise TypeError(f"{type(record).__name__}.{name} must be a Mapping, "
                         f"got {type(value).__name__}")
-    object.__setattr__(record, name, MappingProxyType(dict(value)))
+    object.__setattr__(record, name,
+                       _deep_freeze(value, f"{type(record).__name__}.{name}"))
 
 
 def _require(condition: bool, message: str) -> None:
@@ -281,9 +306,10 @@ class RouterPolicySnapshot:
 
 @dataclass(frozen=True)
 class SegmentContext:
-    """Routing input for one segment. `segment_id` IS the existing repo clip
-    key "{start}_{end}" (Stage 4.0 §5) — Phase 4 introduces no new
-    segmentation system."""
+    """Routing input for one segment. `segment_id` is an opaque, non-empty
+    identifier. The current DVD pipeline uses the clip key "{start}_{end}"
+    (Stage 4.0 §5) — Phase 4 introduces no new segmentation system — but that
+    format is validated by the later DVD/routed-caption adapter, not here."""
 
     video_id: str
     segment_id: str
@@ -296,9 +322,8 @@ class SegmentContext:
 
     def __post_init__(self) -> None:
         _require(bool(self.video_id), "SegmentContext.video_id must be non-empty")
-        _require(bool(self.segment_id) and bool(_SEGMENT_ID_RE.match(self.segment_id)),
-                 f"SegmentContext.segment_id must be a clip key like '0_10', "
-                 f"got {self.segment_id!r}")
+        _require(isinstance(self.segment_id, str) and bool(self.segment_id),
+                 "SegmentContext.segment_id must be a non-empty string")
         if self.timestamp_start is not None and self.timestamp_end is not None:
             _require(self.timestamp_start < self.timestamp_end,
                      "SegmentContext timestamps must satisfy start < end")
@@ -309,7 +334,12 @@ class SegmentContext:
 @dataclass(frozen=True)
 class RoutingDecision:
     """Structured multi-entry selection for one segment (§10.2). Never
-    unstructured prose; supports zero or more selected entries."""
+    unstructured prose; supports zero or more selected entries.
+
+    `prompt_scores` may contain scores for ALL active candidates the router
+    considered; `selected_prompt_ids` records the final committed selection.
+    Scores are deliberately not constrained to selected entries — rejected
+    candidates' scores are evidence for later router optimization."""
 
     video_id: str
     segment_id: str

@@ -172,6 +172,57 @@ def test_source_mapping_mutation_does_not_leak_in():
     assert e.provenance["origin"] == "unit"  # defensive copy at construction
 
 
+# --------------------------- recursive freezing ---------------------------- #
+def test_nested_source_dict_mutation_does_not_leak_in():
+    src = {"outer": {"inner": "unit", "deep": {"k": 1}}}
+    e = entry(provenance=src)
+    src["outer"]["inner"] = "mutated"
+    src["outer"]["deep"]["k"] = 999
+    assert e.provenance["outer"]["inner"] == "unit"
+    assert e.provenance["outer"]["deep"]["k"] == 1
+
+
+def test_nested_source_list_mutation_does_not_leak_in():
+    src = {"steps": ["a", "b"], "nested": [{"k": ["x"]}]}
+    e = entry(provenance=src)
+    src["steps"].append("c")
+    src["nested"][0]["k"].append("y")
+    assert e.provenance["steps"] == ("a", "b")
+    assert e.provenance["nested"][0]["k"] == ("x",)
+
+
+def test_nested_values_immutable_through_record():
+    e = entry(provenance={"outer": {"inner": 1}, "steps": ["a", "b"]})
+    with pytest.raises(TypeError):
+        e.provenance["outer"]["inner"] = 2      # nested mapping frozen
+    assert isinstance(e.provenance["steps"], tuple)  # list became tuple
+    with pytest.raises(AttributeError):
+        e.provenance["steps"].append("c")
+
+
+def test_sets_become_deterministic_tuples():
+    a = entry(provenance={"tags": {"b", "a", "c"}})
+    b = entry(provenance={"tags": {"c", "a", "b"}})
+    assert a.provenance["tags"] == ("a", "b", "c")
+    assert dumps_canonical(a) == dumps_canonical(b)
+
+
+def test_raw_objects_inside_mappings_rejected_at_construction():
+    with pytest.raises(TypeError):
+        entry(provenance={"handle": object()})
+    with pytest.raises(TypeError):
+        segment(segment_features={"nested": [{"bad": object()}]})
+
+
+def test_recursively_frozen_data_serializes_deterministically():
+    e = entry(provenance={"z": {"b": [2, 1], "a": {"y", "x"}}, "a": ["m"]})
+    d = as_json_dict(e)
+    assert d["provenance"] == {"z": {"b": [2, 1], "a": ["x", "y"]}, "a": ["m"]}
+    assert isinstance(d["provenance"]["a"], list)  # plain JSON types out
+    assert dumps_canonical(e) == dumps_canonical(entry(
+        provenance={"a": ["m"], "z": {"a": {"x", "y"}, "b": [2, 1]}}))
+
+
 # ------------------------- deterministic serialization --------------------- #
 def test_deterministic_serialization_across_mapping_order():
     a = decision()
@@ -331,9 +382,19 @@ def test_trace_partition_enforced():
     assert t.omitted_prompt_ids == ("pe_b",)
 
 
-def test_segment_id_is_repo_clip_key():
+def test_segment_id_is_opaque_non_empty():
+    # current integer clip key
+    assert SegmentContext(video_id="v", segment_id="0_10").segment_id == "0_10"
+    # decimal timestamp key
+    assert SegmentContext(video_id="v", segment_id="12.5_20.0").segment_id == "12.5_20.0"
+    # other opaque identifier (format checks belong to the DVD adapter)
+    assert SegmentContext(video_id="v", segment_id="shot-007").segment_id == "shot-007"
+    # empty rejected
     with pytest.raises(ValueError):
-        SegmentContext(video_id="v", segment_id="segment-7")
+        SegmentContext(video_id="v", segment_id="")
+
+
+def test_segment_timestamps_ordered():
     with pytest.raises(ValueError):
         segment(timestamp_start=10.0, timestamp_end=0.0)
 
@@ -395,3 +456,14 @@ def test_config_round_trip_preserves_all_switches(flags):
     assert restored == cfg
     assert restored.optimization == cfg.optimization
     assert dumps_canonical(restored) == dumps_canonical(cfg)
+
+
+def test_config_round_trip_via_canonical_json_nested_values():
+    cfg = Phase4Config(seed=3, dry_run=False, commit=True,
+                       optimization=Phase4OptimizationConfig(
+                           optimize_scaffold=True, max_iterations=2,
+                           min_feedback_confidence=0.5))
+    restored = Phase4Config.from_json_dict(json.loads(dumps_canonical(cfg)))
+    assert restored == cfg
+    assert restored.optimize_scaffold is True
+    assert restored.optimization.min_feedback_confidence == 0.5
