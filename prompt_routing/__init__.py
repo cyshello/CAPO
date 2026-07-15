@@ -2,8 +2,17 @@
 
 Stage 4.1: foundational typed records. Stage 4.2: versioned component
 persistence and cross-record validation. Stage 4.3: routing. Stage 4.4:
-scaffold application. Caption integration arrives in later stages.
+scaffold application. Stage 4.5: offline routing-to-composition dry runs.
+Caption integration arrives in later stages.
 """
+
+from surrogate_rollout.prompt_routing.offline_dry_run import (
+    OfflineDryRunError,
+    OfflineDryRunResult,
+    load_fixture_bundle,
+    run_offline_dry_run,
+    segment_context_from_json,
+)
 
 from surrogate_rollout.prompt_routing.policies.deterministic_scaffold import (
     INSERTION_MARKER,
@@ -77,6 +86,8 @@ __all__ = [
     "ComponentSnapshotStore",
     "DeterministicScaffoldApplier",
     "INSERTION_MARKER",
+    "OfflineDryRunError",
+    "OfflineDryRunResult",
     "PromptRouter",
     "RuleBasedPromptRouter",
     "SLMScaffoldApplier",
@@ -86,12 +97,15 @@ __all__ = [
     "create_scaffold_applier",
     "estimate_prompt_tokens",
     "finalize_composed_prompt",
+    "load_fixture_bundle",
     "read_composed_prompts",
     "validate_composed_text",
     "write_composed_prompts",
     "read_routing_decisions",
     "routing_decision_from_json",
     "write_routing_decisions",
+    "run_offline_dry_run",
+    "segment_context_from_json",
     "SnapshotStoreError",
     "SnapshotValidationError",
     "VersionConflictError",

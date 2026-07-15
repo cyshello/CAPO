@@ -11,7 +11,7 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 
 ---
 
-## Implementation progress (updated 2026-07-15)
+## Implementation progress (updated 2026-07-16)
 
 ### Completed stages and commits
 
@@ -22,8 +22,10 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 | 4.1h | Hardening: opaque `segment_id`, recursive deep-freeze, version/digest + `prompt_scores` semantics documented | `4d5c416` |
 | 4.2 | Versioned persistence (`persistence.py`) + cross-record validation (`validators.py`) | `bcc5bdb` |
 | 4.3 | Multi-entry rule-based router (`router.py`, `policies/rule_based_router.py`) + numeric `list_versions` sort | `ce8c776` |
+| 4.4 | Fixed scaffold application (`scaffold_applier.py`, deterministic applier, SLM stub) | `cad027a` |
+| 4.5 | Offline routing-to-composition dry run (`offline_dry_run.py`, deterministic fixture CLI) | this commit |
 
-Stages 4.4+ NOT started. Stop-gate protocol: after each stage, run tests,
+Stages 4.6+ NOT started. Stop-gate protocol: after each stage, run tests,
 produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Current configuration state
@@ -87,12 +89,11 @@ produce the Section 20 checkpoint report, stop, wait for approval.
 
 ### Exact next step (pending approval)
 
-Stage 4.4: fixed scaffold application — `ScaffoldApplier` protocol (§11.2),
-`DeterministicScaffoldApplier`, initial real applier behind configuration,
-composed-prompt validation against `ScaffoldContract` (reuse
-`REQUIRED_PLACEHOLDERS` semantics from `captioning/candidate_captions.py`),
-composition-trace logging, interface-compatible SLM stub that fails clearly.
-Scaffold policy frozen; no scaffold updates; 12 tests per Stage 4.4 list.
+Stage 4.6: routed caption-view adapter — accept a per-segment
+`ComposedCaptionPrompt` map, group captioning calls by composed-prompt hash,
+restore per-clip outputs to temporal order, and reuse the unchanged existing
+whole-video subject-registry merge. Preserve cache isolation and component
+version provenance; do not implement routed DVD evaluation.
 
 ### Test commands
 
@@ -101,12 +102,14 @@ Scaffold policy frozen; no scaffold updates; 12 tests per Stage 4.4 list.
 /home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest \
     surrogate_rollout/tests/test_phase4_schemas.py \
     surrogate_rollout/tests/test_phase4_persistence.py \
-    surrogate_rollout/tests/test_prompt_router.py -q
+    surrogate_rollout/tests/test_prompt_router.py \
+    surrogate_rollout/tests/test_scaffold_applier.py \
+    surrogate_rollout/tests/test_offline_dry_run.py -q
 # complete suite (run from /home/intern/youngseo, the repo parent)
 /home/intern/.conda/envs/local_llm_vllm/bin/python -m pytest surrogate_rollout/tests -q
 ```
 
-Suite status at `ce8c776`: 167 passed (78 Phase 0–3 + 89 Phase 4).
+Suite status after Stage 4.5: 198 passed (78 Phase 0–3 + 120 Phase 4).
 
 ---
 
