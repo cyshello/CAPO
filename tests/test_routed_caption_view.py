@@ -13,6 +13,7 @@ from surrogate_rollout.cache.caption_cache import prompt_hash as cache_prompt_ha
 from surrogate_rollout.captioning.candidate_captions import CandidateCaptionSet
 from surrogate_rollout.prompt_routing.routed_caption_view import (
     ROUTED_PROMPT_VIEW,
+    ROUTED_SELECTIVE_PROMPT_VIEW,
     RoutedCaptionViewBuilder,
     RoutedCaptionViewError,
 )
@@ -58,8 +59,9 @@ def composed(segment_id, specialization="temporal", *, valid=True, text=None):
 
 
 class FakeCaptioner:
-    def __init__(self, clips=CLIPS):
+    def __init__(self, clips=CLIPS, ckpt_root=None):
         self.clips = tuple(clips)
+        self.ckpt_root = Path(ckpt_root) if ckpt_root else None
         self.calls = []
 
     def __call__(self, *, sample, candidate_prompt, merge_prompt, clip_ids,
@@ -80,10 +82,17 @@ class FakeCaptioner:
             }
             for key in reversed(ordered_requested)
         }
+        ckpt_dir = (self.ckpt_root / strong_hash[:12]
+                    if self.ckpt_root else
+                    Path(f"/candidate_cache/{strong_hash[:12]}/ckpt"))
+        if self.ckpt_root:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            for key, value in parsed.items():
+                (ckpt_dir / f"{key}.json").write_text(json.dumps(value))
         return CandidateCaptionSet(
             video_id=VIDEO_ID,
             prompt_hash=strong_hash,
-            ckpt_dir=f"/candidate_cache/{strong_hash[:12]}/ckpt",
+            ckpt_dir=str(ckpt_dir),
             clips=list(self.clips),
             parsed=parsed,
             caption_call_count=len(clip_ids),
@@ -235,6 +244,36 @@ def test_routed_view_never_labeled_as_full_single_prompt_cache(tmp_path):
     assert "captions_full" not in artifact.captions_path
     sidecar = json.loads(Path(artifact.routed_view_path).read_text())
     assert sidecar["artifact_type"] == "routed_prompt_view"
+
+
+def test_selective_routed_view_replaces_only_selected_and_merges_temporally(
+    tmp_path,
+):
+    baseline_captioner = FakeCaptioner(ckpt_root=tmp_path / "baseline_ckpt")
+    baseline, _, _ = build(
+        tmp_path / "baseline", same_prompt_map(), captioner=baseline_captioner)
+    candidate_captioner = FakeCaptioner(ckpt_root=tmp_path / "candidate_ckpt")
+    merger = MergeRecorder()
+    artifact = RoutedCaptionViewBuilder(
+        caption_fn=candidate_captioner,
+        clip_index_fn=clip_index,
+        merge_fn=merger,
+    ).build_selective(
+        sample={"sample_id": VIDEO_ID, "video_path": "unused.mp4"},
+        segment_composed_prompt_map={
+            key: composed(key, "text") for key in CLIPS},
+        selected_segment_ids={"10_20", "30_40"},
+        baseline_view=baseline,
+        work_root=str(tmp_path / "selective_work"),
+        merge_prompt=MERGE_PROMPT,
+        candidate_cache_root=str(tmp_path / "candidate_cache"),
+    )
+    assert artifact.artifact_type == ROUTED_SELECTIVE_PROMPT_VIEW
+    assert candidate_captioner.calls[0]["clip_ids"] == {"10_20", "30_40"}
+    assert len(merger.calls) == 1
+    assert [value["segment_id"] for value in merger.calls[0]] == list(CLIPS)
+    captions = json.loads(Path(artifact.captions_path).read_text())
+    assert list(captions) == [*CLIPS, "subject_registry"]
 
 
 def test_missing_composed_prompt_rejected_before_captioning(tmp_path):

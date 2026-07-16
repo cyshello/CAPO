@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
@@ -103,8 +104,15 @@ def evaluate_routed_states(
     source_revision: str,
     gpu: str,
     dvd_max_iterations: int,
+    rollout_mode: str = "full",
+    max_selected_clips: int = 32,
+    candidate_cache_root: str | None = None,
 ) -> RealEvaluationResult:
     """Evaluate two component states through existing routed/DVD services."""
+    if rollout_mode not in ("full", "selective"):
+        raise ValueError("rollout_mode must be full or selective")
+    if max_selected_clips < 1:
+        raise ValueError("max_selected_clips must be positive")
     states = {
         "incumbent": (
             incumbent_bank, incumbent_router, incumbent_scaffold,
@@ -169,6 +177,8 @@ def evaluate_routed_states(
     error_maps = {}
     artifacts = {}
     timing = {}
+    incumbent_views = {}
+    incumbent_qa_dirs = {}
     for state_name, (bank, router, scaffold, contract) in states.items():
         if state_name == "candidate" and no_change is not None:
             score_maps[state_name] = {}
@@ -184,21 +194,58 @@ def evaluate_routed_states(
             sample = video_qas[0][1]
             routing_dir = os.path.join(state_dir, "routing", video_id)
             offline = offline_results[state_name][video_id]
-            caption_view = RoutedCaptionViewBuilder().build(
-                sample=sample,
-                segment_composed_prompt_map={
-                    item.segment_id: item for item in offline.composed_prompts},
-                work_root=os.path.join(state_dir, "caption_view"),
-                merge_prompt=merge_prompt)
+            prompt_map = {
+                item.segment_id: item for item in offline.composed_prompts}
+            all_segment_ids = tuple(prompt_map)
+            caption_view = None
+            if state_name == "incumbent" or rollout_mode == "full":
+                caption_view = RoutedCaptionViewBuilder().build(
+                    sample=sample,
+                    segment_composed_prompt_map=prompt_map,
+                    work_root=os.path.join(state_dir, "caption_view"),
+                    merge_prompt=merge_prompt,
+                    candidate_cache_root=candidate_cache_root)
+                if state_name == "incumbent":
+                    incumbent_views[video_id] = caption_view
             for example, qa_sample in video_qas:
                 qa_dir = os.path.join(
                     state_dir, "qa", example.question_id.replace("/", "-"))
+                selection = None
+                fallback_type = "none"
+                fallback_reason = None
+                if state_name == "candidate" and rollout_mode == "selective":
+                    reference_path = os.path.join(
+                        incumbent_qa_dirs[example.question_id], "references.json")
+                    with open(reference_path) as f:
+                        references = json.load(f)
+                    referenced = set(
+                        references.get("consumed_segments") or
+                        references.get("frame_inspected_segments") or
+                        references.get("returned_segments") or ())
+                    ordered = [value for value in incumbent_views[video_id].segment_ids
+                               if value in referenced]
+                    if not ordered:
+                        ordered = list(incumbent_views[video_id].segment_ids)
+                        fallback_type = "full_rollout"
+                        fallback_reason = "no incumbent trace references"
+                    selection = set(ordered[:max_selected_clips])
+                    caption_view = RoutedCaptionViewBuilder().build_selective(
+                        sample=sample,
+                        segment_composed_prompt_map=prompt_map,
+                        selected_segment_ids=selection,
+                        baseline_view=incumbent_views[video_id],
+                        work_root=os.path.join(state_dir, "caption_view"),
+                        merge_prompt=merge_prompt,
+                        candidate_cache_root=candidate_cache_root,
+                        view_name=example.question_id.replace("/", "-"))
                 result = run_dvd_qa(
                     captions_path=caption_view.captions_path,
                     sample=qa_sample, run_dir=qa_dir,
                     question_id=example.question_id,
                     database_path=caption_view.database_path,
                     max_iterations=dvd_max_iterations, gpu=gpu)
+                if state_name == "incumbent":
+                    incumbent_qa_dirs[example.question_id] = qa_dir
                 rows.append({
                     "question_id": example.question_id,
                     "video_id": example.video_id,
@@ -211,6 +258,7 @@ def evaluate_routed_states(
                     "reasoning_seconds": result.latency_seconds,
                     "captions_path": result.captions_path,
                     "database_path": result.database_path,
+                    "trajectory_path": os.path.join(qa_dir, "trajectory.jsonl"),
                     "routing_decisions_path": os.path.join(
                         routing_dir, "routing", "decisions.jsonl"),
                     "composition_traces_path": os.path.join(
@@ -221,6 +269,19 @@ def evaluate_routed_states(
                     "caption_call_count": caption_view.caption_call_count,
                     "caption_cache_hits": caption_view.caption_cache_hits,
                     "caption_seconds": caption_view.caption_seconds,
+                    "rollout_mode": (rollout_mode if state_name == "candidate"
+                                     else "full"),
+                    "selection_policy": ("trace_reference_budget"
+                                         if selection is not None else
+                                         "full_rollout"),
+                    "selected_clip_ids": (tuple(sorted(selection))
+                                          if selection is not None else
+                                          all_segment_ids),
+                    "recaption_fraction": (
+                        len(selection) / len(all_segment_ids)
+                        if selection is not None else 1.0),
+                    "fallback_type": fallback_type,
+                    "fallback_reason": fallback_reason,
                     "component_versions": {
                         "bank": bank.bank_version,
                         "router": router.router_version,
@@ -249,6 +310,7 @@ def evaluate_routed_states(
         "incumbent_scaffold_version": incumbent_scaffold.scaffold_version,
         "candidate_scaffold_version": candidate_scaffold.scaffold_version,
         "contract_version": incumbent_contract.contract_version,
+        "candidate_rollout_mode": rollout_mode,
         "no_change": no_change,
     })
     return RealEvaluationResult(
@@ -325,10 +387,14 @@ class RealFixedScaffoldIterationRunner:
         knowledge = store.list_items()
 
         proposals = {
-            "prompt_bank": DeterministicPromptBankUpdateProposer().propose(
+            "prompt_bank": DeterministicPromptBankUpdateProposer(
+                max_operations=config.optimization.max_new_entries_per_iteration,
+            ).propose(
                 prompt_bank=input_bank, feedback=feedback,
                 meta_knowledge=knowledge),
-            "router": DeterministicRouterUpdateProposer().propose(
+            "router": DeterministicRouterUpdateProposer(
+                max_operations=config.optimization.max_router_operations_per_iteration,
+            ).propose(
                 prompt_bank=input_bank, router_policy=input_router,
                 feedback=feedback, meta_knowledge=knowledge),
             "scaffold": DeterministicScaffoldUpdateProposer().propose(
@@ -441,6 +507,22 @@ class RealFixedScaffoldIterationRunner:
                 output_dir, "validation", f"{component}.json"),
                 validations[component])
 
+        accepted = {component for component, value in validations.items()
+                    if value.decision == "accept"}
+        next_bank = (candidate_bank if "prompt_bank" in accepted else input_bank)
+        next_router = (candidate_router if "router" in accepted else input_router)
+        next_scaffold = (candidate_scaffold
+                         if "scaffold" in accepted else input_scaffold)
+        next_state_path = _write(os.path.join(
+            output_dir, "output_state", "next_components.json"), {
+                "prompt_bank": next_bank,
+                "router_policy": next_router,
+                "scaffold_policy": next_scaffold,
+                "scaffold_contract": scaffold_contract,
+                "accepted_components": tuple(sorted(accepted)),
+                "canonical_state_mutated": False,
+            })
+
         verify_frozen()
         identity = {
             "source_revision": source_revision,
@@ -495,6 +577,8 @@ class RealFixedScaffoldIterationRunner:
             "candidate_validation_eligible": evaluation.no_change is None,
             "candidate_regression_evidence_eligible": evaluation.no_change is None,
             "canonical_commits": 0,
+            "next_state_artifact": next_state_path,
+            "accepted_components": tuple(sorted(accepted)),
             "scaffold_candidate_created": (
                 proposals["scaffold"].candidate_policy is not None),
             "scaffold_skipped_reason": proposals["scaffold"].skipped_reason,

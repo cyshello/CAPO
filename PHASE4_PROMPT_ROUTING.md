@@ -32,11 +32,12 @@ Refer to `PHASE2_3_SURROGATE.md` for the completed rollout implementation, invar
 | 4.11 | Meta-knowledge review, rollback-safe candidate previews, and saved-fixture empirical validation | `82b0f9c` |
 | 4.12 | Complete saved-fixture one-iteration dry run with fixed/optimized scaffold ablation | `3f35786` |
 | 4.13 | One real fixed-scaffold iteration from frozen inputs with routed DVD evaluation | `d11ffe1` |
-| 4.14 | One real scaffold-enabled iteration with matched frozen inputs and typed no-change guard | this commit |
+| 4.14 | One real scaffold-enabled iteration with matched frozen inputs and typed no-change guard | `cf0d8df` |
+| Pilot | Bounded matched two-iteration runner with selective validation and final full rollout | this commit |
 
-Multi-iteration optimization is NOT started. Stop-gate protocol: after each
-stage, run tests, produce the Section 20 checkpoint report, stop, wait for
-approval.
+The bounded overnight pilot runner is implemented; runtime launch is pending.
+No larger or paper-scale multi-iteration experiment is started. Stop-gate
+protocol remains in effect beyond this explicitly approved pilot.
 
 ### Current configuration state
 
@@ -103,9 +104,8 @@ approval.
 
 ### Exact next step (pending approval)
 
-Create the separate matched multi-iteration experiment plan required after
-Stage 4.14. Do not implement or execute multi-iteration optimization until
-that plan is reviewed and approved.
+Launch only the approved bounded matched two-iteration pilot from its frozen
+non-test video manifest. Do not begin a larger or paper-scale experiment.
 
 ### Test commands
 
@@ -141,7 +141,7 @@ that plan is reviewed and approved.
     --output-dir surrogate_rollout/runs/phase4_stage4_12_checkpoint/scaffold_enabled
 ```
 
-Suite status after Stage 4.14: 286 passed (78 Phase 0–3 + 208 Phase 4).
+Suite status after bounded-pilot runner: 290 passed (78 Phase 0–3 + 212 Phase 4).
 
 ---
 

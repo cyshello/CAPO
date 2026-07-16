@@ -42,6 +42,7 @@ from surrogate_rollout.schemas import sha256_text
 
 
 ROUTED_PROMPT_VIEW = "routed_prompt_view"
+ROUTED_SELECTIVE_PROMPT_VIEW = "routed_selective_prompt_view"
 
 
 class RoutedCaptionViewError(RuntimeError):
@@ -242,6 +243,130 @@ class RoutedCaptionViewBuilder:
             json.dumps(artifact.as_json_dict(), sort_keys=True,
                        ensure_ascii=False, indent=2) + "\n",
         )
+        return artifact
+
+    def build_selective(
+        self,
+        *,
+        sample: dict,
+        segment_composed_prompt_map: Mapping[str, ComposedCaptionPrompt],
+        selected_segment_ids: set[str],
+        baseline_view: RoutedCaptionViewArtifact,
+        work_root: str,
+        merge_prompt: str | None = None,
+        candidate_cache_root: str | None = None,
+        view_name: str = "selective",
+    ) -> RoutedCaptionViewArtifact:
+        """Recaption selected routed clips and retain the incumbent elsewhere."""
+        video_id = sample.get("extra", {}).get("videoID") or sample.get("sample_id")
+        clip_index = self.clip_index_fn(sample, video_id)
+        clip_keys = tuple(key for key, _ in clip_index)
+        self._validate_prompt_map(video_id, clip_keys, segment_composed_prompt_map)
+        if tuple(baseline_view.segment_ids) != clip_keys:
+            raise RoutedCaptionViewError("baseline routed view clip order mismatch")
+        unknown = selected_segment_ids - set(clip_keys)
+        if unknown:
+            raise RoutedCaptionViewError(
+                f"selective routed view contains unknown clips: {sorted(unknown)}")
+
+        grouped_ids: dict[str, list[str]] = {}
+        grouped_prompts: dict[str, ComposedCaptionPrompt] = {}
+        for segment_id in clip_keys:
+            if segment_id not in selected_segment_ids:
+                continue
+            composed = segment_composed_prompt_map[segment_id]
+            grouped_ids.setdefault(composed.prompt_hash, []).append(segment_id)
+            grouped_prompts.setdefault(composed.prompt_hash, composed)
+
+        parsed_by_segment: dict[str, dict] = {}
+        groups: list[RoutedPromptGroup] = []
+        for composed_hash, segment_ids in grouped_ids.items():
+            result = self.caption_fn(
+                sample=sample,
+                candidate_prompt=grouped_prompts[composed_hash].prompt_text,
+                merge_prompt=merge_prompt,
+                clip_ids=set(segment_ids),
+                cache_root=candidate_cache_root,
+            )
+            self._validate_caption_result(
+                result, video_id, clip_keys, tuple(segment_ids))
+            cache_prompt_hash = result.cache_key.get("prompt_hash")
+            for segment_id in segment_ids:
+                parsed_by_segment[segment_id] = result.parsed[segment_id]
+            groups.append(RoutedPromptGroup(
+                composed_prompt_hash=composed_hash,
+                segment_ids=tuple(segment_ids),
+                caption_cache_key=result.cache_key,
+                caption_cache_prompt_hash=cache_prompt_hash,
+                caption_ckpt_dir=result.ckpt_dir,
+                caption_call_count=result.caption_call_count,
+                caption_cache_hits=result.cache_hits,
+                caption_seconds=result.caption_seconds,
+            ))
+
+        with open(baseline_view.captions_path) as f:
+            baseline_captions = json.load(f)
+        baseline_registries: dict[str, object] = {}
+        for group in baseline_view.prompt_groups:
+            for segment_id in group.segment_ids:
+                path = os.path.join(group.caption_ckpt_dir, f"{segment_id}.json")
+                if os.path.exists(path):
+                    with open(path) as f:
+                        registry = json.load(f).get("subject_registry")
+                    if registry:
+                        baseline_registries[segment_id] = registry
+
+        captions: dict[str, dict | object] = {}
+        ordered_registries = []
+        for segment_id in clip_keys:
+            parsed = parsed_by_segment.get(segment_id)
+            entry = caption_entry_from_parsed(parsed or {})
+            if entry is None:
+                entry = baseline_captions.get(segment_id)
+            if entry is not None:
+                captions[segment_id] = entry
+            registry = ((parsed or {}).get("subject_registry")
+                        if segment_id in selected_segment_ids else
+                        baseline_registries.get(segment_id))
+            if not registry and segment_id in selected_segment_ids:
+                registry = baseline_registries.get(segment_id)
+            if registry:
+                ordered_registries.append(registry)
+        captions["subject_registry"] = self.merge_fn(ordered_registries)
+
+        segments = tuple(self._segment_provenance(
+            segment_composed_prompt_map[segment_id]) for segment_id in clip_keys)
+        view_hash = sha256_text(dumps_canonical({
+            "artifact_type": ROUTED_SELECTIVE_PROMPT_VIEW,
+            "video_id": video_id,
+            "segments": segments,
+            "selected_segment_ids": tuple(sorted(selected_segment_ids)),
+            "baseline_view_hash": baseline_view.view_hash,
+        }))
+        view_dir = os.path.join(
+            work_root, video_id, f"captions_{view_name}_{view_hash[:12]}")
+        self._validate_view_isolation(
+            view_dir, candidate_cache_root or config.CAPTION_CACHE_ROOT)
+        captions_path, captions_hash = self.captions_writer(captions, view_dir)
+        routed_view_path = os.path.join(view_dir, "routed_view.json")
+        artifact = RoutedCaptionViewArtifact(
+            artifact_type=ROUTED_SELECTIVE_PROMPT_VIEW,
+            video_id=video_id,
+            view_hash=view_hash,
+            captions_path=captions_path,
+            captions_hash=captions_hash,
+            database_path=os.path.join(
+                work_root, video_id, f"database_c{captions_hash[:16]}.json"),
+            routed_view_path=routed_view_path,
+            segment_ids=clip_keys,
+            segments=segments,
+            prompt_groups=tuple(groups),
+            caption_call_count=sum(group.caption_call_count for group in groups),
+            caption_cache_hits=sum(group.caption_cache_hits for group in groups),
+            caption_seconds=sum(group.caption_seconds for group in groups),
+        )
+        _atomic_write_text(routed_view_path, json.dumps(
+            artifact.as_json_dict(), sort_keys=True, indent=2) + "\n")
         return artifact
 
     @staticmethod
