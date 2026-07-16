@@ -196,8 +196,20 @@ class BaselinePhaseRunner:
         source_revision: str = "unknown",
         gpu: str | None = None,
         dvd_max_iterations: int = 10,
+        bounded_smoke_video_id: str | None = None,
+        caption_cache_root: str | None = None,
+        cache_manifest_path: str | None = None,
     ) -> BaselinePhaseResult:
-        selected_ids, next_coverage = select_evidence_batch(coverage_state)
+        if bounded_smoke_video_id is None:
+            selected_ids, next_coverage = select_evidence_batch(coverage_state)
+            execution_scope = "production_three_video_iteration"
+        else:
+            evidence_ids = {item.video_id for item in roles.evidence_videos}
+            if bounded_smoke_video_id not in evidence_ids:
+                raise ValueError("bounded smoke video must belong to the evidence pool")
+            selected_ids = (bounded_smoke_video_id,)
+            next_coverage = coverage_state
+            execution_scope = "bounded_smoke_one_video"
         selected = records_for_video_ids(roles, selected_ids)
         output_dir = os.path.abspath(output_dir)
         versions = ComponentVersions(
@@ -214,7 +226,10 @@ class BaselinePhaseRunner:
                 "scaffold_policy": scaffold_policy,
                 "scaffold_contract": scaffold_contract,
             },
-            "phase4_config": phase4_config,
+            "phase4_config": {
+                key: value for key, value in as_json_dict(phase4_config).items()
+                if key != "post_intervention_mode"
+            },
             "base_prompt_template_hash": sha256_text(base_prompt_template),
             "merge_prompt_hash": sha256_text(merge_prompt),
             "source_revision": source_revision,
@@ -223,6 +238,13 @@ class BaselinePhaseRunner:
             "property_retrieval_policy_version": getattr(
                 self.property_retrieval_runner, "policy_version", None),
         }
+        if bounded_smoke_video_id is not None:
+            input_identity["execution_scope"] = execution_scope
+        if caption_cache_root is not None or cache_manifest_path is not None:
+            input_identity["caption_cache_root"] = (
+                os.path.abspath(caption_cache_root) if caption_cache_root else None)
+            input_identity["cache_manifest_path"] = (
+                os.path.abspath(cache_manifest_path) if cache_manifest_path else None)
         if router_policy.policy_type == "history_aware_vlm":
             input_identity["history_policy"] = {
                 "mode": "sequential_vlm",
@@ -333,6 +355,8 @@ class BaselinePhaseRunner:
                     work_root=os.path.join(video_dir, "history_aware_baseline"),
                     history_block_seconds=history_block_seconds,
                     max_history_captions=max_history_captions,
+                    candidate_cache_root=caption_cache_root,
+                    cache_manifest_path=cache_manifest_path,
                 )
                 routing_manifest_path = caption_view.routing_manifest_path
                 frames_path = caption_view.frames_path
@@ -482,25 +506,46 @@ class BaselinePhaseRunner:
             total_router_calls += int(getattr(
                 caption_view, "router_call_count", 0))
 
-        if total_qas != 9:
-            raise RuntimeError(f"baseline phase requires nine QAs, got {total_qas}")
+        expected_qas = 3 * len(selected_ids)
+        if total_qas != expected_qas:
+            raise RuntimeError(
+                f"baseline phase requires {expected_qas} QAs, got {total_qas}")
         before_hash = sha256_text(dumps_canonical(coverage_state))
         after_hash = sha256_text(dumps_canonical(next_coverage))
-        provisional = ProvisionalIterationState(
-            iteration_id=run_id,
-            coverage_cycle=coverage_state.coverage_cycle,
-            selected_video_ids=selected_ids,
-            parent_confirmed_checkpoint_id=parent_confirmed_checkpoint_id,
-            input_versions=versions, provisional_versions=versions,
-            baseline_manifest_path=manifest_path,
-            property_proposal_paths=tuple(proposal_paths),
-            coverage_state_before_hash=before_hash,
-            coverage_state_after_hash=after_hash,
-            property_retrieval_paths=tuple(retrieval_paths))
+        if bounded_smoke_video_id is None:
+            provisional = ProvisionalIterationState(
+                iteration_id=run_id,
+                coverage_cycle=coverage_state.coverage_cycle,
+                selected_video_ids=selected_ids,
+                parent_confirmed_checkpoint_id=parent_confirmed_checkpoint_id,
+                input_versions=versions, provisional_versions=versions,
+                baseline_manifest_path=manifest_path,
+                property_proposal_paths=tuple(proposal_paths),
+                coverage_state_before_hash=before_hash,
+                coverage_state_after_hash=after_hash,
+                property_retrieval_paths=tuple(retrieval_paths))
+        else:
+            provisional = {
+                "schema_version": "bounded_smoke_baseline_state_v1",
+                "status": "baseline_completed",
+                "run_id": run_id,
+                "selected_video_id": bounded_smoke_video_id,
+                "parent_input_id": parent_confirmed_checkpoint_id,
+                "component_versions": versions,
+                "baseline_manifest_path": os.path.abspath(manifest_path),
+                "property_proposal_paths": tuple(proposal_paths),
+                "property_retrieval_paths": tuple(retrieval_paths),
+                "production_coverage_state_mutated": False,
+                "coverage_state_hash": before_hash,
+            }
+        state_name = ("provisional.json" if bounded_smoke_video_id is None
+                      else "bounded_baseline_state.json")
         provisional_path = _write(os.path.join(
-            output_dir, "iteration_state", "provisional.json"), provisional)
+            output_dir, "iteration_state", state_name), provisional)
         manifest = {
             "schema_version": (
+                "phase4_checkpoint3a_bounded_smoke_baseline_v1"
+                if bounded_smoke_video_id is not None else
                 "phase4_checkpoint3a_baseline_v1"
                 if router_policy.policy_type == "history_aware_vlm"
                 else "phase4_checkpoint2_baseline_v1"),
@@ -514,9 +559,9 @@ class BaselinePhaseRunner:
             "provisional_state_path": provisional_path,
             "next_coverage_state": next_coverage,
             "calls": {
-                "video_caption_materializations": 3,
-                "dvd_reasoning": 9,
-                "property_proposal_policy": 3,
+                "video_caption_materializations": len(selected_ids),
+                "dvd_reasoning": expected_qas,
+                "property_proposal_policy": len(selected_ids),
                 "real_vlm_router": total_router_calls,
                 "interventional_feedback_models": 0,
                 "confirmation_evaluations": 0,

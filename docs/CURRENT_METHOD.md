@@ -215,6 +215,21 @@ traces, or used-segment references.
 `property_retrieval_top_k` defaults to 5. Persist every frame score and every
 ranked valid segment, not only the selected segment IDs.
 
+### 3.4.1 Post-intervention execution boundary
+
+`Phase4Config.post_intervention_mode` is a typed three-value boundary:
+`qa_only`, `feedback_only`, or `provisional_update`. Production optimization
+defaults to `provisional_update`. `qa_only` stops after candidate mixed-view QA
+reruns and persisted correctness transitions. `feedback_only` additionally
+runs flip-only feedback and property aggregation. `provisional_update`
+additionally materializes provisional bank/router artifacts.
+
+The bounded-smoke runner never performs confirmation or changes confirmed or
+canonical pointers. The mode is excluded from baseline, proposal, retrieval,
+intervention, and QA identities, allowing a later mode to resume those exact
+artifacts. Feedback and provisional-update manifests bind their respective
+downstream stage identities.
+
 ### 3.5 Independent property interventions
 
 Every candidate property is evaluated in a separate counterfactual run that

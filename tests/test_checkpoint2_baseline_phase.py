@@ -13,7 +13,7 @@ from surrogate_rollout.prompt_routing.persistence import (
     scaffold_contract_from_json,
     scaffold_policy_from_json,
 )
-from surrogate_rollout.prompt_routing.schemas import Phase4Config
+from surrogate_rollout.prompt_routing.schemas import Phase4Config, PostInterventionMode
 from surrogate_rollout.schemas import DVDRunResult, ReferenceSets
 
 
@@ -216,3 +216,43 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
     assert len(qa_calls) == 12
     assert len(retrieval_runner.calls) == 4
     assert Path(partial.manifest_path).exists()
+
+    bounded_captioner = FakeCaptionViewBuilder()
+    bounded_proposer = FixtureProposalPolicy()
+    bounded_retrieval = FixturePropertyRetrievalRunner()
+    bounded_runner = BaselinePhaseRunner(
+        routing_fn=routing_fn, caption_view_builder=bounded_captioner,
+        qa_fn=qa_fn, clip_index_fn=clip_index_fn,
+        proposal_policy=bounded_proposer,
+        property_retrieval_runner=bounded_retrieval)
+    bounded_output = tmp_path / "bounded"
+    bounded_video = roles.evidence_videos[0].video_id
+    bounded = bounded_runner.run(
+        roles=roles, coverage_state=initial_coverage(roles),
+        sample_loader=samples.__getitem__, prompt_bank=bank,
+        router_policy=router, scaffold_policy=scaffold,
+        scaffold_contract=contract,
+        phase4_config=Phase4Config(
+            post_intervention_mode=PostInterventionMode.QA_ONLY),
+        base_prompt_template="base", merge_prompt="merge",
+        output_dir=str(bounded_output),
+        parent_confirmed_checkpoint_id="bounded-input",
+        bounded_smoke_video_id=bounded_video,
+        history_block_size=2, source_revision="fixture")
+    assert bounded.selected_video_ids == (bounded_video,)
+    assert bounded.baseline_qa_count == 3
+    resumed_later_mode = bounded_runner.run(
+        roles=roles, coverage_state=initial_coverage(roles),
+        sample_loader=samples.__getitem__, prompt_bank=bank,
+        router_policy=router, scaffold_policy=scaffold,
+        scaffold_contract=contract,
+        phase4_config=Phase4Config(
+            post_intervention_mode=PostInterventionMode.FEEDBACK_ONLY),
+        base_prompt_template="base", merge_prompt="merge",
+        output_dir=str(bounded_output),
+        parent_confirmed_checkpoint_id="bounded-input",
+        bounded_smoke_video_id=bounded_video,
+        history_block_size=2, source_revision="fixture")
+    assert resumed_later_mode.resumed is True
+    assert bounded_captioner.calls == [bounded_video]
+    assert len(bounded_proposer.calls) == len(bounded_retrieval.calls) == 1

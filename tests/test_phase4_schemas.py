@@ -436,6 +436,22 @@ def test_optimize_scaffold_defaults_false():
     assert cfg.optimization.optimize_scaffold is False
     assert cfg.optimize_scaffold is False  # visible at top level
     assert cfg.dry_run is True and cfg.commit is False
+    assert cfg.post_intervention_mode.value == "provisional_update"
+
+
+@pytest.mark.parametrize("mode", [
+    "qa_only", "feedback_only", "provisional_update",
+])
+def test_post_intervention_mode_round_trip(mode):
+    from surrogate_rollout.prompt_routing.schemas import PostInterventionMode
+
+    cfg = Phase4Config(post_intervention_mode=PostInterventionMode(mode))
+    assert Phase4Config.from_json_dict(cfg.as_json_dict()) == cfg
+
+
+def test_post_intervention_mode_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        Phase4Config.from_json_dict({"post_intervention_mode": "unknown"})
 
 
 def test_dry_run_and_commit_mutually_exclusive():

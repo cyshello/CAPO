@@ -119,18 +119,24 @@ class OpenAIStructuredFeedbackProvider:
 
     def __init__(self, *, model: str = config.FEEDBACK_MODEL,
                  allow_scaffold_updates: bool = False,
-                 api_key: str | None = None) -> None:
+                 api_key: str | None = None, max_calls: int = 1) -> None:
+        if max_calls < 1:
+            raise ValueError("max_calls must be positive")
         self.model = model
         self.allow_scaffold_updates = allow_scaffold_updates
         self.api_key = api_key
+        self.max_calls = max_calls
         self.policy_version = (
             OPENAI_SCAFFOLD_FEEDBACK_POLICY_VERSION
             if allow_scaffold_updates else OPENAI_FEEDBACK_POLICY_VERSION)
         self.call_count = 0
 
     def __call__(self, request: str) -> str:
-        if self.call_count:
-            raise RuntimeError("only one feedback call is permitted")
+        if self.call_count >= self.max_calls:
+            message = ("only one feedback call is permitted"
+                       if self.max_calls == 1
+                       else "configured feedback call limit reached")
+            raise RuntimeError(message)
         self.call_count += 1
         prompt = _feedback_prompt(
             request, allow_scaffold_updates=self.allow_scaffold_updates,
@@ -144,7 +150,8 @@ class OpenAIStructuredFeedbackProvider:
             "provider": "openai_api", "model": self.model,
             "policy_version": self.policy_version,
             "allow_scaffold_updates": self.allow_scaffold_updates,
-            "call_count": self.call_count, "real_model": True,
+            "max_calls": self.max_calls, "call_count": self.call_count,
+            "real_model": True,
         }
 
 

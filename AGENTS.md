@@ -139,3 +139,9 @@ resumed run, log and persist the exact router, captioner, property proposer,
 feedback provider, and downstream QA model identities. Fail before all stage
 calls if any component is missing a model identity, uses a mock/fixture/stub,
 or does not match the reviewed real provider/backend path.
+
+The one-video smoke must use `scripts/run_phase4_bounded_smoke.py` with three
+pairwise independent output/state/cache directories. Its typed
+`post_intervention_mode` may progress from `qa_only` to `feedback_only` to
+`provisional_update` using the same directories. It must never call
+confirmation or write production coverage/confirmed pointers.

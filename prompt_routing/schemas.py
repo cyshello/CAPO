@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
@@ -528,6 +529,12 @@ class ComposedCaptionPrompt:
 # --------------------------------------------------------------------------- #
 #                          Phase 4 typed configuration                         #
 # --------------------------------------------------------------------------- #
+class PostInterventionMode(str, Enum):
+    QA_ONLY = "qa_only"
+    FEEDBACK_ONLY = "feedback_only"
+    PROVISIONAL_UPDATE = "provisional_update"
+
+
 @dataclass(frozen=True)
 class Phase4OptimizationConfig:
     """Optimization switches (§4). `optimize_scaffold` defaults to False and is
@@ -563,12 +570,16 @@ class Phase4Config:
     seed: int = 0
     dry_run: bool = True
     commit: bool = False
+    post_intervention_mode: PostInterventionMode = \
+        PostInterventionMode.PROVISIONAL_UPDATE
     optimization: Phase4OptimizationConfig = field(
         default_factory=Phase4OptimizationConfig)
 
     def __post_init__(self) -> None:
         _require(isinstance(self.optimization, Phase4OptimizationConfig),
                  "Phase4Config.optimization must be a Phase4OptimizationConfig")
+        _require(isinstance(self.post_intervention_mode, PostInterventionMode),
+                 "Phase4Config.post_intervention_mode must be a PostInterventionMode")
         _require(not (self.dry_run and self.commit),
                  "Phase4Config: dry_run and commit are mutually exclusive")
 
@@ -588,5 +599,7 @@ class Phase4Config:
             seed=data.get("seed", 0),
             dry_run=data.get("dry_run", True),
             commit=data.get("commit", False),
+            post_intervention_mode=PostInterventionMode(
+                data.get("post_intervention_mode", "provisional_update")),
             optimization=Phase4OptimizationConfig(**dict(opt)),
         )

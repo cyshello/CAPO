@@ -269,30 +269,55 @@ Confirm that artifacts show:
 - no scaffold candidate;
 - no main experiment launch.
 
-## 5. Small bounded smoke test
+## 5. One-video bounded smoke
 
-The user may run:
+Prerequisite: export `OPENAI_API_KEY`. All three commands use evidence video
+`0RxMZBLeqRI` and its three frozen train QAs, `max_proposals=1`, retrieval
+top-k one, and at most one intervention. Output, state, and cache roots are
+separate siblings. Reuse the same three paths when progressing modes.
+
+QA only:
 
 ```bash
-conda run -n local_llm_vllm python -m pytest -q \
-  tests/test_checkpoint3e_final_iteration.py::test_fixture_end_to_end_accept_reject_rollback_and_resume
+conda run -n local_llm_vllm python \
+  scripts/run_phase4_bounded_smoke.py \
+  --post-intervention-mode qa_only \
+  --video-id 0RxMZBLeqRI --gpu 0 \
+  --output-dir runs/phase4_one_video_smoke_output \
+  --state-dir runs/phase4_one_video_smoke_state \
+  --cache-dir runs/phase4_one_video_smoke_cache
 ```
 
-The coding agent may run it only if its GPU/API cost is explicitly bounded.
+Continue through flip-only feedback and property aggregation:
 
-Expected checks:
+```bash
+conda run -n local_llm_vllm python \
+  scripts/run_phase4_bounded_smoke.py \
+  --post-intervention-mode feedback_only \
+  --video-id 0RxMZBLeqRI --gpu 0 \
+  --output-dir runs/phase4_one_video_smoke_output \
+  --state-dir runs/phase4_one_video_smoke_state \
+  --cache-dir runs/phase4_one_video_smoke_cache
+```
 
-- each source video is full-captioned once;
-- all baseline QAs run;
-- candidate properties retain source lineage;
-- each property retrieves its own `S_sim`;
-- candidate property is force-added only to selected segments;
-- candidate runs share incumbent history and do not affect each other;
-- all source-video QAs rerun for each intervention;
-- only correctness flips enter feedback;
-- `S_sim`, `S_used`, `S_usedagain`, and `S_feedback` are saved;
-- codebook/router update occurs only after all work items finish;
-- scaffold version remains unchanged.
+Continue through isolated provisional bank/router artifacts:
+
+```bash
+conda run -n local_llm_vllm python \
+  scripts/run_phase4_bounded_smoke.py \
+  --post-intervention-mode provisional_update \
+  --video-id 0RxMZBLeqRI --gpu 0 \
+  --output-dir runs/phase4_one_video_smoke_output \
+  --state-dir runs/phase4_one_video_smoke_state \
+  --cache-dir runs/phase4_one_video_smoke_cache
+```
+
+Each invocation writes `run_manifest.json` and an immutable mode manifest under
+`mode_manifests/`. Later modes reuse completed baseline, proposal, retrieval,
+intervention, QA, and feedback artifacts. Repeating a completed mode performs
+an exact resume. Calling an earlier mode does not remove or overwrite later
+artifacts. `state-dir/provisional_update/` is smoke-local: no coverage-cycle,
+confirmed checkpoint, confirmation evaluation, or canonical pointer is used.
 
 ## 6. Main experiment
 

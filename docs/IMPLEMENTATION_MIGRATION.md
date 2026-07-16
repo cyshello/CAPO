@@ -424,3 +424,14 @@ Run the focused tests and complete existing suite.
 - trust regions;
 - broad renaming;
 - automatic main-run execution.
+
+## 7. One-video bounded-smoke boundary
+
+The isolated bounded-smoke adapter is not a replacement for the production
+three-video coverage cycle. It selects one frozen evidence video and its three
+QAs, limits proposals and candidate interventions to one, and uses retrieval
+top-k one. `post_intervention_mode` controls whether execution stops after QA,
+after feedback aggregation, or after isolated provisional update artifacts.
+Changing the mode preserves compatible upstream caches. The adapter never
+writes coverage-cycle state, confirmed checkpoints, or canonical pointers and
+never calls confirmation.

@@ -1000,7 +1000,10 @@ class Checkpoint3EOrchestrator:
         self, *, prompt_bank: PromptBankSnapshot,
         router_policy: RouterPolicySnapshot,
         feedback_manifest_paths: tuple[str, ...],
+        expected_evidence_video_count: int = 3,
     ) -> IterationUpdatePlan:
+        if expected_evidence_video_count < 1:
+            raise ValueError("expected evidence video count must be positive")
         properties = []
         accepted_rows = []
         rejected_count = 0
@@ -1023,9 +1026,9 @@ class Checkpoint3EOrchestrator:
                         })
                     elif qa.get("status") == "rejected":
                         rejected_count += 1
-        if len(feedback_video_ids) != 3:
+        if len(feedback_video_ids) != expected_evidence_video_count:
             raise FinalIterationError(
-                "iteration aggregation requires three evidence videos")
+                "iteration aggregation received an unexpected evidence-video count")
         active = {entry.prompt_id: entry for entry in prompt_bank.entries
                   if entry.status == "active"}
         for row in accepted_rows:
