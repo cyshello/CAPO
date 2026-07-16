@@ -341,6 +341,19 @@ Reject:
 - scaffold changes;
 - updates without cited intervention evidence IDs.
 
+At coverage completion, evaluate the two confirmation videos only. Accept when
+all six QAs are error-free, there are no `correct_to_wrong` transitions, and
+mean accuracy does not decrease. Promote or roll back the bank/router pair
+atomically while preserving the fixed scaffold and contract versions.
+
+`optimization/confirmation_evaluator.py` is the concrete confirmation adapter.
+It creates one immutable input bundle for both policies, runs the existing
+`HistoryAwareBaselineCaptionViewBuilder` independently for parent and candidate,
+validates complete per-segment cache identities and paths, then executes all six
+QAs per policy through `run_dvd_qa`. Both policies share frames and runtime
+configuration, but construct separate on-policy caption histories. Confirmation
+never invokes proposal, intervention, or feedback stages.
+
 ### 3.14 Output artifacts
 
 Add explicit lineage and nesting:

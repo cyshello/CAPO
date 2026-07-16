@@ -503,6 +503,29 @@ optimization feedback. Acceptance saves a confirmed checkpoint. Rejection
 restores the last confirmed checkpoint. Reset coverage only after that decision
 is persisted. Validation and test are not used by this procedure.
 
+Materialize the two videos, six QAs, temporally ordered segments, sampled-frame
+paths and content hashes, transcripts, prompts, caption/runtime configuration,
+history limits, fixed scaffold/contract versions, and DVD QA configuration as
+one immutable confirmation input bundle. Parent and candidate must reference
+that exact bundle and runtime hash. Caption both policies independently through
+the sequential history-aware builder: they use identical history settings but
+each policy's preceding-caption history is produced on-policy from its own
+captions. Parent history is never copied into the candidate run.
+
+Confirmation caption caches use the complete history-aware identity plus the
+shared bundle hash. A cache hit therefore requires identical source/sampling,
+frame bundle, composed prompt, bank/router/scaffold/contract versions, local
+history, caption model/backend, decoding, and history configuration. Persist
+both policies' per-segment cache keys and paths and fail before DVD QA if the
+bundle/runtime references differ or unequal identities resolve to one path.
+
+The initial deterministic acceptance criterion requires all six confirmation
+QAs to finish without evaluation errors, zero `correct_to_wrong` transitions,
+and candidate mean accuracy greater than or equal to the previous confirmed
+policy. Acceptance promotes the bank/router pair atomically. Any failed
+criterion restores both exact parent-confirmed versions; a partial component
+promotion is invalid.
+
 ## 6. Full iteration summary
 
 \[

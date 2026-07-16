@@ -48,6 +48,13 @@ feedback. Validation and test never enter component-update feedback. Use
 signal. Older separate regression-video and per-iteration confirmation flows
 are superseded.
 
+At confirmation, materialize one immutable two-video/six-QA input bundle and
+reuse it for parent and candidate. Both policies use identical sampled frames
+and runtime/history configuration, but independently build on-policy sequential
+caption histories. Use the complete history-aware cache identity plus the
+bundle hash; confirmation must fail before QA on bundle/config mismatch or
+cache-path aliasing across unequal identities.
+
 Implement:
 
 - history-aware multi-property VLM inference routing;

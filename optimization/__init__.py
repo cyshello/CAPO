@@ -9,6 +9,12 @@ from surrogate_rollout.optimization.candidate_preview import (
     CandidatePreviewBuilder,
     CandidatePreviewError,
 )
+from surrogate_rollout.optimization.confirmation_evaluator import (
+    ConfirmationEvaluationConflictError,
+    ConfirmationEvaluationError,
+    ConfirmationEvaluationResult,
+    HistoryAwareDVDConfirmationEvaluator,
+)
 
 from surrogate_rollout.optimization.evidence_builder import (
     CounterfactualEvidenceBuilder,
@@ -92,6 +98,9 @@ __all__ = [
     "CandidatePreviewBuilder",
     "CandidatePreviewError",
     "ComponentValidationResult",
+    "ConfirmationEvaluationConflictError",
+    "ConfirmationEvaluationError",
+    "ConfirmationEvaluationResult",
     "CounterfactualEvidence",
     "CounterfactualEvidenceBuilder",
     "DeterministicFailureAttributor",
@@ -109,6 +118,7 @@ __all__ = [
     "FeedbackItem",
     "FeedbackParseError",
     "LLMFeedbackGenerator",
+    "HistoryAwareDVDConfirmationEvaluator",
     "MetaKnowledgeItem",
     "MetaKnowledgeStore",
     "MockFeedbackGenerator",

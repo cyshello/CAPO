@@ -307,6 +307,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
         max_history_captions: int = DEFAULT_MAX_HISTORY_CAPTIONS,
         candidate_cache_root: str | None = None,
         cache_manifest_path: str | None = None,
+        caption_run_identity_hash: str | None = None,
     ) -> HistoryAwareBaselineViewArtifact:
         video_id = str(sample.get("extra", {}).get("videoID")
                        or sample.get("sample_id"))
@@ -369,6 +370,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 "caption_model_id": self.segment_captioner.caption_model_id,
                 "caption_backend_id": self.segment_captioner.backend_id,
                 "caption_decoding_hash": config.decoding_hash(),
+                "caption_run_identity_hash": caption_run_identity_hash,
                 "history_configuration": {
                     "schema_version": HISTORY_SCHEMA_VERSION,
                     "block_seconds": history_block_seconds,
@@ -427,6 +429,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
                     merge_prompt=merge_prompt,
                     cache_root=candidate_cache_root,
                     cache_manifest_path=cache_manifest_path,
+                    intervention_identity_hash=caption_run_identity_hash,
                 )
                 parsed = dict(result.parsed)
                 caption_calls += int(not result.cache_hit)

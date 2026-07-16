@@ -41,6 +41,7 @@ class ProvisionalIterationState:
     coverage_state_before_hash: str
     coverage_state_after_hash: str
     property_retrieval_paths: tuple[str, ...] = ()
+    accumulated_provisional_iteration_ids: tuple[str, ...] = ()
     status: str = "provisional"
 
     def __post_init__(self) -> None:
@@ -50,6 +51,10 @@ class ProvisionalIterationState:
             raise ValueError("provisional state requires three unique evidence videos")
         if len(self.property_proposal_paths) != 3:
             raise ValueError("provisional state requires one proposal artifact per video")
+        if self.accumulated_provisional_iteration_ids and \
+                self.iteration_id not in self.accumulated_provisional_iteration_ids:
+            raise ValueError(
+                "accumulated provisional lineage must include the current iteration")
         if self.status != "provisional":
             raise ValueError("ProvisionalIterationState.status must be provisional")
 

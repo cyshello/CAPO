@@ -129,6 +129,15 @@ class HistoryAwareVLMRouter:
             "max_selected_properties": limit,
             "output_schema": {"property_ids": ["property_id"]},
         }
+        supervision = tuple(router_policy.configuration.get(
+            "supervision_examples") or ())[-100:]
+        if supervision:
+            request["router_supervision"] = tuple({
+                "property_id": item.get("property_id"),
+                "polarity": item.get("polarity"),
+                "evidence": item.get("evidence"),
+                "context_hash": item.get("context_hash"),
+            } for item in supervision)
         prompt = (
             "Select zero or more active caption properties for the current "
             "video segment. Return only strict JSON matching output_schema; "
