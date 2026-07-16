@@ -20,7 +20,7 @@ from surrogate_rollout.optimization.evidence_builder import (
 )
 from surrogate_rollout.optimization.feedback_generator import FeedbackGenerator
 from surrogate_rollout.optimization.policies.codex_feedback import (
-    CodexStructuredFeedbackProvider,
+    OpenAIStructuredFeedbackProvider,
 )
 from surrogate_rollout.optimization.policies.llm_feedback import LLMFeedbackGenerator
 from surrogate_rollout.optimization.real_fixed_scaffold_iteration import (
@@ -160,7 +160,8 @@ def prepare(root: Path) -> None:
         "proposal_validation_max_selected_clips": 32,
         "final_evaluation_rollout": "full",
         "seed": 0,
-        "feedback_model": "gpt-5.5",
+        "feedback_model": config.FEEDBACK_MODEL,
+        "feedback_provider": "openai_api",
         "dvd_text_backend": "codex",
         "dvd_openai_tools": False,
         "dvd_max_iterations": 10,
@@ -227,8 +228,9 @@ class RetryFeedbackGenerator(FeedbackGenerator):
     def generate(self, evidence, meta_knowledge):
         attempts = []
         for attempt in range(2):
-            provider = CodexStructuredFeedbackProvider(
-                model="gpt-5.5", allow_scaffold_updates=self.allow_scaffold)
+            provider = OpenAIStructuredFeedbackProvider(
+                model=config.FEEDBACK_MODEL,
+                allow_scaffold_updates=self.allow_scaffold)
             directory = self.artifact_dir / f"attempt_{attempt + 1}"
             generator = LLMFeedbackGenerator(
                 artifact_dir=str(directory), enabled=True,

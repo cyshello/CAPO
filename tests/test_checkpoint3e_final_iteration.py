@@ -310,7 +310,8 @@ def run_iteration(tmp_path, *, accepted, output):
     confirmation = MockConfirmationEvaluator(accepted)
     runner = Checkpoint3EOrchestrator(
         baseline_runner=baseline, intervention_runner=intervention,
-        feedback_runner=feedback, confirmation_evaluator=confirmation)
+        feedback_runner=feedback, confirmation_evaluator=confirmation,
+        require_real_models=False)
     result = runner.run(
         iteration_id="iteration-final", roles=roles(), coverage_state=coverage(),
         parent_confirmed=parent_checkpoint(bank, router, scaffold, contract),
@@ -377,7 +378,8 @@ def run_three_iteration_cycle(tmp_path, *, accepted):
     confirmation = MockConfirmationEvaluator(accepted)
     runner = Checkpoint3EOrchestrator(
         baseline_runner=baseline, intervention_runner=intervention,
-        feedback_runner=feedback, confirmation_evaluator=confirmation)
+        feedback_runner=feedback, confirmation_evaluator=confirmation,
+        require_real_models=False)
     state_dir = tmp_path / "policy-state"
     state = EvidenceCoverageState(
         rotation_order=tuple(f"e{index}" for index in range(8)))
@@ -477,7 +479,8 @@ def test_active_policy_resolution_accumulates_and_accepts_latest_pair(tmp_path):
         baseline_runner=next_baseline,
         intervention_runner=MockInterventionRunner(),
         feedback_runner=MockFeedbackRunner(),
-        confirmation_evaluator=MockConfirmationEvaluator(True))
+        confirmation_evaluator=MockConfirmationEvaluator(True),
+        require_real_models=False)
     next_result = next_runner.run(
         iteration_id="iteration-4", roles=roles(),
         coverage_state=third.next_coverage_state,
@@ -517,7 +520,8 @@ def test_rejected_cycle_restores_exact_parent_and_new_cycle_starts_from_it(
         baseline_runner=next_baseline,
         intervention_runner=MockInterventionRunner(),
         feedback_runner=MockFeedbackRunner(),
-        confirmation_evaluator=MockConfirmationEvaluator(True))
+        confirmation_evaluator=MockConfirmationEvaluator(True),
+        require_real_models=False)
     next_runner.run(
         iteration_id="iteration-after-reject", roles=roles(),
         coverage_state=third.next_coverage_state,
@@ -644,7 +648,8 @@ def test_codebook_action_rules_and_retirement_support(tmp_path):
         baseline_runner=MockBaselineRunner(),
         intervention_runner=MockInterventionRunner(),
         feedback_runner=MockFeedbackRunner(),
-        confirmation_evaluator=MockConfirmationEvaluator(True))
+        confirmation_evaluator=MockConfirmationEvaluator(True),
+        require_real_models=False)
 
     retire_manifests = (
         feedback_manifest(tmp_path / "retire", "e0", [{

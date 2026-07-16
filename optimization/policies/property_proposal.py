@@ -447,4 +447,5 @@ class OpenAIPropertyProposalProvider:
         return {
             "provider": "openai_api", "model": self.model,
             "response_format": "json_object",
+            "real_model": True,
         }

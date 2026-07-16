@@ -335,6 +335,17 @@ orchestrator = Checkpoint3EOrchestrator.with_real_confirmation(
 )
 ```
 
+Every real `run()` invocation performs a fail-closed model audit before resume
+resolution or any stage call. Standard output begins with one
+`STARTUP_MODELS {...}` JSON line, and the same payload is written immutably to
+`<output_dir>/startup_models.json`. It names the router, captioner, property
+proposer, feedback provider, and downstream QA models. The active real path
+requires the local Qwen history-aware router/captioner, OpenAI API property and
+feedback providers, and the existing DVD QA runner. A missing model identity,
+mock/fixture/stub implementation, provider mismatch, or a changed startup
+manifest aborts the run before captioning, proposal, feedback, or QA calls.
+Resume prints the same line again and validates it against the saved file.
+
 The fixture-only concrete evaluator command is:
 
 ```bash

@@ -432,7 +432,8 @@ def test_concrete_confirmation_selects_complete_candidate_or_parent_pair(
         confirmation_artifact_path="confirmed-c0.json")
     runner = Checkpoint3EOrchestrator(
         baseline_runner=object(), intervention_runner=object(),
-        feedback_runner=object(), confirmation_evaluator=evaluator)
+        feedback_runner=object(), confirmation_evaluator=evaluator,
+        require_real_models=False)
     decision, checkpoint_path, active_bank_path, active_router_path = \
         runner._run_confirmation(
             parent_confirmed=parent, roles=roles,

@@ -276,6 +276,7 @@ class Checkpoint3EOrchestrator:
         self, *, baseline_runner: Any, intervention_runner: Any,
         feedback_runner: Any, confirmation_evaluator: ConfirmationEvaluator,
         min_retire_support_videos: int = 2,
+        require_real_models: bool = True,
     ) -> None:
         if min_retire_support_videos < 2:
             raise ValueError("retirement requires at least two support videos")
@@ -284,6 +285,7 @@ class Checkpoint3EOrchestrator:
         self.feedback_runner = feedback_runner
         self.confirmation_evaluator = confirmation_evaluator
         self.min_retire_support_videos = min_retire_support_videos
+        self.require_real_models = require_real_models
 
     @classmethod
     def with_real_confirmation(
@@ -302,7 +304,26 @@ class Checkpoint3EOrchestrator:
             feedback_runner=feedback_runner,
             confirmation_evaluator=HistoryAwareDVDConfirmationEvaluator(
                 **dict(confirmation_kwargs)),
-            min_retire_support_videos=min_retire_support_videos)
+            min_retire_support_videos=min_retire_support_videos,
+            require_real_models=True)
+
+    def _startup_models(self, *, iteration_id: str, output_dir: str) \
+            -> Mapping[str, Any] | None:
+        if not self.require_real_models:
+            return None
+        from surrogate_rollout.optimization.startup_models import (
+            build_startup_model_manifest,
+            log_startup_models,
+        )
+
+        manifest = build_startup_model_manifest(
+            iteration_id=iteration_id,
+            baseline_runner=self.baseline_runner,
+            intervention_runner=self.intervention_runner,
+            feedback_runner=self.feedback_runner,
+            confirmation_evaluator=self.confirmation_evaluator)
+        log_startup_models(output_dir, manifest)
+        return manifest
 
     @staticmethod
     def _state_paths(state_dir: str, coverage_cycle: int) -> Mapping[str, str]:
@@ -564,6 +585,7 @@ class Checkpoint3EOrchestrator:
         prompt_bank: PromptBankSnapshot | None,
         router_policy: RouterPolicySnapshot | None,
         state_dir: str,
+        startup_models: Mapping[str, Any] | None,
     ) -> FinalIterationResult:
         manifest = _read_json(manifest_target)
         if manifest.get("status") != "completed" or \
@@ -576,6 +598,7 @@ class Checkpoint3EOrchestrator:
             "parent_confirmed": parent_confirmed,
             "scaffold": scaffold_policy, "contract": scaffold_contract,
             "execution_identity": execution_identity,
+            "startup_models": startup_models,
             "stages": {
                 "baseline": _stage_identity(self.baseline_runner),
                 "intervention": _stage_identity(self.intervention_runner),
@@ -632,6 +655,8 @@ class Checkpoint3EOrchestrator:
     ) -> FinalIterationResult:
         output_dir = os.path.abspath(output_dir)
         state_dir = os.path.abspath(state_dir)
+        startup_models = self._startup_models(
+            iteration_id=iteration_id, output_dir=output_dir)
         manifest_target = os.path.join(output_dir, "manifest.json")
         if os.path.exists(manifest_target):
             return self._resume_completed(
@@ -642,7 +667,7 @@ class Checkpoint3EOrchestrator:
                 scaffold_contract=scaffold_contract,
                 execution_identity=execution_identity,
                 prompt_bank=prompt_bank, router_policy=router_policy,
-                state_dir=state_dir)
+                state_dir=state_dir, startup_models=startup_models)
 
         resolved = self._resolve_active_policy(
             state_dir=state_dir, coverage_state=coverage_state,
@@ -684,6 +709,7 @@ class Checkpoint3EOrchestrator:
                 "scaffold": scaffold_policy, "contract": scaffold_contract,
             },
             "execution_identity": execution_identity,
+            "startup_models": startup_models,
             "stages": {
                 "baseline": _stage_identity(self.baseline_runner),
                 "intervention": _stage_identity(self.intervention_runner),
@@ -836,6 +862,7 @@ class Checkpoint3EOrchestrator:
             "parent_confirmed": parent_confirmed,
             "scaffold": scaffold_policy, "contract": scaffold_contract,
             "execution_identity": execution_identity,
+            "startup_models": startup_models,
             "stages": {
                 "baseline": _stage_identity(self.baseline_runner),
                 "intervention": _stage_identity(self.intervention_runner),

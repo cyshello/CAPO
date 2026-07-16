@@ -40,3 +40,11 @@ def test_pilot_does_not_import_canonical_component_store():
     assert "range(1, 3)" in source
     assert "max_new_entries_per_iteration=1" in source
     assert "max_router_operations_per_iteration=1" in source
+
+
+def test_pilot_uses_openai_feedback_and_keeps_codex_dvd_backend():
+    source = (ROOT / "scripts/run_phase4_matched_pilot.py").read_text()
+    assert "OpenAIStructuredFeedbackProvider" in source
+    assert '"feedback_provider": "openai_api"' in source
+    assert 'text_backend="codex"' in source
+    assert "use_openai_tools=False" in source

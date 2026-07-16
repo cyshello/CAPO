@@ -10,6 +10,7 @@ import pytest
 from surrogate_rollout.optimization.feedback_generator import feedback_batch_from_json
 from surrogate_rollout.optimization.policies.codex_feedback import (
     CodexStructuredFeedbackProvider,
+    OpenAIStructuredFeedbackProvider,
 )
 from surrogate_rollout.optimization.real_fixed_scaffold_iteration import (
     RealEvaluationResult,
@@ -213,6 +214,25 @@ def test_codex_feedback_provider_allows_one_real_call(monkeypatch):
     assert provider(request) == expected
     assert provider.metadata()["call_count"] == 1
     with pytest.raises(RuntimeError, match="exactly one"):
+        provider(request)
+
+
+def test_openai_feedback_provider_defaults_to_gpt4o_and_allows_one_call(
+    monkeypatch,
+):
+    import surrogate_rollout.optimization.policies.codex_feedback as module
+
+    calls = []
+    monkeypatch.setattr(module, "_openai_chat", lambda prompt, **kwargs: (
+        calls.append((prompt, kwargs)) or json.dumps({"feedback": "response"})))
+    provider = OpenAIStructuredFeedbackProvider(api_key="test-key")
+    request = json.dumps({"evidence": [{"evidence_id": "e1"}],
+                          "meta_knowledge": []})
+    assert provider(request) == json.dumps({"feedback": "response"})
+    assert calls[0][1] == {"model": "gpt-4o", "api_key": "test-key"}
+    assert provider.metadata()["provider"] == "openai_api"
+    assert provider.metadata()["model"] == "gpt-4o"
+    with pytest.raises(RuntimeError, match="only one"):
         provider(request)
 
 

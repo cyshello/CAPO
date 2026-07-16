@@ -132,3 +132,10 @@ Report:
 - exact commands the user should execute next.
 
 Do not execute the user's main command.
+
+Real Checkpoint 3E execution must be constructed with
+`Checkpoint3EOrchestrator.with_real_confirmation(...)`. Before every fresh or
+resumed run, log and persist the exact router, captioner, property proposer,
+feedback provider, and downstream QA model identities. Fail before all stage
+calls if any component is missing a model identity, uses a mock/fixture/stub,
+or does not match the reviewed real provider/backend path.

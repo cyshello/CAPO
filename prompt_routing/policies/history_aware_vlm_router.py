@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from surrogate_rollout import config
 from surrogate_rollout.prompt_routing.schemas import (
     PromptBankSnapshot,
     RouterPolicySnapshot,
@@ -69,13 +70,27 @@ class HistoryAwareVLMRouter:
     policy_type = "history_aware_vlm"
 
     def __init__(self, vlm: Any, *, max_selected_properties: int = 3,
-                 max_tokens: int = 256) -> None:
+                 max_tokens: int = 256, model_id: str | None = None) -> None:
         if max_selected_properties < 1:
             raise ValueError("max_selected_properties must be positive")
         self.vlm = vlm
         self.max_selected_properties = max_selected_properties
         self.max_tokens = max_tokens
+        self.model_id = model_id or config.CAPTION_MODEL_ID
+        self.backend_id = f"{type(vlm).__module__}.{type(vlm).__qualname__}"
         self.last_exchange: RouterExchange | None = None
+
+    @property
+    def configuration_identity(self) -> Mapping[str, Any]:
+        return {
+            "policy_type": self.policy_type,
+            "provider": "local_qwen_vlm",
+            "model": self.model_id,
+            "backend": self.backend_id,
+            "max_selected_properties": self.max_selected_properties,
+            "max_tokens": self.max_tokens,
+            "real_model": True,
+        }
 
     @classmethod
     def from_local_qwen(cls, **kwargs) -> "HistoryAwareVLMRouter":

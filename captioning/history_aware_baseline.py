@@ -144,6 +144,16 @@ class HistoryAwareSegmentCaptioner:
         self.backend_id = backend_id or (
             f"{type(vlm).__module__}.{type(vlm).__qualname__}")
 
+    @property
+    def configuration_identity(self) -> Mapping[str, Any]:
+        return {
+            "provider": "local_qwen_vlm",
+            "model": self.caption_model_id,
+            "backend": self.backend_id,
+            "decoding": as_json_dict(config.CAPTION_DECODING),
+            "real_model": True,
+        }
+
     def caption(
         self,
         *,

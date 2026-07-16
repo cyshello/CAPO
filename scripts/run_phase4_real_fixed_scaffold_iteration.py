@@ -23,7 +23,7 @@ from surrogate_rollout.optimization.evidence_builder import (
     write_evidence_jsonl,
 )
 from surrogate_rollout.optimization.policies.codex_feedback import (
-    CodexStructuredFeedbackProvider,
+    OpenAIStructuredFeedbackProvider,
 )
 from surrogate_rollout.optimization.policies.llm_feedback import (
     LLMFeedbackGenerator,
@@ -111,7 +111,7 @@ def main() -> None:
         description="One real Stage 4.13/4.14 prompt-routing iteration")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--gpu", default="0")
-    parser.add_argument("--feedback-model", default=config.TEXT_FALLBACK_MODEL)
+    parser.add_argument("--feedback-model", default=config.FEEDBACK_MODEL)
     parser.add_argument("--dvd-max-iterations", type=int, default=10)
     parser.add_argument("--stage", choices=("4.13", "4.14"), default="4.13")
     parser.add_argument("--optimize-scaffold", action="store_true")
@@ -272,7 +272,7 @@ def main() -> None:
                 raise RuntimeError(f"frozen input changed: {value['path']}")
 
     verify_frozen()
-    feedback_provider = CodexStructuredFeedbackProvider(
+    feedback_provider = OpenAIStructuredFeedbackProvider(
         model=args.feedback_model,
         allow_scaffold_updates=args.optimize_scaffold)
     feedback_generator = LLMFeedbackGenerator(
