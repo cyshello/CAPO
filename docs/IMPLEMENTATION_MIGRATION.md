@@ -179,7 +179,12 @@ Add support for an ephemeral intervention property:
   property;
 - recaption only `S_sim`;
 - reuse incumbent captions elsewhere;
-- use incumbent fallback for failed selected segments.
+- fail the entire candidate if any selected segment cannot be re-captioned or
+  validated; never fall back selected segments to incumbent captions.
+
+The temporary sequence may contain `max_selected_properties + 1` entries.
+Append the candidate after all incumbent properties, do not remove incumbents
+or resolve semantic conflicts, and fail explicitly on prompt-budget overflow.
 
 The candidate property must not be committed to the codebook during this step.
 

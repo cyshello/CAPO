@@ -62,6 +62,7 @@ class CaptionCacheKey:
     contract_version: str | None = None
     backend_id: str | None = None
     history_config_hash: str | None = None
+    intervention_identity_hash: str | None = None
 
     @property
     def legacy_tag8(self) -> str:

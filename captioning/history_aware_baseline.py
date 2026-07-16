@@ -156,6 +156,7 @@ class HistoryAwareSegmentCaptioner:
         merge_prompt: str,
         cache_root: str | None = None,
         cache_manifest_path: str | None = None,
+        intervention_identity_hash: str | None = None,
     ) -> HistoryAwareCaptionResult:
         key = build_history_aware_cache_key(
             video_id=video_id,
@@ -179,6 +180,7 @@ class HistoryAwareSegmentCaptioner:
                 "boundary_rule": "floor_segment_start_div_block_seconds",
             })),
             caption_model_id=self.caption_model_id,
+            intervention_identity_hash=intervention_identity_hash,
         )
         cache_dir = new_history_aware_cache_dir(key, cache_root)
         result_path = os.path.join(cache_dir, "caption.json")

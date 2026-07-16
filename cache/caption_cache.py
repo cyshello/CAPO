@@ -90,6 +90,7 @@ def build_history_aware_cache_key(
     contract_version: str,
     backend_id: str,
     history_config_hash: str,
+    intervention_identity_hash: str | None = None,
     caption_model_id: str = config.CAPTION_MODEL_ID,
     sample_fps: float = config.SAMPLE_FPS,
     clip_secs: int = config.CLIP_SECS,
@@ -135,6 +136,7 @@ def build_history_aware_cache_key(
         contract_version=contract_version,
         backend_id=backend_id,
         history_config_hash=history_config_hash,
+        intervention_identity_hash=intervention_identity_hash,
     )
     return CaptionCacheKey(**values)
 
@@ -278,6 +280,9 @@ def new_history_aware_cache_dir(key: CaptionCacheKey,
     safe_segment = key.segment_id.replace("/", "_")
     model_hash = sha256_text(key.caption_model_id)
     backend_hash = sha256_text(key.backend_id or "unknown")
+    intervention_suffix = (
+        f"_i{key.intervention_identity_hash[:12]}"
+        if key.intervention_identity_hash else "")
     return os.path.join(
         root,
         key.video_id,
@@ -286,10 +291,14 @@ def new_history_aware_cache_dir(key: CaptionCacheKey,
         f"c{key.composed_prompt_hash[:12]}_p{key.prompt_hash[:12]}_"
         f"h{key.history_hash[:12]}_v{versions_hash[:12]}_"
         f"m{model_hash[:8]}_d{key.decoding_hash[:8]}_"
-        f"b{backend_hash[:8]}_g{(key.history_config_hash or 'na')[:8]}_"
+        f"b{backend_hash[:8]}_g{(key.history_config_hash or 'na')[:8]}"
+        f"{intervention_suffix}_"
         f"s{(key.source_hash or 'na')[:8]}",
     )
 
 
 def key_as_dict(key: CaptionCacheKey) -> dict:
-    return asdict(key)
+    value = asdict(key)
+    if key.intervention_identity_hash is None:
+        value.pop("intervention_identity_hash")
+    return value

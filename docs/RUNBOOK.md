@@ -20,10 +20,9 @@ three unique evidence videos and runs all nine QAs. Confirmation runs only
 after all eight evidence videos have appeared since the last confirmation.
 There is no separate regression-video subset.
 
-The main experiment, real VLM router, property interventions, feedback calls,
-and confirmation evaluation are not available at Checkpoint 2. Any older
-command that launches those paths is superseded and must not be used as the
-active method.
+The main experiment, feedback calls, and confirmation evaluation are not
+available through Checkpoint 3C. Any older command that launches those paths is
+superseded and must not be used as the active method.
 
 Exact active train roles:
 
@@ -75,6 +74,43 @@ An exact completed proposal skips the optimization-LLM provider. An exact
 retrieval artifact skips the SigLIP text encoder. Conflicting property text,
 source video, visual index, model/sampling identity, top-k, pooling, or ranking
 configuration fails closed rather than overwriting the artifact.
+
+Checkpoint 3C consumes the frozen baseline and one Checkpoint 3B retrieval
+artifact per candidate. Its artifact layout is:
+
+```text
+<iteration>/property_interventions/<video_id>/
+├── manifest.json
+└── <candidate_property_id>_p<property_text_hash>/
+    ├── work_item.json
+    ├── composed_prompts.jsonl
+    ├── frozen_histories.jsonl
+    ├── caption_cache_keys.jsonl
+    ├── mixed_view/
+    ├── qa/<question_id>/
+    ├── transitions.json
+    └── result.json
+```
+
+Every candidate is independent. The candidate is appended after the incumbent
+routed properties only for `S_sim`; its temporary sequence may be one entry
+over the router maximum. Exact frozen baseline histories are reused without
+candidate-caption propagation. Unselected segments retain incumbent captions.
+Any selected-segment caption/validation failure or prompt-budget overflow fails
+the complete candidate without incumbent fallback and does not abort siblings.
+
+Completed candidate results resume without captioning or QA calls when the
+candidate ID/text, parent baseline, retrieval, composed prompts, frozen
+histories, caption configuration, and QA configuration match. Any collision on
+those identities fails closed. Mixed-view registries are rebuilt from restored
+per-segment incumbent/candidate registries in temporal order.
+
+Checkpoint 3C fixture tests do not invoke a GPU or external model:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_checkpoint3c_property_intervention.py
+```
 
 Checkpoint 2 baseline artifacts:
 
@@ -268,7 +304,8 @@ A healthy run satisfies:
 - candidate properties are force-applied, not prematurely routed;
 - frozen history is reused;
 - unselected captions equal incumbent captions;
-- failures have explicit incumbent fallback records;
+- selected-segment failures fail the candidate explicitly without incumbent
+  fallback;
 - all source-video QAs rerun for each property;
 - only correctness flips enter optimization feedback;
 - feedback evidence is concise;

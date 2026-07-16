@@ -249,8 +249,9 @@ h_{i,t}^{(k)},
 \right).
 \]
 
-Unselected segments retain incumbent captions. Failed selected segments fall
-back to incumbent captions with an explicit failure record.
+Unselected segments retain incumbent captions. If any selected segment cannot
+be re-captioned or validated, the entire candidate intervention fails
+explicitly; selected segments never fall back to incumbent captions.
 
 Build the mixed caption view:
 
@@ -273,6 +274,11 @@ Important invariants:
   force-applied only to their retrieved segments;
 - no history propagation occurs after recaptioning;
 - no full recaption occurs between candidate interventions.
+- the ephemeral sequence appends exactly one candidate after all incumbent
+  routed properties and may contain `max_selected_properties + 1` entries;
+- incumbent properties are never removed and semantic conflicts are not
+  resolved during intervention;
+- prompt-budget overflow fails the candidate rather than dropping properties.
 
 All property-source-video interventions may run in parallel. Segment captioning
 within one intervention may also run in parallel.

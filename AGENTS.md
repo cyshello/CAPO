@@ -61,7 +61,12 @@ Implement:
 - one independent property intervention per
   `(source_video, candidate_property)`;
 - frozen incumbent history;
-- force-add candidate property only to retrieved segments;
+- force-add exactly one ephemeral candidate after incumbent routed properties
+  only on retrieved segments; the temporary sequence may contain
+  `max_selected_properties + 1` entries;
+- retain every incumbent property without conflict resolution and fail the
+  candidate on prompt-budget overflow or any selected-segment caption failure;
+- reuse incumbent captions only for unselected segments;
 - parallel property interventions;
 - rerun all source-video QAs per intervention;
 - correctness-flip-only compact multimodal feedback;

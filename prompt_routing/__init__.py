@@ -47,6 +47,10 @@ from surrogate_rollout.prompt_routing.router import (
     routing_decision_from_json,
     write_routing_decisions,
 )
+from surrogate_rollout.prompt_routing.intervention_composer import (
+    InterventionCompositionError,
+    compose_forced_property,
+)
 from surrogate_rollout.prompt_routing.routed_caption_view import (
     ROUTED_PROMPT_VIEW,
     RoutedCaptionViewArtifact,
@@ -118,6 +122,7 @@ __all__ = [
     "RuleBasedPromptRouter",
     "HistoryAwareRouterError",
     "HistoryAwareVLMRouter",
+    "InterventionCompositionError",
     "get_local_qwen_backend",
     "ROUTED_PROMPT_VIEW",
     "ROUTED_CONDITION",
@@ -133,6 +138,7 @@ __all__ = [
     "ScaffoldApplier",
     "SmokeConditionResult",
     "composed_prompt_from_json",
+    "compose_forced_property",
     "composition_trace_from_json",
     "create_scaffold_applier",
     "estimate_prompt_tokens",

@@ -84,6 +84,7 @@ class MixedViewBuilder:
         *,
         video_id: str,
         baseline_ckpt_dir: str | None = None,
+        baseline_registries: dict[str, object] | None = None,
         view_name: str = "mixed",
     ) -> MixedViewArtifact:
         """`candidate_captions` maps clip key -> parsed captioner JSON for (at
@@ -117,6 +118,7 @@ class MixedViewBuilder:
         # registry is derived state: re-merge over the mixed per-clip registries
         registries = (load_clip_registries(baseline_ckpt_dir, clip_keys)
                       if baseline_ckpt_dir else {})
+        registries.update(baseline_registries or {})
         for k in replaced:
             reg = (candidate_captions.get(k) or {}).get("subject_registry")
             if reg:
