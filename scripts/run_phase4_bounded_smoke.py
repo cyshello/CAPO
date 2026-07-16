@@ -99,6 +99,7 @@ def main() -> None:
     from data_provider import get_provider
     from dvd_captioning import video_duration_seconds
     from dvd_prompt import get_prompts
+    from surrogate_rollout.evaluation.dvd_qa import ensure_backend
 
     provider = get_provider(config.BENCHMARK, split=config.BENCHMARK_SPLIT)
     sample_loader = provider.__getitem__
@@ -132,6 +133,9 @@ def main() -> None:
     output_dir = os.path.abspath(args.output_dir)
     state_dir = os.path.abspath(args.state_dir)
     cache_dir = os.path.abspath(args.cache_dir)
+    ensure_backend(
+        args.gpu, preload_captioner=True,
+        text_backend="codex", use_openai_tools=False)
     history_builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen()
     proposal_policy = MultiPropertyProposalPolicy(
         response_provider=OpenAIPropertyProposalProvider(
@@ -170,7 +174,9 @@ def main() -> None:
         cache_root=os.path.join(cache_dir, "confirmation_disabled"),
         cache_manifest_path=os.path.join(
             cache_dir, "confirmation_disabled_manifest.jsonl"),
-        gpu=args.gpu, dvd_max_iterations=args.dvd_max_iterations)
+        gpu=args.gpu, dvd_max_iterations=args.dvd_max_iterations,
+        downstream_qa_configuration={
+            "text_backend": "codex", "use_openai_tools": False})
     update_engine = Checkpoint3EOrchestrator(
         baseline_runner=baseline_runner,
         intervention_runner=intervention_runner,
@@ -208,6 +214,8 @@ def main() -> None:
             "feedback_model": args.feedback_model,
             "dvd_max_iterations": args.dvd_max_iterations,
             "gpu": args.gpu,
+            "dvd_text_backend": "codex",
+            "dvd_use_openai_tools": False,
             "base_prompt_hash": _text_hash(prompts.caption_prompt),
             "merge_prompt_hash": _text_hash(prompts.merge_prompt),
             "components_path": os.path.abspath(args.components),
