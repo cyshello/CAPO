@@ -161,6 +161,8 @@ def prepare(root: Path) -> None:
         "final_evaluation_rollout": "full",
         "seed": 0,
         "feedback_model": "gpt-5.5",
+        "dvd_text_backend": "codex",
+        "dvd_openai_tools": False,
         "dvd_max_iterations": 10,
         "canonical_production_commits": False,
         "scaffold_min_distinct_support_videos": 3,
@@ -370,7 +372,8 @@ def run_condition(root: Path, condition: str, gpu: str) -> None:
         output_dir=str(condition_dir / "bootstrap_evidence_evaluation"),
         source_revision=manifest["source_revision"], gpu=gpu,
         dvd_max_iterations=10, rollout_mode="full",
-        candidate_cache_root=str(cache_root))
+        candidate_cache_root=str(cache_root), text_backend="codex",
+        use_openai_tools=False)
     evidence = _build_evidence(
         bootstrap, proposal_ids, condition_dir / "bootstrap_evidence.jsonl")
     if not evidence or len({item.video_id for item in evidence}) != 3:
@@ -387,7 +390,8 @@ def run_condition(root: Path, condition: str, gpu: str) -> None:
         def selective_evaluation(**kwargs):
             return evaluate_routed_states(
                 **kwargs, rollout_mode="selective", max_selected_clips=32,
-                candidate_cache_root=str(cache_root))
+                candidate_cache_root=str(cache_root), text_backend="codex",
+                use_openai_tools=False)
 
         runner = RealFixedScaffoldIterationRunner(
             feedback_generator=feedback, evaluation_fn=selective_evaluation,
@@ -447,7 +451,8 @@ def run_condition(root: Path, condition: str, gpu: str) -> None:
         output_dir=str(condition_dir / "final_full_evaluation"),
         source_revision=manifest["source_revision"], gpu=gpu,
         dvd_max_iterations=10, rollout_mode="full",
-        candidate_cache_root=str(cache_root))
+        candidate_cache_root=str(cache_root), text_backend="codex",
+        use_openai_tools=False)
     _write(condition_dir / "condition_summary.json", {
         "condition": condition, "optimize_scaffold": optimize_scaffold,
         "completed_iterations": 2, "state_history": state_history,

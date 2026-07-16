@@ -38,6 +38,7 @@ def ensure_backend(
     tool_calling_model: str = config.ORCHESTRATOR_TOOL_MODEL,
     inference_model: str = config.TEXT_FALLBACK_MODEL,
     use_openai_tools: bool = True,
+    text_backend: str = "openai",
     preload_captioner: bool = False,
 ) -> None:
     """Install the codex+Qwen+BGE backend once per process (idempotent).
@@ -61,6 +62,7 @@ def ensure_backend(
             tool_vlm_max_frames=config.TOOL_VLM_MAX_FRAMES,
             tool_calling_model=tool_calling_model,
             use_openai_tools=use_openai_tools,
+            text_backend=text_backend,
             tensor_parallel_size=1,
         )
         _BACKEND_INSTALLED = True

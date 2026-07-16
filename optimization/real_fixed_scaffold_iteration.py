@@ -107,6 +107,8 @@ def evaluate_routed_states(
     rollout_mode: str = "full",
     max_selected_clips: int = 32,
     candidate_cache_root: str | None = None,
+    text_backend: str = "openai",
+    use_openai_tools: bool = True,
 ) -> RealEvaluationResult:
     """Evaluate two component states through existing routed/DVD services."""
     if rollout_mode not in ("full", "selective"):
@@ -172,7 +174,9 @@ def evaluate_routed_states(
             eligible_for_regression_evidence=False,
         )
 
-    ensure_backend(gpu, preload_captioner=True)
+    ensure_backend(
+        gpu, preload_captioner=True, text_backend=text_backend,
+        use_openai_tools=use_openai_tools)
     score_maps = {}
     error_maps = {}
     artifacts = {}
