@@ -20,9 +20,9 @@ three unique evidence videos and runs all nine QAs. Confirmation runs only
 after all eight evidence videos have appeared since the last confirmation.
 There is no separate regression-video subset.
 
-The main experiment, feedback calls, and confirmation evaluation are not
-available through Checkpoint 3C. Any older command that launches those paths is
-superseded and must not be used as the active method.
+The main experiment, real feedback calls, component updates, and confirmation
+evaluation are not available through Checkpoint 3D. Any older command that
+launches those paths is superseded and must not be used as the active method.
 
 Exact active train roles:
 
@@ -110,6 +110,56 @@ Checkpoint 3C fixture tests do not invoke a GPU or external model:
 ```bash
 conda run -n local_llm_vllm python -m pytest -q \
   tests/test_checkpoint3c_property_intervention.py
+```
+
+Checkpoint 3D reads completed Checkpoint 3C artifacts and emits feedback only
+for `wrong_to_correct` and `correct_to_wrong`. It computes, in retrieval order:
+
+```text
+S_feedback = S_sim ∩ (S_used_before ∪ S_used_after)
+```
+
+An empty `S_feedback` is an explicit rejection with no provider call. Unchanged
+correctness remains in analysis records but never creates a feedback request.
+The default request bounds are five segments, two frames per segment, 64 KiB
+per encoded frame, three history items, 1,200 characters per caption, three
+reasoning events per side, four relevant codebook entries, and 400,000 total
+serialized characters. All limits are configurable through
+`FeedbackEvidenceBounds`.
+
+Frames are EXIF-normalized, converted to RGB, resized with deterministic
+LANCZOS sampling, and encoded using a fixed JPEG quality ladder and subsampling
+policy. `FrameTransformConfig`, the Pillow version, source hash, transformed
+hash, dimensions, selected quality, and resize step are persisted in every
+frame payload and in run identity. A frame is rejected only if the configured
+quality and resize ladder is exhausted while it remains over the byte limit.
+
+```text
+<iteration>/property_feedback/
+├── manifest.json
+└── <video_id>/<candidate_property_id>_p<property_text_hash>/
+    ├── input_identity.json
+    ├── qa/<question_id>/
+    │   ├── request.json
+    │   ├── raw_output.txt
+    │   ├── parsed_output.json
+    │   └── rejection.json
+    └── result.json
+```
+
+`result.json` aggregates positive/negative flip counts, source and flip-QA
+lineage, attributed segments, accepted evidence references, codebook coverage,
+and recommendation evidence. It never applies a recommendation. Exact complete
+or per-QA resume performs no provider call; conflicting or partial artifacts
+fail closed. Failed property results are immutable and resume by default.
+Passing `retry_failed=True` creates an isolated
+`retries/retry_001/` artifact tree and never overwrites the original failure.
+
+Checkpoint 3D fixture tests use only mocked feedback and fixture frame payloads:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_checkpoint3d_interventional_feedback.py
 ```
 
 Checkpoint 2 baseline artifacts:

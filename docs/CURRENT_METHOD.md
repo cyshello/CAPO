@@ -342,6 +342,8 @@ S_{\mathrm{usedagain}}^{i,j,q}
 
 Similarity retrieval determines what is recaptioned. Before/after reasoning
 determines which recaptioned segments are shown to the feedback model.
+If this intersection is empty for a correctness flip, persist an explicit
+`empty_s_feedback` rejection and do not call the feedback model.
 
 ### 4.3 Feedback input
 
@@ -359,6 +361,11 @@ For each correctness flip, provide:
   - incumbent routed properties;
   - force-added candidate property;
   - incumbent and candidate captions.
+
+Oversized sampled frames are deterministically resized and JPEG-compressed
+under a persisted bounded transform configuration. Persist source and
+transformed hashes and reject only after the configured transform ladder is
+exhausted.
 
 Do not send:
 
@@ -407,6 +414,10 @@ Record:
 - retrieved and attributed segment IDs;
 - source-video lineage;
 - codebook coverage judgment.
+
+Feedback may recommend `add`, `revise`, `merge`, `retire`,
+`router_positive`, `router_negative`, or `no_op`. These are evidence-bearing
+recommendations only; aggregation does not apply a component update.
 
 Then aggregate all intervention feedback across the three-video batch:
 

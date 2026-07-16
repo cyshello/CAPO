@@ -239,11 +239,19 @@ For each QA:
 S_feedback = S_sim ∩ (S_used ∪ S_usedagain)
 ```
 
+An empty intersection is persisted as `empty_s_feedback` and makes no feedback
+model call.
+
 - load relevant trace contents, not only filesystem paths;
 - include only `S_feedback` segments;
 - resolve incumbent property IDs and candidate property to full text;
 - include frames, concise frozen history, and before/after captions;
 - enforce deterministic size limits and log truncation.
+
+Bound frame payloads with a persisted deterministic resize/JPEG-compression
+configuration and transformed-frame hash. Reject a frame only after exhausting
+that transformation. Keep failed property artifacts immutable; explicit
+`retry_failed` execution writes to an isolated retry namespace.
 
 Keep non-flip records in analysis artifacts.
 
@@ -264,6 +272,10 @@ Aggregate QA-level outputs into one property-source-video result containing:
 - attributed segments;
 - source lineage;
 - coverage assessment.
+
+Recommendation labels are limited to `add`, `revise`, `merge`, `retire`,
+`router_positive`, `router_negative`, and `no_op`; this stage records but does
+not apply them.
 
 ### 3.10 `optimization/prompt_bank_update_proposer.py`
 
