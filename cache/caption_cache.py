@@ -74,6 +74,71 @@ def build_cache_key(*, video_id: str, video_path: str, caption_prompt: str,
     )
 
 
+def build_history_aware_cache_key(
+    *,
+    video_id: str,
+    video_path: str,
+    caption_prompt: str,
+    merge_prompt: str,
+    subtitle_path: str | None,
+    segment_id: str,
+    history_hash: str,
+    composed_prompt_hash: str,
+    bank_version: str,
+    router_version: str,
+    scaffold_version: str,
+    contract_version: str,
+    backend_id: str,
+    history_config_hash: str,
+    caption_model_id: str = config.CAPTION_MODEL_ID,
+    sample_fps: float = config.SAMPLE_FPS,
+    clip_secs: int = config.CLIP_SECS,
+) -> CaptionCacheKey:
+    """Strong identity for a history-dependent per-segment caption.
+
+    This is deliberately separate from ``build_cache_key``. A caller cannot
+    accidentally omit history/component lineage and therefore cannot resolve
+    to a legacy history-free cache entry.
+    """
+    required_identity = {
+        "history_hash": history_hash,
+        "composed_prompt_hash": composed_prompt_hash,
+        "bank_version": bank_version,
+        "router_version": router_version,
+        "scaffold_version": scaffold_version,
+        "contract_version": contract_version,
+        "backend_id": backend_id,
+        "history_config_hash": history_config_hash,
+    }
+    missing = [name for name, value in required_identity.items() if not value]
+    if missing:
+        raise ValueError(
+            f"history-aware cache identity has empty fields: {missing}")
+    key = build_cache_key(
+        video_id=video_id,
+        video_path=video_path,
+        caption_prompt=caption_prompt,
+        merge_prompt=merge_prompt,
+        subtitle_path=subtitle_path,
+        segment_id=segment_id,
+        caption_model_id=caption_model_id,
+        sample_fps=sample_fps,
+        clip_secs=clip_secs,
+    )
+    values = asdict(key)
+    values.update(
+        history_hash=history_hash,
+        composed_prompt_hash=composed_prompt_hash,
+        bank_version=bank_version,
+        router_version=router_version,
+        scaffold_version=scaffold_version,
+        contract_version=contract_version,
+        backend_id=backend_id,
+        history_config_hash=history_config_hash,
+    )
+    return CaptionCacheKey(**values)
+
+
 def captions_content_hash(captions_json_path: str) -> str:
     """Content hash of the exact captions.json a vector DB was built from.
     A DB may only be reused when this hash matches (correction #5)."""
@@ -195,6 +260,34 @@ def new_candidate_cache_dir(key: CaptionCacheKey, root: str | None = None) -> st
     return os.path.join(
         root, key.video_id,
         f"p{key.prompt_hash[:12]}_d{key.decoding_hash[:8]}_s{(key.source_hash or 'na')[:8]}",
+    )
+
+
+def new_history_aware_cache_dir(key: CaptionCacheKey,
+                                root: str | None = None) -> str:
+    """Isolated cache directory for one frozen-history segment identity."""
+    if not key.history_hash or not key.composed_prompt_hash:
+        raise ValueError("history-aware cache key is missing history/prompt identity")
+    versions_hash = sha256_json({
+        "bank": key.bank_version,
+        "router": key.router_version,
+        "scaffold": key.scaffold_version,
+        "contract": key.contract_version,
+    })
+    root = root or config.CAPTION_CACHE_ROOT
+    safe_segment = key.segment_id.replace("/", "_")
+    model_hash = sha256_text(key.caption_model_id)
+    backend_hash = sha256_text(key.backend_id or "unknown")
+    return os.path.join(
+        root,
+        key.video_id,
+        "history_v1",
+        safe_segment,
+        f"c{key.composed_prompt_hash[:12]}_p{key.prompt_hash[:12]}_"
+        f"h{key.history_hash[:12]}_v{versions_hash[:12]}_"
+        f"m{model_hash[:8]}_d{key.decoding_hash[:8]}_"
+        f"b{backend_hash[:8]}_g{(key.history_config_hash or 'na')[:8]}_"
+        f"s{(key.source_hash or 'na')[:8]}",
     )
 
 

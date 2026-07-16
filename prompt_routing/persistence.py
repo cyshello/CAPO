@@ -21,9 +21,9 @@ Invariants:
 - Content digest (optional version suffix) = sha256 over the canonical JSON
   of the record WITH ITS OWN VERSION FIELD REMOVED — the version string may
   embed the digest, so including it would be circular. Parent versions stay
-  in the digest (lineage is content). Component versions remain provenance
-  identifiers, not caption-cache keys: caption-cache identity derives from
-  composed prompt text/hash only.
+  in the digest (lineage is content). Component versions remain snapshot
+  provenance identifiers; the sequential history-aware baseline also carries
+  them into its stronger cache identity.
 
 No routing or composition logic here (Stage 4.2 scope).
 """

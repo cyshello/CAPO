@@ -19,12 +19,10 @@ Design constraints enforced here:
   component kind (§21.3).
 - `as_json_dict` / `dumps_canonical` give deterministic serialization
   (sorted keys) for artifact writing and round-trip tests (§21.4).
-- Caption-cache identity stays separate from component provenance: the
-  composed prompt text/hash alone determines the (later) caption-cache key,
-  while ComposedCaptionPrompt separately retains bank/router/scaffold/contract
-  versions and the selected prompt IDs. Different component versions may share
-  a cache entry when they compose byte-identical prompt text; their provenance
-  stays distinguishable in these records.
+- Ordinary routed caption caches use composed prompt content. Sequential
+  history-aware baseline caches additionally include frozen-history identity
+  and all component versions, so they cannot resolve through history-free
+  cache entries.
 
 No persistence, routing logic, composition, captioning, or model calls here.
 """
@@ -49,8 +47,8 @@ from surrogate_rollout.schemas import sha256_text
 # - the numeric portion is a component-local, monotonically increasing
 #   version number (lineage order within one component kind);
 # - the optional hex suffix is a snapshot-content digest;
-# - component versions are provenance identifiers, NOT caption-cache keys
-#   (caption-cache identity derives from composed prompt text/hash only);
+# - component versions are provenance identifiers; history-aware baseline
+#   caches additionally include them in their strong cache identity;
 # - changed content must receive a new version;
 # - an existing version ID must never be overwritten with different content.
 
@@ -479,11 +477,9 @@ class CompositionTrace:
 class ComposedCaptionPrompt:
     """Final composed captioning prompt for one segment (§10.3).
 
-    `prompt_hash` = sha256(prompt_text) and is what caption-cache identity
-    will later be derived from; the component versions here are provenance
-    only and deliberately do NOT enter that hash (Stage 4.1 clarification #5:
-    different component versions may share a cache entry when the composed
-    text is byte-identical, while remaining distinguishable here)."""
+    `prompt_hash` = sha256(prompt_text). Ordinary routed caches use that text;
+    history-aware baseline caches also key on frozen history and the component
+    versions carried here."""
 
     video_id: str
     segment_id: str

@@ -9,6 +9,11 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from surrogate_rollout.captioning.candidate_captions import build_clip_index
+from surrogate_rollout.captioning.history_aware_baseline import (
+    DEFAULT_HISTORY_BLOCK_SECONDS,
+    DEFAULT_MAX_HISTORY_CAPTIONS,
+    HistoryAwareBaselineCaptionViewBuilder,
+)
 from surrogate_rollout.evaluation.dvd_qa import run_dvd_qa
 from surrogate_rollout.optimization.iteration_state import (
     ComponentVersions,
@@ -152,12 +157,20 @@ class BaselinePhaseRunner:
         qa_fn: Callable[..., Any] = run_dvd_qa,
         clip_index_fn: Callable[..., list[tuple[str, dict]]] = build_clip_index,
         proposal_policy: PropertyProposalPolicy | None = None,
+        history_aware_builder: Any | None = None,
     ) -> None:
         self.routing_fn = routing_fn
         self.caption_view_builder = caption_view_builder or RoutedCaptionViewBuilder()
         self.qa_fn = qa_fn
         self.clip_index_fn = clip_index_fn
         self.proposal_policy = proposal_policy or NoOpPropertyProposalPolicy()
+        self.history_aware_builder = history_aware_builder
+
+    def _history_builder(self) -> Any:
+        if self.history_aware_builder is None:
+            self.history_aware_builder = (
+                HistoryAwareBaselineCaptionViewBuilder.from_local_qwen())
+        return self.history_aware_builder
 
     def run(
         self,
@@ -174,7 +187,9 @@ class BaselinePhaseRunner:
         merge_prompt: str,
         output_dir: str,
         parent_confirmed_checkpoint_id: str,
-        history_block_size: int,
+        history_block_size: int | None = None,
+        history_block_seconds: float = DEFAULT_HISTORY_BLOCK_SECONDS,
+        max_history_captions: int = DEFAULT_MAX_HISTORY_CAPTIONS,
         source_revision: str = "unknown",
         gpu: str | None = None,
         dvd_max_iterations: int = 10,
@@ -199,11 +214,19 @@ class BaselinePhaseRunner:
             "phase4_config": phase4_config,
             "base_prompt_template_hash": sha256_text(base_prompt_template),
             "merge_prompt_hash": sha256_text(merge_prompt),
-            "history_block_size": history_block_size,
             "source_revision": source_revision,
             "proposal_policy_version": self.proposal_policy.policy_version,
             "parent_confirmed_checkpoint_id": parent_confirmed_checkpoint_id,
         }
+        if router_policy.policy_type == "history_aware_vlm":
+            input_identity["history_policy"] = {
+                "mode": "sequential_vlm",
+                "history_block_seconds": history_block_seconds,
+                "max_history_captions": max_history_captions,
+            }
+        else:
+            # Preserve the exact Checkpoint 2 fingerprint for old completed runs.
+            input_identity["history_block_size"] = history_block_size
         input_fingerprint = sha256_text(dumps_canonical(input_identity))
         run_id = "baseline_" + input_fingerprint[:24]
         manifest_path = os.path.join(output_dir, "manifest.json")
@@ -238,6 +261,7 @@ class BaselinePhaseRunner:
         video_manifests = []
         proposal_paths = []
         total_qas = 0
+        total_router_calls = 0
         for record in selected:
             video_dir = os.path.join(output_dir, "baseline", record.video_id)
             complete_path = os.path.join(video_dir, "video_complete.json")
@@ -263,6 +287,7 @@ class BaselinePhaseRunner:
                 video_manifests.append(os.path.abspath(complete_path))
                 proposal_paths.append(complete["property_proposal_path"])
                 total_qas += int(complete["qa_count"])
+                total_router_calls += int(complete.get("real_vlm_router_calls", 0))
                 continue
 
             samples = tuple(sample_loader(index) for index in record.provider_indices)
@@ -271,32 +296,65 @@ class BaselinePhaseRunner:
             clip_index = self.clip_index_fn(samples[0], record.video_id)
             segment_ids = tuple(segment_id for segment_id, _ in clip_index)
             frames = _frame_references(clip_index)
-            contexts = tuple(SegmentContext(
-                video_id=record.video_id,
-                segment_id=segment_id,
-                segment_features={"frame_references": frames[segment_id]},
-                metadata={"checkpoint": 2, "history_router_input": "deferred"},
-            ) for segment_id in segment_ids)
-            routing = self.routing_fn(
-                contexts=contexts, prompt_bank=prompt_bank,
-                router_policy=router_policy, scaffold_policy=scaffold_policy,
-                scaffold_contract=scaffold_contract, phase4_config=phase4_config,
-                base_prompt_template=base_prompt_template,
-                output_dir=os.path.join(video_dir, "routing"),
-                source_revision=source_revision)
-            prompt_map = {item.segment_id: item for item in routing.composed_prompts}
-            caption_view = self.caption_view_builder.build(
-                sample=dict(samples[0]), segment_composed_prompt_map=prompt_map,
-                work_root=os.path.join(video_dir, "caption_view"),
-                merge_prompt=merge_prompt)
+            if router_policy.policy_type == "history_aware_vlm":
+                caption_view = self._history_builder().build(
+                    sample=dict(samples[0]),
+                    clip_index=clip_index,
+                    prompt_bank=prompt_bank,
+                    router_policy=router_policy,
+                    scaffold_policy=scaffold_policy,
+                    scaffold_contract=scaffold_contract,
+                    base_prompt_template=base_prompt_template,
+                    merge_prompt=merge_prompt,
+                    work_root=os.path.join(video_dir, "history_aware_baseline"),
+                    history_block_seconds=history_block_seconds,
+                    max_history_captions=max_history_captions,
+                )
+                routing_manifest_path = caption_view.routing_manifest_path
+                frames_path = caption_view.frames_path
+                histories_path = caption_view.frozen_histories_path
+                histories = caption_view.histories
+            else:
+                if history_block_size is None:
+                    history_block_size = max_history_captions
+                contexts = tuple(SegmentContext(
+                    video_id=record.video_id,
+                    segment_id=segment_id,
+                    segment_features={"frame_references": frames[segment_id]},
+                    metadata={"checkpoint": 2,
+                              "history_router_input": "deferred"},
+                ) for segment_id in segment_ids)
+                routing = self.routing_fn(
+                    contexts=contexts, prompt_bank=prompt_bank,
+                    router_policy=router_policy,
+                    scaffold_policy=scaffold_policy,
+                    scaffold_contract=scaffold_contract,
+                    phase4_config=phase4_config,
+                    base_prompt_template=base_prompt_template,
+                    output_dir=os.path.join(video_dir, "routing"),
+                    source_revision=source_revision)
+                prompt_map = {item.segment_id: item
+                              for item in routing.composed_prompts}
+                caption_view = self.caption_view_builder.build(
+                    sample=dict(samples[0]),
+                    segment_composed_prompt_map=prompt_map,
+                    work_root=os.path.join(video_dir, "caption_view"),
+                    merge_prompt=merge_prompt)
+                with open(caption_view.captions_path) as f:
+                    legacy_captions = json.load(f)
+                histories = _history_snapshots(
+                    tuple(caption_view.segment_ids), legacy_captions,
+                    history_block_size)
+                frames_path = _write(
+                    os.path.join(video_dir, "frames.json"), frames)
+                histories_path = os.path.join(
+                    video_dir, "frozen_histories.jsonl")
+                _atomic_write_text(histories_path, "".join(
+                    dumps_canonical(item) + "\n" for item in histories))
+                routing_manifest_path = routing.manifest_path
+
             with open(caption_view.captions_path) as f:
                 captions = json.load(f)
-            histories = _history_snapshots(
-                tuple(caption_view.segment_ids), captions, history_block_size)
-            frames_path = _write(os.path.join(video_dir, "frames.json"), frames)
-            histories_path = os.path.join(video_dir, "frozen_histories.jsonl")
-            _atomic_write_text(histories_path, "".join(
-                dumps_canonical(item) + "\n" for item in histories))
 
             qa_rows = []
             for question_id, provider_index, sample in zip(
@@ -362,7 +420,7 @@ class BaselinePhaseRunner:
                 "video_id": record.video_id,
                 "video_fingerprint": video_fingerprint,
                 "qa_count": len(qa_rows),
-                "routing_manifest_path": routing.manifest_path,
+                "routing_manifest_path": routing_manifest_path,
                 "caption_view_path": caption_view.routed_view_path,
                 "captions_path": caption_view.captions_path,
                 "frames_path": frames_path,
@@ -370,12 +428,19 @@ class BaselinePhaseRunner:
                 "baseline_qas_path": os.path.abspath(qa_path),
                 "property_proposal_path": proposal_path,
                 "caption_materializations": 1,
+                "history_mode": ("sequential_vlm" if
+                                 router_policy.policy_type == "history_aware_vlm"
+                                 else "legacy_posthoc"),
+                "real_vlm_router_calls": int(getattr(
+                    caption_view, "router_call_count", 0)),
                 "component_versions": as_json_dict(versions),
             }
             _write(complete_path, complete)
             video_manifests.append(os.path.abspath(complete_path))
             proposal_paths.append(proposal_path)
             total_qas += len(qa_rows)
+            total_router_calls += int(getattr(
+                caption_view, "router_call_count", 0))
 
         if total_qas != 9:
             raise RuntimeError(f"baseline phase requires nine QAs, got {total_qas}")
@@ -394,7 +459,10 @@ class BaselinePhaseRunner:
         provisional_path = _write(os.path.join(
             output_dir, "iteration_state", "provisional.json"), provisional)
         manifest = {
-            "schema_version": "phase4_checkpoint2_baseline_v1",
+            "schema_version": (
+                "phase4_checkpoint3a_baseline_v1"
+                if router_policy.policy_type == "history_aware_vlm"
+                else "phase4_checkpoint2_baseline_v1"),
             "status": "completed", "run_id": run_id,
             "input_fingerprint": input_fingerprint,
             "selected_video_ids": selected_ids,
@@ -407,7 +475,7 @@ class BaselinePhaseRunner:
                 "video_caption_materializations": 3,
                 "dvd_reasoning": 9,
                 "property_proposal_policy": 3,
-                "real_vlm_router": 0,
+                "real_vlm_router": total_router_calls,
                 "interventional_feedback_models": 0,
                 "confirmation_evaluations": 0,
             },

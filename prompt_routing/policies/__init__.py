@@ -1,11 +1,10 @@
-"""Concrete routing/scaffold policy implementations (PHASE4 §8).
-
-Stage 4.3: RuleBasedPromptRouter only. Scaffold policies and SLM stubs arrive
-in later stages.
-"""
+"""Concrete routing and scaffold policy implementations."""
 
 from surrogate_rollout.prompt_routing.policies.rule_based_router import (
     RuleBasedPromptRouter,
 )
+from surrogate_rollout.prompt_routing.policies.history_aware_vlm_router import (
+    HistoryAwareVLMRouter,
+)
 
-__all__ = ["RuleBasedPromptRouter"]
+__all__ = ["HistoryAwareVLMRouter", "RuleBasedPromptRouter"]

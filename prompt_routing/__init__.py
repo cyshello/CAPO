@@ -21,6 +21,12 @@ from surrogate_rollout.prompt_routing.policies.deterministic_scaffold import (
 from surrogate_rollout.prompt_routing.policies.rule_based_router import (
     RuleBasedPromptRouter,
 )
+from surrogate_rollout.prompt_routing.policies.history_aware_vlm_router import (
+    HistoryAwareRouterError,
+    HistoryAwareVLMRouter,
+    get_local_qwen_backend,
+    parse_router_output,
+)
 from surrogate_rollout.prompt_routing.policies.slm_scaffold import (
     SLMScaffoldApplier,
 )
@@ -110,6 +116,9 @@ __all__ = [
     "OfflineDryRunResult",
     "PromptRouter",
     "RuleBasedPromptRouter",
+    "HistoryAwareRouterError",
+    "HistoryAwareVLMRouter",
+    "get_local_qwen_backend",
     "ROUTED_PROMPT_VIEW",
     "ROUTED_CONDITION",
     "RoutedCaptionViewArtifact",
@@ -137,6 +146,7 @@ __all__ = [
     "routing_decision_from_json",
     "write_routing_decisions",
     "run_offline_dry_run",
+    "parse_router_output",
     "segment_context_from_json",
     "SnapshotStoreError",
     "SnapshotValidationError",

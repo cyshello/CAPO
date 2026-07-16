@@ -42,9 +42,10 @@ class CaptionCacheKey:
     """Strong identity of one cached caption set (CLAUDE.md §11).
 
     The vendored DVD cache tag is only md5(caption_prompt||merge_prompt)[:8];
-    this key adds the caption model, decoding, and source identity. Existing
-    legacy caches are registered with this key too (fields reconstructed), but
-    are marked read-only in the manifest and never rewritten.
+    this key adds the caption model, decoding, and source identity. Optional
+    history/component fields extend it for sequential baselines. Existing
+    legacy caches are registered with reconstructed fields, marked read-only,
+    and never rewritten.
     """
 
     video_id: str
@@ -53,6 +54,14 @@ class CaptionCacheKey:
     caption_model_id: str
     decoding_hash: str        # sha256 of decoding-config JSON
     source_hash: str          # sha256 of frame/subtitle source identity
+    history_hash: str | None = None
+    composed_prompt_hash: str | None = None
+    bank_version: str | None = None
+    router_version: str | None = None
+    scaffold_version: str | None = None
+    contract_version: str | None = None
+    backend_id: str | None = None
+    history_config_hash: str | None = None
 
     @property
     def legacy_tag8(self) -> str:

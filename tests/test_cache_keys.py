@@ -82,6 +82,40 @@ def test_new_candidate_cache_dir_outside_legacy_workspace(tmp_path):
     assert key.prompt_hash[:12] in d
 
 
+def test_history_aware_key_requires_history_and_versions_and_is_isolated(tmp_path):
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"video")
+    kwargs = dict(
+        video_id="v1", video_path=str(video), caption_prompt="caption",
+        merge_prompt="merge", subtitle_path=None, segment_id="0_10",
+        composed_prompt_hash="c" * 64, bank_version="bank_v0001",
+        router_version="router_v0001", scaffold_version="scaffold_v0001",
+        contract_version="contract_v0001", backend_id="dvd_backend:qwen_vllm",
+        history_config_hash="g" * 64,
+    )
+    first = cc.build_history_aware_cache_key(
+        **kwargs, history_hash="h" * 64)
+    second = cc.build_history_aware_cache_key(
+        **kwargs, history_hash="i" * 64)
+    assert first != second
+    assert cc.new_history_aware_cache_dir(first, str(tmp_path / "cache")) != \
+        cc.new_history_aware_cache_dir(second, str(tmp_path / "cache"))
+    assert "history_v1" in cc.new_history_aware_cache_dir(
+        first, str(tmp_path / "cache"))
+    with pytest.raises(ValueError, match="history_hash"):
+        cc.build_history_aware_cache_key(**kwargs, history_hash="")
+    assert first.caption_model_id
+    assert first.backend_id == "dvd_backend:qwen_vllm"
+    assert first.decoding_hash
+    assert first.history_config_hash == "g" * 64
+    assert first != cc.build_history_aware_cache_key(
+        **{**kwargs, "backend_id": "other_backend"}, history_hash="h" * 64)
+    assert first != cc.build_history_aware_cache_key(
+        **{**kwargs, "history_config_hash": "j" * 64}, history_hash="h" * 64)
+    assert first != cc.build_history_aware_cache_key(
+        **kwargs, history_hash="h" * 64, caption_model_id="other_model")
+
+
 def test_captions_content_hash(tmp_path):
     p = tmp_path / "captions.json"
     p.write_text('{"0_10": {"caption": "a"}}')
