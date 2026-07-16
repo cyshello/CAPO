@@ -196,19 +196,24 @@ video:
 \[
 S_{\mathrm{sim}}^{i,j}
 =
-\operatorname{Retrieve}
-\left(
-p_{i,j},
-\{(s_{i,t},h_{i,t})\}_{t=1}^{T_i}
-\right).
+\operatorname{TopM}_{t}
+\left[
+\max_f\;\cos\left(
+E_{\mathrm{text}}(p_{i,j}),
+E_{\mathrm{visual}}(x_{i,t,f})
+\right)
+\right].
 \]
 
-Retrieval is conditioned on the candidate property and segment/history
-representation. It must not use the downstream question as an inference-time
-router input.
+The exact normalized candidate property text is the only text query. SigLIP
+scores every sampled frame in every valid source-video segment; maximum frame
+pooling produces the segment score. Select the top `M` by descending score,
+ascending segment start, then stable segment ID. Retrieval must not use frozen
+history, captions, questions, answer choices, answers, correctness, reasoning
+traces, or used-segment references.
 
-Apply a configurable segment budget and persist retrieval scores and selected
-segment IDs.
+`property_retrieval_top_k` defaults to 5. Persist every frame score and every
+ranked valid segment, not only the selected segment IDs.
 
 ### 3.5 Independent property interventions
 
@@ -513,6 +518,8 @@ is persisted. Validation and test are not used by this procedure.
 - Every video runs all of its baseline QAs.
 - One video may propose multiple candidate properties.
 - Every candidate property is evaluated in its own source-video intervention.
+- Property retrieval uses only exact candidate property text and sampled
+  segment frames; frozen local history is not a retrieval input.
 - Candidate properties are force-added to retrieved segments, not routed as if
   already trained.
 - All candidate interventions share frozen incumbent history.
@@ -528,6 +535,9 @@ is persisted. Validation and test are not used by this procedure.
   `correct_to_wrong` flips provide regression evidence.
 - Confirmation videos never generate proposals or optimization feedback.
 - Main experiments are executed manually by the user.
+
+Frozen local history is used only for baseline routing, baseline captioning,
+later selective re-captioning, and later multimodal feedback.
 
 ## 8. Deferred work
 

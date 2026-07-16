@@ -41,6 +41,41 @@ conda run -n local_llm_vllm python -m pytest \
   tests/test_checkpoint2_baseline_phase.py -q
 ```
 
+Checkpoint 3B retrieval is authoritative and frame-only:
+
+```text
+exact candidate property text + sampled segment frames
+→ SigLIP frame cosine scores
+→ maximum frame pooling
+→ top-M source-video segments (default M=5)
+```
+
+Frozen history is not part of the retrieval request, score, cache identity, or
+resume identity. It remains used only by baseline routing, baseline captioning,
+later selective re-captioning, and later multimodal feedback. Questions,
+answers, correctness, traces, captions, and used segments are also prohibited
+as direct retrieval inputs.
+
+Checkpoint 3B artifacts:
+
+```text
+<iteration>/
+├── property_proposals/<video_id>/model_artifacts/
+│   ├── request.json
+│   ├── raw_output.txt
+│   ├── parsed_output.json
+│   ├── rejections.json
+│   └── completed.json
+└── property_retrieval/<video_id>/
+    ├── manifest.json
+    └── <candidate_property_id>/retrieval.json
+```
+
+An exact completed proposal skips the optimization-LLM provider. An exact
+retrieval artifact skips the SigLIP text encoder. Conflicting property text,
+source video, visual index, model/sampling identity, top-k, pooling, or ranking
+configuration fails closed rather than overwriting the artifact.
+
 Checkpoint 2 baseline artifacts:
 
 ```text
@@ -101,7 +136,7 @@ The final command must cover:
 
 - three-video baseline orchestration;
 - per-video multi-property proposals;
-- property-conditioned retrieval;
+- frame-only property-conditioned retrieval;
 - independent frozen-history interventions;
 - all-QA reruns;
 - flip-only feedback;

@@ -143,6 +143,7 @@ class BaselinePhaseResult:
     provisional_state_path: str
     manifest_path: str
     next_coverage_state: EvidenceCoverageState
+    property_retrieval_paths: tuple[str, ...] = ()
     resumed: bool = False
 
 
@@ -158,6 +159,7 @@ class BaselinePhaseRunner:
         clip_index_fn: Callable[..., list[tuple[str, dict]]] = build_clip_index,
         proposal_policy: PropertyProposalPolicy | None = None,
         history_aware_builder: Any | None = None,
+        property_retrieval_runner: Any | None = None,
     ) -> None:
         self.routing_fn = routing_fn
         self.caption_view_builder = caption_view_builder or RoutedCaptionViewBuilder()
@@ -165,6 +167,7 @@ class BaselinePhaseRunner:
         self.clip_index_fn = clip_index_fn
         self.proposal_policy = proposal_policy or NoOpPropertyProposalPolicy()
         self.history_aware_builder = history_aware_builder
+        self.property_retrieval_runner = property_retrieval_runner
 
     def _history_builder(self) -> Any:
         if self.history_aware_builder is None:
@@ -217,6 +220,8 @@ class BaselinePhaseRunner:
             "source_revision": source_revision,
             "proposal_policy_version": self.proposal_policy.policy_version,
             "parent_confirmed_checkpoint_id": parent_confirmed_checkpoint_id,
+            "property_retrieval_policy_version": getattr(
+                self.property_retrieval_runner, "policy_version", None),
         }
         if router_policy.policy_type == "history_aware_vlm":
             input_identity["history_policy"] = {
@@ -227,6 +232,13 @@ class BaselinePhaseRunner:
         else:
             # Preserve the exact Checkpoint 2 fingerprint for old completed runs.
             input_identity["history_block_size"] = history_block_size
+        if hasattr(self.proposal_policy, "configuration_identity"):
+            input_identity["proposal_policy_configuration"] = (
+                self.proposal_policy.configuration_identity)
+        if self.property_retrieval_runner is not None and hasattr(
+                self.property_retrieval_runner, "configuration_identity"):
+            input_identity["property_retrieval_configuration"] = (
+                self.property_retrieval_runner.configuration_identity)
         input_fingerprint = sha256_text(dumps_canonical(input_identity))
         run_id = "baseline_" + input_fingerprint[:24]
         manifest_path = os.path.join(output_dir, "manifest.json")
@@ -245,7 +257,10 @@ class BaselinePhaseRunner:
                 provisional_state_path=manifest["provisional_state_path"],
                 manifest_path=manifest_path,
                 next_coverage_state=_coverage_from_json(
-                    manifest["next_coverage_state"]), resumed=True)
+                    manifest["next_coverage_state"]),
+                property_retrieval_paths=tuple(
+                    manifest.get("property_retrieval_paths") or ()),
+                resumed=True)
 
         _write(os.path.join(output_dir, "policy_snapshot", "prompt_bank.json"),
                prompt_bank)
@@ -262,6 +277,7 @@ class BaselinePhaseRunner:
         proposal_paths = []
         total_qas = 0
         total_router_calls = 0
+        retrieval_paths: list[str] = []
         for record in selected:
             video_dir = os.path.join(output_dir, "baseline", record.video_id)
             complete_path = os.path.join(video_dir, "video_complete.json")
@@ -278,8 +294,14 @@ class BaselinePhaseRunner:
                     "frames_path", "frozen_histories_path", "baseline_qas_path",
                     "property_proposal_path",
                 )
+                if self.property_retrieval_runner is not None:
+                    required += ("property_retrieval_manifest_path",)
                 missing = [name for name in required
                            if not os.path.exists(complete.get(name, ""))]
+                missing.extend(
+                    f"property_retrieval:{path}"
+                    for path in complete.get("property_retrieval_paths") or ()
+                    if not os.path.exists(path))
                 if missing:
                     raise RuntimeError(
                         f"completed video is missing artifacts: {record.video_id}: "
@@ -288,6 +310,8 @@ class BaselinePhaseRunner:
                 proposal_paths.append(complete["property_proposal_path"])
                 total_qas += int(complete["qa_count"])
                 total_router_calls += int(complete.get("real_vlm_router_calls", 0))
+                retrieval_paths.extend(
+                    complete.get("property_retrieval_paths") or ())
                 continue
 
             samples = tuple(sample_loader(index) for index in record.provider_indices)
@@ -382,6 +406,7 @@ class BaselinePhaseRunner:
                     "question_id": question_id,
                     "provider_index": provider_index,
                     "question": example.question,
+                    "options": example.options,
                     "ground_truth": result.ground_truth,
                     "prediction": result.prediction,
                     "parsed_answer": result.parsed_answer,
@@ -407,7 +432,10 @@ class BaselinePhaseRunner:
                 captions=MappingProxyType(captions),
                 frame_references=MappingProxyType(frames),
                 frozen_histories=tuple(MappingProxyType(item) for item in histories),
-                prompt_bank=prompt_bank)
+                prompt_bank=prompt_bank,
+                proposal_artifact_dir=os.path.join(
+                    output_dir, "property_proposals", record.video_id,
+                    "model_artifacts"))
             proposals = tuple(self.proposal_policy.propose(proposal_context))
             proposal_record = VideoPropertyProposalRecord(
                 video_id=record.video_id, baseline_run_id=run_id,
@@ -416,6 +444,15 @@ class BaselinePhaseRunner:
             proposal_path = _write(os.path.join(
                 output_dir, "property_proposals", f"{record.video_id}.json"),
                 proposal_record)
+            video_retrieval_paths: tuple[str, ...] = ()
+            retrieval_manifest_path: str | None = None
+            if self.property_retrieval_runner is not None:
+                retrieval_result = self.property_retrieval_runner.run(
+                    sample=dict(samples[0]), proposals=proposals,
+                    output_dir=os.path.join(
+                        output_dir, "property_retrieval", record.video_id))
+                video_retrieval_paths = retrieval_result.retrieval_artifact_paths
+                retrieval_manifest_path = retrieval_result.manifest_path
             complete = {
                 "video_id": record.video_id,
                 "video_fingerprint": video_fingerprint,
@@ -427,6 +464,8 @@ class BaselinePhaseRunner:
                 "frozen_histories_path": os.path.abspath(histories_path),
                 "baseline_qas_path": os.path.abspath(qa_path),
                 "property_proposal_path": proposal_path,
+                "property_retrieval_paths": video_retrieval_paths,
+                "property_retrieval_manifest_path": retrieval_manifest_path,
                 "caption_materializations": 1,
                 "history_mode": ("sequential_vlm" if
                                  router_policy.policy_type == "history_aware_vlm"
@@ -438,6 +477,7 @@ class BaselinePhaseRunner:
             _write(complete_path, complete)
             video_manifests.append(os.path.abspath(complete_path))
             proposal_paths.append(proposal_path)
+            retrieval_paths.extend(video_retrieval_paths)
             total_qas += len(qa_rows)
             total_router_calls += int(getattr(
                 caption_view, "router_call_count", 0))
@@ -455,7 +495,8 @@ class BaselinePhaseRunner:
             baseline_manifest_path=manifest_path,
             property_proposal_paths=tuple(proposal_paths),
             coverage_state_before_hash=before_hash,
-            coverage_state_after_hash=after_hash)
+            coverage_state_after_hash=after_hash,
+            property_retrieval_paths=tuple(retrieval_paths))
         provisional_path = _write(os.path.join(
             output_dir, "iteration_state", "provisional.json"), provisional)
         manifest = {
@@ -469,6 +510,7 @@ class BaselinePhaseRunner:
             "baseline_qa_count": total_qas,
             "video_manifest_paths": tuple(video_manifests),
             "property_proposal_paths": tuple(proposal_paths),
+            "property_retrieval_paths": tuple(retrieval_paths),
             "provisional_state_path": provisional_path,
             "next_coverage_state": next_coverage,
             "calls": {
@@ -486,6 +528,7 @@ class BaselinePhaseRunner:
             selected_video_ids=selected_ids, baseline_qa_count=total_qas,
             video_manifest_paths=tuple(video_manifests),
             property_proposal_paths=tuple(proposal_paths),
+            property_retrieval_paths=tuple(retrieval_paths),
             provisional_state_path=provisional_path,
             manifest_path=os.path.abspath(manifest_path),
             next_coverage_state=next_coverage)

@@ -63,6 +63,31 @@ class FixtureProposalPolicy:
         ) for index in range(count))
 
 
+class FixturePropertyRetrievalRunner:
+    policy_version = "fixture_property_retrieval_v1"
+    configuration_identity = {"top_k": 5, "method": "fixture"}
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, *, sample, proposals, output_dir):
+        video_id = sample["extra"]["videoID"]
+        self.calls.append((video_id, tuple(item.property_id for item in proposals)))
+        directory = Path(output_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for item in proposals:
+            path = directory / item.property_id / "retrieval.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}")
+            paths.append(str(path.resolve()))
+        manifest = directory / "manifest.json"
+        manifest.write_text("{}")
+        return SimpleNamespace(
+            retrieval_artifact_paths=tuple(paths),
+            manifest_path=str(manifest.resolve()))
+
+
 def components():
     data = json.loads((ROOT / "prompt_routing/fixtures/stage4_7_components.json").read_text())
     return (
@@ -120,9 +145,11 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
 
     caption_builder = FakeCaptionViewBuilder()
     proposer = FixtureProposalPolicy()
+    retrieval_runner = FixturePropertyRetrievalRunner()
     runner = BaselinePhaseRunner(
         routing_fn=routing_fn, caption_view_builder=caption_builder,
-        qa_fn=qa_fn, clip_index_fn=clip_index_fn, proposal_policy=proposer)
+        qa_fn=qa_fn, clip_index_fn=clip_index_fn, proposal_policy=proposer,
+        property_retrieval_runner=retrieval_runner)
     bank, router, scaffold, contract = components()
     output = tmp_path / "iteration"
     result = runner.run(
@@ -140,6 +167,8 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
     assert caption_builder.calls == list(result.selected_video_ids)
     assert len(qa_calls) == 9
     assert proposer.calls == list(result.selected_video_ids)
+    assert [len(item[1]) for item in retrieval_runner.calls] == [0, 1, 2]
+    assert len(result.property_retrieval_paths) == 3
     assert [len(json.loads(Path(path).read_text())["proposals"])
             for path in result.property_proposal_paths] == [0, 1, 2]
     for path in result.video_manifest_paths:
@@ -170,6 +199,7 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
     assert resumed.resumed
     assert len(routing_calls) == len(caption_builder.calls) == 3
     assert len(qa_calls) == 9
+    assert len(retrieval_runner.calls) == 3
 
     Path(result.manifest_path).unlink()
     Path(result.video_manifest_paths[-1]).unlink()
@@ -184,4 +214,5 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
     assert not partial.resumed
     assert len(routing_calls) == len(caption_builder.calls) == 4
     assert len(qa_calls) == 12
+    assert len(retrieval_runner.calls) == 4
     assert Path(partial.manifest_path).exists()

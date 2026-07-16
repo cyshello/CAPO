@@ -55,7 +55,9 @@ Implement:
   iteration;
 - all baseline QAs for every source video;
 - multiple property proposals per video;
-- property-conditioned similarity retrieval within each source video;
+- frame-only property-conditioned SigLIP retrieval within each source video:
+  exact candidate property text against sampled frames, maximum frame pooling,
+  deterministic top-M selection;
 - one independent property intervention per
   `(source_video, candidate_property)`;
 - frozen incumbent history;
@@ -76,6 +78,12 @@ Do not implement:
 - scaffold optimization;
 - trust regions;
 - broad renaming.
+
+Frozen local history is never a property-retrieval input or retrieval-cache
+identity field. History is used only for baseline routing, baseline captioning,
+later selective re-captioning, and later multimodal feedback. Retrieval also
+must not directly consume QA text, answers, correctness, captions, traces, or
+used-segment references.
 
 ## Execution policy
 

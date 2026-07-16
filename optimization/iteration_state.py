@@ -40,6 +40,7 @@ class ProvisionalIterationState:
     property_proposal_paths: tuple[str, ...]
     coverage_state_before_hash: str
     coverage_state_after_hash: str
+    property_retrieval_paths: tuple[str, ...] = ()
     status: str = "provisional"
 
     def __post_init__(self) -> None:

@@ -144,13 +144,18 @@ Do not directly mutate the codebook.
 Implement property-conditioned retrieval for every candidate property:
 
 ```text
-property + segment frames/features + frozen local history
-→ ranked source-video segments
+exact normalized candidate property text + sampled source-video segment frames
+→ SigLIP frame-level cosine similarity
+→ maximum frame pooling per segment
+→ deterministic top-M ranked source-video segments
 → S_sim
 ```
 
-Reuse existing retrieval utilities from `evaluation/selective_rollout.py` where
-appropriate, but do not retrieve using the downstream question.
+Reuse the existing SigLIP visual index and compatible cached frame embeddings.
+The retrieval query must not include frozen history, baseline captions,
+questions, answer choices, answers, correctness, traces, or used segments.
+History remains available only to baseline routing/captioning and later
+selective re-captioning/feedback.
 
 Persist:
 
@@ -159,6 +164,8 @@ Persist:
 - ranked segment IDs and scores;
 - selected `S_sim`;
 - retrieval budget and model/version.
+- property-text hash, frame-sampling identity, visual-index identity, maximum
+  frame-pooling rule, and deterministic ranking version.
 
 ### 3.5 `prompt_routing/routed_caption_view.py`
 
