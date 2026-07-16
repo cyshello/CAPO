@@ -1,0 +1,423 @@
+"""Reusable three-video incumbent baseline phase for Checkpoint 2."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
+
+from surrogate_rollout.captioning.candidate_captions import build_clip_index
+from surrogate_rollout.evaluation.dvd_qa import run_dvd_qa
+from surrogate_rollout.optimization.iteration_state import (
+    ComponentVersions,
+    ProvisionalIterationState,
+)
+from surrogate_rollout.optimization.property_proposal import (
+    NoOpPropertyProposalPolicy,
+    PropertyProposalPolicy,
+    VideoPropertyProposalRecord,
+    VideoProposalContext,
+)
+from surrogate_rollout.optimization.train_roles import (
+    EvidenceCoverageState,
+    TrainRoleAssignment,
+    records_for_video_ids,
+    select_evidence_batch,
+)
+from surrogate_rollout.prompt_routing.offline_dry_run import run_offline_dry_run
+from surrogate_rollout.prompt_routing.persistence import _atomic_write_text
+from surrogate_rollout.prompt_routing.routed_caption_view import RoutedCaptionViewBuilder
+from surrogate_rollout.prompt_routing.schemas import (
+    Phase4Config,
+    PromptBankSnapshot,
+    RouterPolicySnapshot,
+    ScaffoldContract,
+    ScaffoldPolicySnapshot,
+    SegmentContext,
+    as_json_dict,
+    dumps_canonical,
+)
+from surrogate_rollout.schemas import QAExample, sha256_text
+
+
+def _write(path: str, value: object) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _atomic_write_text(path, dumps_canonical(value) + "\n")
+    return os.path.abspath(path)
+
+
+def _read_json(path: str) -> dict[str, Any]:
+    with open(path) as f:
+        return json.load(f)
+
+
+def _coverage_from_json(value: Mapping[str, Any]) -> EvidenceCoverageState:
+    return EvidenceCoverageState(
+        rotation_order=tuple(value["rotation_order"]),
+        used_since_confirmation=tuple(value.get("used_since_confirmation") or ()),
+        rotation_cursor=int(value.get("rotation_cursor", 0)),
+        coverage_cycle=int(value.get("coverage_cycle", 0)),
+        iterations_since_confirmation=int(
+            value.get("iterations_since_confirmation", 0)),
+        confirmation_due=bool(value.get("confirmation_due", False)),
+    )
+
+
+def _video_id(sample: Mapping[str, Any]) -> str:
+    return str(sample.get("extra", {}).get("videoID") or sample["sample_id"])
+
+
+def _caption_text(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("caption") or "")
+    return value if isinstance(value, str) else ""
+
+
+def _frame_references(clip_index: list[tuple[str, dict]]) -> dict[str, tuple[str, ...]]:
+    output = {}
+    for segment_id, info in clip_index:
+        files = info.get("files") or info.get("frames") or ()
+        if isinstance(files, (str, os.PathLike)):
+            files = (files,)
+        output[segment_id] = tuple(os.path.abspath(os.fspath(item)) for item in files)
+    return output
+
+
+def _history_snapshots(
+    segment_ids: tuple[str, ...], captions: Mapping[str, Any], block_size: int,
+) -> tuple[dict[str, Any], ...]:
+    if block_size < 1:
+        raise ValueError("history_block_size must be positive")
+    output = []
+    for index, segment_id in enumerate(segment_ids):
+        block_start = (index // block_size) * block_size
+        preceding_ids = segment_ids[block_start:index]
+        preceding = tuple({"segment_id": value,
+                           "caption": _caption_text(captions.get(value))}
+                          for value in preceding_ids)
+        identity = {"block_start_index": block_start, "preceding": preceding}
+        output.append({
+            "segment_id": segment_id,
+            "block_index": index // block_size,
+            "preceding_segment_ids": preceding_ids,
+            "history": preceding,
+            "history_hash": sha256_text(dumps_canonical(identity)),
+            "source": "frozen_incumbent_caption_view",
+        })
+    return tuple(output)
+
+
+def _reference_sets(result: Any) -> dict[str, tuple[str, ...]]:
+    refs = result.references
+    names = ("retrieved_segments", "returned_segments",
+             "frame_inspected_segments", "explicitly_cited_segments",
+             "consumed_segments")
+    return {name: tuple(sorted(getattr(refs, name, ()) or ())) for name in names}
+
+
+def _used_segments(reference_sets: Mapping[str, tuple[str, ...]]) -> tuple[str, ...]:
+    consumed = reference_sets.get("consumed_segments") or ()
+    if consumed:
+        return tuple(consumed)
+    fallback = set(reference_sets.get("frame_inspected_segments") or ())
+    fallback.update(reference_sets.get("explicitly_cited_segments") or ())
+    fallback.update(reference_sets.get("returned_segments") or ())
+    return tuple(sorted(fallback))
+
+
+@dataclass(frozen=True)
+class BaselinePhaseResult:
+    run_id: str
+    output_dir: str
+    selected_video_ids: tuple[str, ...]
+    baseline_qa_count: int
+    video_manifest_paths: tuple[str, ...]
+    property_proposal_paths: tuple[str, ...]
+    provisional_state_path: str
+    manifest_path: str
+    next_coverage_state: EvidenceCoverageState
+    resumed: bool = False
+
+
+class BaselinePhaseRunner:
+    """Materialize each selected incumbent video once, then run all its QAs."""
+
+    def __init__(
+        self,
+        *,
+        routing_fn: Callable[..., Any] = run_offline_dry_run,
+        caption_view_builder: Any | None = None,
+        qa_fn: Callable[..., Any] = run_dvd_qa,
+        clip_index_fn: Callable[..., list[tuple[str, dict]]] = build_clip_index,
+        proposal_policy: PropertyProposalPolicy | None = None,
+    ) -> None:
+        self.routing_fn = routing_fn
+        self.caption_view_builder = caption_view_builder or RoutedCaptionViewBuilder()
+        self.qa_fn = qa_fn
+        self.clip_index_fn = clip_index_fn
+        self.proposal_policy = proposal_policy or NoOpPropertyProposalPolicy()
+
+    def run(
+        self,
+        *,
+        roles: TrainRoleAssignment,
+        coverage_state: EvidenceCoverageState,
+        sample_loader: Callable[[int], Mapping[str, Any]],
+        prompt_bank: PromptBankSnapshot,
+        router_policy: RouterPolicySnapshot,
+        scaffold_policy: ScaffoldPolicySnapshot,
+        scaffold_contract: ScaffoldContract,
+        phase4_config: Phase4Config,
+        base_prompt_template: str,
+        merge_prompt: str,
+        output_dir: str,
+        parent_confirmed_checkpoint_id: str,
+        history_block_size: int,
+        source_revision: str = "unknown",
+        gpu: str | None = None,
+        dvd_max_iterations: int = 10,
+    ) -> BaselinePhaseResult:
+        selected_ids, next_coverage = select_evidence_batch(coverage_state)
+        selected = records_for_video_ids(roles, selected_ids)
+        output_dir = os.path.abspath(output_dir)
+        versions = ComponentVersions(
+            bank_version=prompt_bank.bank_version,
+            router_version=router_policy.router_version,
+            scaffold_version=scaffold_policy.scaffold_version,
+            contract_version=scaffold_contract.contract_version,
+        )
+        input_identity = {
+            "selected_video_ids": selected_ids,
+            "coverage_state": coverage_state,
+            "components": {
+                "prompt_bank": prompt_bank, "router_policy": router_policy,
+                "scaffold_policy": scaffold_policy,
+                "scaffold_contract": scaffold_contract,
+            },
+            "phase4_config": phase4_config,
+            "base_prompt_template_hash": sha256_text(base_prompt_template),
+            "merge_prompt_hash": sha256_text(merge_prompt),
+            "history_block_size": history_block_size,
+            "source_revision": source_revision,
+            "proposal_policy_version": self.proposal_policy.policy_version,
+            "parent_confirmed_checkpoint_id": parent_confirmed_checkpoint_id,
+        }
+        input_fingerprint = sha256_text(dumps_canonical(input_identity))
+        run_id = "baseline_" + input_fingerprint[:24]
+        manifest_path = os.path.join(output_dir, "manifest.json")
+        if os.path.exists(manifest_path):
+            manifest = _read_json(manifest_path)
+            if manifest.get("input_fingerprint") != input_fingerprint:
+                raise RuntimeError("baseline output exists for different frozen inputs")
+            if manifest.get("status") != "completed":
+                raise RuntimeError("baseline manifest exists but is not completed")
+            return BaselinePhaseResult(
+                run_id=manifest["run_id"], output_dir=output_dir,
+                selected_video_ids=tuple(manifest["selected_video_ids"]),
+                baseline_qa_count=int(manifest["baseline_qa_count"]),
+                video_manifest_paths=tuple(manifest["video_manifest_paths"]),
+                property_proposal_paths=tuple(manifest["property_proposal_paths"]),
+                provisional_state_path=manifest["provisional_state_path"],
+                manifest_path=manifest_path,
+                next_coverage_state=_coverage_from_json(
+                    manifest["next_coverage_state"]), resumed=True)
+
+        _write(os.path.join(output_dir, "policy_snapshot", "prompt_bank.json"),
+               prompt_bank)
+        _write(os.path.join(output_dir, "policy_snapshot", "router_policy.json"),
+               router_policy)
+        _write(os.path.join(output_dir, "policy_snapshot", "scaffold_policy.json"),
+               scaffold_policy)
+        _write(os.path.join(output_dir, "policy_snapshot", "scaffold_contract.json"),
+               scaffold_contract)
+        _write(os.path.join(output_dir, "coverage", "before.json"), coverage_state)
+        _write(os.path.join(output_dir, "coverage", "after.json"), next_coverage)
+
+        video_manifests = []
+        proposal_paths = []
+        total_qas = 0
+        for record in selected:
+            video_dir = os.path.join(output_dir, "baseline", record.video_id)
+            complete_path = os.path.join(video_dir, "video_complete.json")
+            video_fingerprint = sha256_text(dumps_canonical({
+                "run": input_fingerprint, "video": record,
+            }))
+            if os.path.exists(complete_path):
+                complete = _read_json(complete_path)
+                if complete.get("video_fingerprint") != video_fingerprint:
+                    raise RuntimeError(
+                        f"completed video has stale inputs: {record.video_id}")
+                required = (
+                    "routing_manifest_path", "caption_view_path", "captions_path",
+                    "frames_path", "frozen_histories_path", "baseline_qas_path",
+                    "property_proposal_path",
+                )
+                missing = [name for name in required
+                           if not os.path.exists(complete.get(name, ""))]
+                if missing:
+                    raise RuntimeError(
+                        f"completed video is missing artifacts: {record.video_id}: "
+                        f"{missing}")
+                video_manifests.append(os.path.abspath(complete_path))
+                proposal_paths.append(complete["property_proposal_path"])
+                total_qas += int(complete["qa_count"])
+                continue
+
+            samples = tuple(sample_loader(index) for index in record.provider_indices)
+            if any(_video_id(sample) != record.video_id for sample in samples):
+                raise RuntimeError(f"provider video changed for {record.video_id}")
+            clip_index = self.clip_index_fn(samples[0], record.video_id)
+            segment_ids = tuple(segment_id for segment_id, _ in clip_index)
+            frames = _frame_references(clip_index)
+            contexts = tuple(SegmentContext(
+                video_id=record.video_id,
+                segment_id=segment_id,
+                segment_features={"frame_references": frames[segment_id]},
+                metadata={"checkpoint": 2, "history_router_input": "deferred"},
+            ) for segment_id in segment_ids)
+            routing = self.routing_fn(
+                contexts=contexts, prompt_bank=prompt_bank,
+                router_policy=router_policy, scaffold_policy=scaffold_policy,
+                scaffold_contract=scaffold_contract, phase4_config=phase4_config,
+                base_prompt_template=base_prompt_template,
+                output_dir=os.path.join(video_dir, "routing"),
+                source_revision=source_revision)
+            prompt_map = {item.segment_id: item for item in routing.composed_prompts}
+            caption_view = self.caption_view_builder.build(
+                sample=dict(samples[0]), segment_composed_prompt_map=prompt_map,
+                work_root=os.path.join(video_dir, "caption_view"),
+                merge_prompt=merge_prompt)
+            with open(caption_view.captions_path) as f:
+                captions = json.load(f)
+            histories = _history_snapshots(
+                tuple(caption_view.segment_ids), captions, history_block_size)
+            frames_path = _write(os.path.join(video_dir, "frames.json"), frames)
+            histories_path = os.path.join(video_dir, "frozen_histories.jsonl")
+            _atomic_write_text(histories_path, "".join(
+                dumps_canonical(item) + "\n" for item in histories))
+
+            qa_rows = []
+            for question_id, provider_index, sample in zip(
+                    record.question_ids, record.provider_indices, samples):
+                example = QAExample(
+                    video_id=record.video_id, question_id=question_id,
+                    question=str(sample["question"]),
+                    ground_truth=str(sample.get("answer") or ""),
+                    provider_index=provider_index,
+                    options=tuple(sample.get("options") or ()),
+                    subtitle_available=bool(
+                        sample.get("extra", {}).get("subtitle_path")),
+                )
+                qa_dir = os.path.join(
+                    video_dir, "qa", question_id.replace("/", "-"))
+                result = self.qa_fn(
+                    captions_path=caption_view.captions_path,
+                    sample=dict(sample), run_dir=qa_dir,
+                    question_id=question_id,
+                    database_path=caption_view.database_path,
+                    max_iterations=dvd_max_iterations, gpu=gpu)
+                references = _reference_sets(result)
+                row = {
+                    "video_id": record.video_id,
+                    "question_id": question_id,
+                    "provider_index": provider_index,
+                    "question": example.question,
+                    "ground_truth": result.ground_truth,
+                    "prediction": result.prediction,
+                    "parsed_answer": result.parsed_answer,
+                    "score": float(result.score),
+                    "is_correct": float(result.score) > 0.0,
+                    "used_segments": _used_segments(references),
+                    "reference_sets": references,
+                    "trajectory_path": os.path.join(qa_dir, "trajectory.jsonl"),
+                    "references_path": os.path.join(qa_dir, "references.json"),
+                    "result_path": os.path.join(qa_dir, "result.json"),
+                    "errors": tuple(result.errors),
+                    "latency_seconds": float(result.latency_seconds),
+                }
+                _write(os.path.join(qa_dir, "baseline_record.json"), row)
+                qa_rows.append(row)
+            qa_path = os.path.join(video_dir, "baseline_qas.jsonl")
+            _atomic_write_text(qa_path, "".join(
+                dumps_canonical(item) + "\n" for item in qa_rows))
+
+            proposal_context = VideoProposalContext(
+                video_id=record.video_id, baseline_run_id=run_id,
+                baseline_qa_results=tuple(MappingProxyType(item) for item in qa_rows),
+                captions=MappingProxyType(captions),
+                frame_references=MappingProxyType(frames),
+                frozen_histories=tuple(MappingProxyType(item) for item in histories),
+                prompt_bank=prompt_bank)
+            proposals = tuple(self.proposal_policy.propose(proposal_context))
+            proposal_record = VideoPropertyProposalRecord(
+                video_id=record.video_id, baseline_run_id=run_id,
+                baseline_qa_ids=record.question_ids, proposals=proposals,
+                proposer_policy_version=self.proposal_policy.policy_version)
+            proposal_path = _write(os.path.join(
+                output_dir, "property_proposals", f"{record.video_id}.json"),
+                proposal_record)
+            complete = {
+                "video_id": record.video_id,
+                "video_fingerprint": video_fingerprint,
+                "qa_count": len(qa_rows),
+                "routing_manifest_path": routing.manifest_path,
+                "caption_view_path": caption_view.routed_view_path,
+                "captions_path": caption_view.captions_path,
+                "frames_path": frames_path,
+                "frozen_histories_path": os.path.abspath(histories_path),
+                "baseline_qas_path": os.path.abspath(qa_path),
+                "property_proposal_path": proposal_path,
+                "caption_materializations": 1,
+                "component_versions": as_json_dict(versions),
+            }
+            _write(complete_path, complete)
+            video_manifests.append(os.path.abspath(complete_path))
+            proposal_paths.append(proposal_path)
+            total_qas += len(qa_rows)
+
+        if total_qas != 9:
+            raise RuntimeError(f"baseline phase requires nine QAs, got {total_qas}")
+        before_hash = sha256_text(dumps_canonical(coverage_state))
+        after_hash = sha256_text(dumps_canonical(next_coverage))
+        provisional = ProvisionalIterationState(
+            iteration_id=run_id,
+            coverage_cycle=coverage_state.coverage_cycle,
+            selected_video_ids=selected_ids,
+            parent_confirmed_checkpoint_id=parent_confirmed_checkpoint_id,
+            input_versions=versions, provisional_versions=versions,
+            baseline_manifest_path=manifest_path,
+            property_proposal_paths=tuple(proposal_paths),
+            coverage_state_before_hash=before_hash,
+            coverage_state_after_hash=after_hash)
+        provisional_path = _write(os.path.join(
+            output_dir, "iteration_state", "provisional.json"), provisional)
+        manifest = {
+            "schema_version": "phase4_checkpoint2_baseline_v1",
+            "status": "completed", "run_id": run_id,
+            "input_fingerprint": input_fingerprint,
+            "selected_video_ids": selected_ids,
+            "baseline_qa_count": total_qas,
+            "video_manifest_paths": tuple(video_manifests),
+            "property_proposal_paths": tuple(proposal_paths),
+            "provisional_state_path": provisional_path,
+            "next_coverage_state": next_coverage,
+            "calls": {
+                "video_caption_materializations": 3,
+                "dvd_reasoning": 9,
+                "property_proposal_policy": 3,
+                "real_vlm_router": 0,
+                "interventional_feedback_models": 0,
+                "confirmation_evaluations": 0,
+            },
+        }
+        _write(manifest_path, manifest)
+        return BaselinePhaseResult(
+            run_id=run_id, output_dir=output_dir,
+            selected_video_ids=selected_ids, baseline_qa_count=total_qas,
+            video_manifest_paths=tuple(video_manifests),
+            property_proposal_paths=tuple(proposal_paths),
+            provisional_state_path=provisional_path,
+            manifest_path=os.path.abspath(manifest_path),
+            next_coverage_state=next_coverage)
