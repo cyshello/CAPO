@@ -16,6 +16,7 @@ from surrogate_rollout.prompt_routing.persistence import (
     scaffold_policy_from_json,
 )
 from surrogate_rollout.prompt_routing.schemas import (
+    as_json_dict,
     Phase4Config,
     PostInterventionMode,
 )
@@ -145,6 +146,53 @@ class FakeUpdateEngine:
         return kwargs["prompt_bank"], kwargs["router_policy"]
 
 
+class FakeMemoryUpdateEngine(FakeUpdateEngine):
+    def __init__(self):
+        super().__init__()
+        self.memory_calls = 0
+        self.router_calls = 0
+        self.property_memory_runner = SimpleNamespace(
+            configuration_identity={"fixture": "memory"})
+        self.llm_codebook_updater = SimpleNamespace(
+            configuration_identity={"fixture": "codebook"},
+            response_provider=SimpleNamespace(call_count=1))
+        self.llm_router_updater = SimpleNamespace(
+            configuration_identity={"fixture": "router"},
+            response_provider=SimpleNamespace(call_count=1))
+
+    def run_memory_conditioned_codebook_checkpoint(self, **kwargs):
+        self.memory_calls += 1
+        root = Path(kwargs["output_dir"])
+        snapshot = _write(root / "property_memory_v1.json", {
+            "schema_version": "property_memory_v1", "properties": [],
+            "candidates": []})
+        manifest = _write(root / "manifest.json", {
+            "schema_version": "memory_conditioned_codebook_iteration_v1",
+            "status": "completed", "artifacts": {
+                "property_memory_snapshot": snapshot}})
+        return {"status": "completed", "artifacts": {
+            "property_memory_snapshot": snapshot}, "manifest_path": manifest}
+
+    def run_memory_conditioned_router_checkpoint(self, **kwargs):
+        self.router_calls += 1
+        root = Path(kwargs["output_dir"])
+        bank, router = _inputs()["prompt_bank"], _inputs()["router_policy"]
+        bank_path = _write(root / "provisional_bank.json", as_json_dict(bank))
+        router_path = _write(root / "provisional_router.json", as_json_dict(router))
+        pair_path = _write(root / "policy_pair.json", {"status": "committed"})
+        manifest = _write(root / "manifest.json", {
+            "schema_version": "memory_conditioned_atomic_policy_pair_v1",
+            "status": "committed"})
+        return {
+            "status": "committed", "rendered_router_prompt_hash": "hash-v2",
+            "artifacts": {
+                "atomic_policy_pair": pair_path,
+                "provisional_codebook": bank_path,
+                "provisional_router": router_path,
+            }, "manifest_path": manifest,
+        }
+
+
 def _inputs():
     components = json.loads((
         ROOT / "prompt_routing/fixtures/stage4_7_components.json").read_text())
@@ -206,6 +254,35 @@ def test_all_modes_progress_without_recomputing_upstream(tmp_path):
     assert resumed.resumed is True
     assert (baseline.work_calls, intervention.work_calls, feedback.work_calls) == (1, 1, 1)
     assert (update.aggregate_calls, update.apply_calls) == (1, 1)
+
+
+def test_memory_conditioned_bounded_update_and_resume(tmp_path, monkeypatch):
+    update = FakeMemoryUpdateEngine()
+    runner = BoundedSmokeRunner(
+        baseline_runner=FakeBaseline(), intervention_runner=FakeIntervention(),
+        feedback_runner=FakeFeedback(), update_engine=update,
+        require_real_models=False, memory_conditioned_update=True)
+
+    def probe(**kwargs):
+        return _write(Path(kwargs["output_dir"]) / "probe.json", {
+            "next_router_call_used_rendered_prompt": True})
+
+    monkeypatch.setattr(runner, "_probe_rendered_router_prompt", probe)
+    result = _run(runner, tmp_path, PostInterventionMode.PROVISIONAL_UPDATE)
+    mode = json.loads((
+        tmp_path / "output/mode_manifests/provisional_update.json").read_text())
+    assert update.memory_calls == update.router_calls == 1
+    assert mode["property_memory_snapshot_path"].endswith(
+        "property_memory_v1.json")
+    assert mode["rendered_router_prompt_hash"] == "hash-v2"
+    assert mode["confirmed_pointer_hash_before"] is None
+    assert mode["confirmed_pointer_hash_after"] is None
+    assert Path(mode["router_prompt_probe_path"]).exists()
+    assert result.provisional_bank_path and result.provisional_router_path
+
+    resumed = _run(runner, tmp_path, PostInterventionMode.PROVISIONAL_UPDATE)
+    assert resumed.resumed is True
+    assert update.memory_calls == update.router_calls == 1
 
 
 def test_moving_to_earlier_mode_preserves_later_artifacts(tmp_path):

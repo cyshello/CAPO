@@ -25,6 +25,12 @@ from surrogate_rollout.optimization.confirmation_evaluator import (
     HistoryAwareDVDConfirmationEvaluator,
 )
 from surrogate_rollout.optimization.final_iteration import Checkpoint3EOrchestrator
+from surrogate_rollout.optimization.llm_codebook_updater import (
+    MemoryConditionedLLMCodebookUpdater,
+)
+from surrogate_rollout.optimization.llm_router_updater import (
+    MemoryConditionedLLMRouterUpdater,
+)
 from surrogate_rollout.optimization.interventional_feedback import PropertyFeedbackRunner
 from surrogate_rollout.optimization.policies.codex_feedback import (
     OpenAIStructuredFeedbackProvider,
@@ -32,6 +38,12 @@ from surrogate_rollout.optimization.policies.codex_feedback import (
 from surrogate_rollout.optimization.policies.property_proposal import (
     MultiPropertyProposalPolicy,
     OpenAIPropertyProposalProvider,
+)
+from surrogate_rollout.optimization.policies.openai_update import (
+    OpenAIJSONUpdateProvider,
+)
+from surrogate_rollout.optimization.property_memory import (
+    CompactPropertyMemoryRunner,
 )
 from surrogate_rollout.optimization.property_intervention import (
     PropertyInterventionBatchRunner,
@@ -206,16 +218,26 @@ def main() -> None:
         gpu=primary_gpu, dvd_max_iterations=args.dvd_max_iterations,
         downstream_qa_configuration={
             "text_backend": "codex", "use_openai_tools": False})
+    codebook_update_provider = OpenAIJSONUpdateProvider(
+        model=args.feedback_model, max_calls=1)
+    router_update_provider = OpenAIJSONUpdateProvider(
+        model=args.feedback_model, max_calls=1)
     update_engine = Checkpoint3EOrchestrator(
         baseline_runner=baseline_runner,
         intervention_runner=intervention_runner,
         feedback_runner=feedback_runner,
-        confirmation_evaluator=confirmation_evaluator)
+        confirmation_evaluator=confirmation_evaluator,
+        property_memory_runner=CompactPropertyMemoryRunner(),
+        llm_codebook_updater=MemoryConditionedLLMCodebookUpdater(
+            response_provider=codebook_update_provider),
+        llm_router_updater=MemoryConditionedLLMRouterUpdater(
+            response_provider=router_update_provider))
     runner = BoundedSmokeRunner(
         baseline_runner=baseline_runner,
         intervention_runner=intervention_runner,
         feedback_runner=feedback_runner,
-        update_engine=update_engine)
+        update_engine=update_engine,
+        memory_conditioned_update=True)
     phase4_config = Phase4Config(
         seed=0, dry_run=True, commit=False,
         post_intervention_mode=PostInterventionMode(
@@ -242,6 +264,9 @@ def main() -> None:
                 "provider_indices": record.provider_indices,
                 "question_ids": record.question_ids,
                 "feedback_model": args.feedback_model,
+                "codebook_update_provider":
+                    codebook_update_provider.metadata(),
+                "router_update_provider": router_update_provider.metadata(),
                 "dvd_max_iterations": args.dvd_max_iterations,
                 "gpu": primary_gpu,
                 "retrieval_device": "cpu",
@@ -268,7 +293,34 @@ def main() -> None:
                 "dvd_max_iterations": args.dvd_max_iterations,
             })
     finally:
+        worker_processes = tuple(
+            (gpu, process.pid, process)
+            for gpu, process in history_builder._pool_processes.items())
         history_builder.close_worker_pool()
+        cleanup_path = os.path.join(output_dir, "worker_cleanup.json")
+        os.makedirs(os.path.dirname(cleanup_path), exist_ok=True)
+        with open(cleanup_path, "w") as handle:
+            json.dump({
+                "schema_version": "bounded_smoke_worker_cleanup_v1",
+                "configured_gpus": caption_gpus,
+                "workers_before_close": tuple({
+                    "gpu": gpu, "pid": pid,
+                } for gpu, pid, _ in worker_processes),
+                "workers_alive_after_close": tuple({
+                    "gpu": gpu, "pid": pid,
+                } for gpu, pid, process in worker_processes
+                if process.is_alive()),
+                "pool_empty_after_close": not history_builder._pool_processes,
+                "all_workers_released": (
+                    not history_builder._pool_processes and
+                    not any(process.is_alive()
+                            for _, _, process in worker_processes)),
+                "component_update_provider_calls": {
+                    "codebook": codebook_update_provider.call_count,
+                    "router": router_update_provider.call_count,
+                },
+            }, handle, sort_keys=True, ensure_ascii=False, indent=2)
+            handle.write("\n")
     print(result.manifest_path, flush=True)
 
 

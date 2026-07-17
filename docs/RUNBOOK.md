@@ -441,6 +441,46 @@ conda run -n local_llm_vllm python -m pytest -q \
   tests/test_checkpoint3_memory_router_updater.py
 ```
 
+### One-video Checkpoint 3 real smoke
+
+The bounded runner now opts into the memory-conditioned path only in
+`scripts/run_phase4_bounded_smoke.py`; fixture and legacy callers retain the
+deterministic provisional-update path unless they explicitly set
+`memory_conditioned_update=True`. The real smoke uses one call each for the
+codebook and router updater, then makes exactly one post-commit router call
+through the still-active persistent GPU pool to prove that the rendered prompt
+is consumed. Worker cleanup is recorded in `worker_cleanup.json`.
+
+Use isolated output/state roots and the compatible read-only caption cache:
+
+```bash
+conda run -n local_llm_vllm python -m dotenv run -- python \
+  scripts/run_phase4_bounded_smoke.py \
+  --post-intervention-mode provisional_update \
+  --video-id wCkQ138sg6M --gpu 4 --gpus 4,5,6,7 \
+  --output-dir runs/phase4_memory_router_smoke_wCkQ138sg6M_output \
+  --state-dir runs/phase4_memory_router_smoke_wCkQ138sg6M_state \
+  --cache-dir runs/phase4_one_video_smoke_json_cache
+```
+
+Repeat that exact command for the resume audit. A successful repeat performs
+no proposal, feedback, codebook-updater, router-updater, routing-probe,
+captioning, or QA model call. Inspect:
+
+```text
+runs/phase4_memory_router_smoke_wCkQ138sg6M_output/
+├── mode_manifests/provisional_update.json
+├── memory_codebook_checkpoint/
+├── memory_router_checkpoint/
+│   └── router_prompt_consumption_probe.json
+└── worker_cleanup.json
+```
+
+`mode_manifests/provisional_update.json` records property-memory, both updater
+manifests, the rendered-prompt hash, atomic pair paths, updater call counts,
+and the before/after confirmed-pointer hash. The smoke fails if that pointer
+changes or if the post-commit router call does not carry the new prompt hash.
+
 ## 1. Repository and environment
 
 ```bash

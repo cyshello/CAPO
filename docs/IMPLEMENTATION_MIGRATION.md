@@ -572,6 +572,11 @@ Files and interfaces changed:
 - `optimization/llm_codebook_updater.py`: preserves bounded routing examples
   when property memories merge;
 - `tests/test_checkpoint3_memory_router_updater.py`: mock-only checkpoint tests.
+- `optimization/bounded_smoke.py`, `scripts/run_phase4_bounded_smoke.py`, and
+  `optimization/policies/openai_update.py`: explicit one-video real-smoke
+  opt-in, one-call OpenAI updater providers, atomic checkpoint chaining,
+  rendered-prompt consumption probe, confirmed-pointer guard, exact resume,
+  and worker-cleanup audit. Legacy fixture callers remain deterministic.
 
 Schemas/versions are `memory_router_updater_request_v1`,
 `memory_router_updater_response_v1`, `memory_router_updater_plan_v1`,

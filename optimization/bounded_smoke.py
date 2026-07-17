@@ -31,6 +31,11 @@ from surrogate_rollout.prompt_routing.schemas import (
     ScaffoldPolicySnapshot,
     as_json_dict,
     dumps_canonical,
+    SegmentContext,
+)
+from surrogate_rollout.prompt_routing.persistence import (
+    prompt_bank_from_json,
+    router_policy_from_json,
 )
 from surrogate_rollout.schemas import sha256_json, sha256_text
 
@@ -189,6 +194,11 @@ def _stage_identity(value: Any) -> Mapping[str, Any]:
         result["bounds"] = as_json_dict(value.bounds)
     if hasattr(value, "frame_transform"):
         result["frame_transform"] = as_json_dict(value.frame_transform)
+    for name in ("property_memory_runner", "llm_codebook_updater",
+                 "llm_router_updater"):
+        stage = getattr(value, name, None)
+        if stage is not None:
+            result[name] = _stage_identity(stage)
     for name in ("caption_cache_root", "caption_cache_manifest_path"):
         configured_path = getattr(value, name, None)
         if configured_path is not None:
@@ -205,12 +215,14 @@ class BoundedSmokeRunner:
         self, *, baseline_runner: Any, intervention_runner: Any,
         feedback_runner: Any, update_engine: Checkpoint3EOrchestrator,
         require_real_models: bool = True,
+        memory_conditioned_update: bool = False,
     ) -> None:
         self.baseline_runner = baseline_runner
         self.intervention_runner = intervention_runner
         self.feedback_runner = feedback_runner
         self.update_engine = update_engine
         self.require_real_models = require_real_models
+        self.memory_conditioned_update = memory_conditioned_update
 
     @staticmethod
     def _validate_directories(output_dir: str, state_dir: str, cache_dir: str) -> None:
@@ -239,6 +251,70 @@ class BoundedSmokeRunner:
         retriever = getattr(retrieval, "retriever", None)
         if getattr(retriever, "top_k", None) != 1:
             raise BoundedSmokeError("bounded smoke requires property_retrieval_top_k=1")
+        if self.memory_conditioned_update and \
+                config.post_intervention_mode is PostInterventionMode.PROVISIONAL_UPDATE and \
+                any(getattr(self.update_engine, name, None) is None for name in (
+                    "property_memory_runner", "llm_codebook_updater",
+                    "llm_router_updater")):
+            raise BoundedSmokeError(
+                "provisional smoke requires all memory-conditioned update stages")
+
+    def _probe_rendered_router_prompt(
+        self, *, video_manifest_path: str, candidate_bank_path: str,
+        candidate_router_path: str, output_dir: str,
+    ) -> str:
+        """Make one real post-commit router call through the active GPU pool."""
+        video = _read_json(video_manifest_path)
+        frames = _read_json(video["frames_path"])
+        histories = _read_jsonl(video["frozen_histories_path"])
+        history = next((row for row in histories
+                        if frames.get(str(row.get("segment_id") or ""))), None)
+        if history is None:
+            raise BoundedSmokeError("router probe lacks a framed frozen history")
+        segment_id = str(history["segment_id"])
+        try:
+            start, end = (float(item) for item in segment_id.split("_", 1))
+        except (TypeError, ValueError) as exc:
+            raise BoundedSmokeError("router probe segment ID is invalid") from exc
+        bank = prompt_bank_from_json(_read_json(candidate_bank_path))
+        router = router_policy_from_json(_read_json(candidate_router_path))
+        rendered_hash = str(router.configuration.get(
+            "rendered_router_prompt_hash") or "")
+        if not rendered_hash:
+            raise BoundedSmokeError("candidate router lacks rendered-prompt hash")
+        builder = getattr(self.baseline_runner, "history_aware_builder", None)
+        if builder is None:
+            raise BoundedSmokeError("router probe requires history-aware builder")
+        decision = builder.router.route(
+            SegmentContext(
+                video_id=str(video["video_id"]), segment_id=segment_id,
+                timestamp_start=start, timestamp_end=end,
+                segment_features={"frame_references": tuple(frames[segment_id])},
+                history_summary=str(history["serialized_history"])),
+            bank, router)
+        exchange = builder.router.last_exchange
+        if exchange is None or \
+                exchange.request.get("router_prompt_identity", {}).get(
+                    "rendered_prompt_hash") != rendered_hash or \
+                decision.decision_payload.get(
+                    "rendered_router_prompt_hash") != rendered_hash:
+            raise BoundedSmokeError(
+                "post-commit router call did not consume rendered prompt")
+        return _write_immutable(os.path.join(
+            output_dir, "router_prompt_consumption_probe.json"), {
+                "schema_version": "bounded_smoke_router_prompt_probe_v1",
+                "status": "completed", "video_id": video["video_id"],
+                "segment_id": segment_id,
+                "candidate_bank_version": bank.bank_version,
+                "candidate_router_version": router.router_version,
+                "rendered_router_prompt_hash": rendered_hash,
+                "request": exchange.request,
+                "request_hash": exchange.request_hash,
+                "raw_output": exchange.raw_output,
+                "output_hash": exchange.output_hash,
+                "routing_decision": decision,
+                "next_router_call_used_rendered_prompt": True,
+            })
 
     @staticmethod
     def _write_run_pointer(
@@ -321,6 +397,8 @@ class BoundedSmokeRunner:
                 "output": output_dir, "state": state_dir, "cache": cache_dir,
             },
             "confirmation_enabled": False,
+            **({"memory_conditioned_update": True}
+               if self.memory_conditioned_update else {}),
         }
         base_fingerprint = sha256_text(dumps_canonical(base_identity))
         state_identity_path = os.path.join(state_dir, "bounded_smoke_identity.json")
@@ -392,6 +470,19 @@ class BoundedSmokeRunner:
                        for hash_key, path in artifact_paths.items()):
                     raise BoundedSmokeConflictError(
                         "completed provisional update artifact is missing or changed")
+                if self.memory_conditioned_update:
+                    for path_key, hash_key in (
+                        ("memory_codebook_checkpoint_manifest_path",
+                         "memory_codebook_checkpoint_manifest_hash"),
+                        ("memory_router_checkpoint_manifest_path",
+                         "memory_router_checkpoint_manifest_hash"),
+                        ("router_prompt_probe_path", "router_prompt_probe_hash"),
+                    ):
+                        path = requested.get(path_key)
+                        if not path or not os.path.exists(path) or \
+                                _file_hash(path) != requested.get(hash_key):
+                            raise BoundedSmokeConflictError(
+                                "completed memory-update artifact is missing or changed")
             manifest_path = self._write_run_pointer(
                 output_dir=output_dir, state_dir=state_dir, cache_dir=cache_dir,
                 iteration_id=iteration_id, video_id=video_id, mode=mode,
@@ -486,19 +577,99 @@ class BoundedSmokeRunner:
         if mode is PostInterventionMode.PROVISIONAL_UPDATE:
             if feedback_result is None:
                 raise BoundedSmokeError("provisional update requires completed feedback")
-            plan = self.update_engine.aggregate_updates(
-                prompt_bank=prompt_bank, router_policy=router_policy,
-                feedback_manifest_paths=(feedback_result.manifest_path,),
-                expected_evidence_video_count=1)
-            candidate_bank, candidate_router = self.update_engine.apply_update_plan(
-                prompt_bank=prompt_bank, router_policy=router_policy, plan=plan)
-            update_root = os.path.join(state_dir, "provisional_update")
-            plan_path = _write_immutable(
-                os.path.join(update_root, "update_plan.json"), plan)
-            bank_path = _write_immutable(
-                os.path.join(update_root, "provisional_bank.json"), candidate_bank)
-            router_path = _write_immutable(
-                os.path.join(update_root, "provisional_router.json"), candidate_router)
+            if not self.memory_conditioned_update:
+                plan = self.update_engine.aggregate_updates(
+                    prompt_bank=prompt_bank, router_policy=router_policy,
+                    feedback_manifest_paths=(feedback_result.manifest_path,),
+                    expected_evidence_video_count=1)
+                candidate_bank, candidate_router = self.update_engine.apply_update_plan(
+                    prompt_bank=prompt_bank, router_policy=router_policy, plan=plan)
+                update_root = os.path.join(state_dir, "provisional_update")
+                plan_path = _write_immutable(
+                    os.path.join(update_root, "update_plan.json"), plan)
+                bank_path = _write_immutable(
+                    os.path.join(update_root, "provisional_bank.json"), candidate_bank)
+                router_path = _write_immutable(
+                    os.path.join(update_root, "provisional_router.json"), candidate_router)
+                _write_immutable(os.path.join(
+                    mode_root, "provisional_update.json"), {
+                        "schema_version": "bounded_smoke_mode_manifest_v1",
+                        "post_intervention_mode": mode.value,
+                        "base_fingerprint": base_fingerprint,
+                        "feedback_manifest_path": feedback_path,
+                        "feedback_manifest_hash": _file_hash(feedback_path),
+                        "update_identity": sha256_json({
+                            "stage": mode.value, "plan": plan,
+                            "input_bank": prompt_bank.bank_version,
+                            "input_router": router_policy.router_version,
+                        }),
+                        "update_plan_path": plan_path,
+                        "update_plan_hash": _file_hash(plan_path),
+                        "provisional_bank_path": bank_path,
+                        "provisional_bank_hash": _file_hash(bank_path),
+                        "provisional_router_path": router_path,
+                        "provisional_router_hash": _file_hash(router_path),
+                        "canonical_state_mutated": False,
+                        "confirmation_calls": 0,
+                    })
+                manifest_path = self._write_run_pointer(
+                    output_dir=output_dir, state_dir=state_dir,
+                    cache_dir=cache_dir, iteration_id=iteration_id,
+                    video_id=video_id, mode=mode,
+                    base_fingerprint=base_fingerprint,
+                    requested_manifest=requested_manifest)
+                return BoundedSmokeResult(
+                    video_id=video_id, post_intervention_mode=mode,
+                    manifest_path=manifest_path,
+                    baseline_manifest_path=baseline_result.manifest_path,
+                    intervention_manifest_path=intervention.manifest_path,
+                    feedback_manifest_path=feedback_path,
+                    update_plan_path=plan_path,
+                    provisional_bank_path=bank_path,
+                    provisional_router_path=router_path,
+                    resumed=requested_mode_completed_before_run)
+            confirmed_pointer = os.path.join(state_dir, "confirmed", "current.json")
+            confirmed_before = (_file_hash(confirmed_pointer)
+                                if os.path.exists(confirmed_pointer) else None)
+            codebook_checkpoint = self.update_engine.\
+                run_memory_conditioned_codebook_checkpoint(
+                    iteration_id=iteration_id, iteration_ordinal=1,
+                    prompt_bank=prompt_bank,
+                    baseline_video_manifest_paths=tuple(
+                        baseline_result.video_manifest_paths),
+                    intervention_manifest_paths=(intervention.manifest_path,),
+                    feedback_manifest_paths=(feedback_result.manifest_path,),
+                    output_dir=os.path.join(
+                        output_dir, "memory_codebook_checkpoint"),
+                    state_dir=state_dir)
+            codebook_manifest_path = os.path.join(
+                output_dir, "memory_codebook_checkpoint", "manifest.json")
+            router_checkpoint = self.update_engine.\
+                run_memory_conditioned_router_checkpoint(
+                    iteration_id=iteration_id,
+                    parent_router_policy=router_policy,
+                    codebook_checkpoint_manifest_path=codebook_manifest_path,
+                    output_dir=os.path.join(
+                        output_dir, "memory_router_checkpoint"),
+                    state_dir=state_dir)
+            pair_artifacts = router_checkpoint["artifacts"]
+            plan_path = pair_artifacts["atomic_policy_pair"]
+            bank_path = pair_artifacts["provisional_codebook"]
+            router_path = pair_artifacts["provisional_router"]
+            probe_path = self._probe_rendered_router_prompt(
+                video_manifest_path=video_manifest_path,
+                candidate_bank_path=bank_path,
+                candidate_router_path=router_path,
+                output_dir=os.path.join(output_dir, "memory_router_checkpoint"))
+            confirmed_after = (_file_hash(confirmed_pointer)
+                               if os.path.exists(confirmed_pointer) else None)
+            if confirmed_before != confirmed_after:
+                raise BoundedSmokeError("confirmed pointer changed during bounded smoke")
+            provider_calls = {}
+            for name in ("llm_codebook_updater", "llm_router_updater"):
+                stage = getattr(self.update_engine, name)
+                provider = getattr(stage, "response_provider", None)
+                provider_calls[name] = int(getattr(provider, "call_count", 0))
             _write_immutable(os.path.join(mode_root, "provisional_update.json"), {
                 "schema_version": "bounded_smoke_mode_manifest_v1",
                 "post_intervention_mode": mode.value,
@@ -506,7 +677,9 @@ class BoundedSmokeRunner:
                 "feedback_manifest_path": feedback_path,
                 "feedback_manifest_hash": _file_hash(feedback_path),
                 "update_identity": sha256_json({
-                    "stage": mode.value, "plan": plan,
+                    "stage": mode.value,
+                    "codebook_checkpoint": codebook_checkpoint,
+                    "router_checkpoint": router_checkpoint,
                     "input_bank": prompt_bank.bank_version,
                     "input_router": router_policy.router_version,
                 }),
@@ -516,6 +689,26 @@ class BoundedSmokeRunner:
                 "provisional_bank_hash": _file_hash(bank_path),
                 "provisional_router_path": router_path,
                 "provisional_router_hash": _file_hash(router_path),
+                "memory_codebook_checkpoint_manifest_path":
+                    codebook_manifest_path,
+                "memory_codebook_checkpoint_manifest_hash":
+                    _file_hash(codebook_manifest_path),
+                "memory_router_checkpoint_manifest_path": os.path.join(
+                    output_dir, "memory_router_checkpoint", "manifest.json"),
+                "memory_router_checkpoint_manifest_hash": _file_hash(os.path.join(
+                    output_dir, "memory_router_checkpoint", "manifest.json")),
+                "property_memory_snapshot_path": codebook_checkpoint["artifacts"][
+                    "property_memory_snapshot"],
+                "property_memory_snapshot_hash": _file_hash(
+                    codebook_checkpoint["artifacts"]["property_memory_snapshot"]),
+                "router_prompt_probe_path": probe_path,
+                "router_prompt_probe_hash": _file_hash(probe_path),
+                "rendered_router_prompt_hash": router_checkpoint[
+                    "rendered_router_prompt_hash"],
+                "component_update_provider_calls": provider_calls,
+                "confirmed_pointer_path": confirmed_pointer,
+                "confirmed_pointer_hash_before": confirmed_before,
+                "confirmed_pointer_hash_after": confirmed_after,
                 "canonical_state_mutated": False,
                 "confirmation_calls": 0,
             })
