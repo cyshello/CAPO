@@ -429,6 +429,48 @@ iteration/
 └── next_state/
 ```
 
+### 3.15 Checkpoint 1 implementation log: compact property memory
+
+Exact before-versus-after state:
+
+| Concern | Before Checkpoint 1 | After Checkpoint 1 |
+|---|---|---|
+| Raw evidence | Complete artifacts persisted | Unchanged and still authoritative |
+| Cross-iteration compact state | Codebook, router supervision, coverage and policy lineage only | Optional parent-linked bounded property/candidate memory |
+| Correct-QA successes | No property-level retained credit | Strong/weak/none summaries with a routed-caption-reasoning-answer chain |
+| Candidate interventions | Flip feedback could update components; no compact all-transition history | Positive/negative/mixed/no-effect summary from all four counts |
+| Seed-property origin | Only codebook provenance | Explicit `seed_or_legacy` memory origin when creation evidence is absent |
+| Bounded selection | Router kept its own supervision list; no property example policy | Strength, distinct video, diversity, then recency with retention/eviction audit |
+| Candidate promotion | Existing updater decided add/merge | Decision unchanged; memory records promotion only after that decision exists |
+
+Files and interfaces added or changed:
+
+- `optimization/property_memory.py` adds `CompactPropertyMemoryRunner`,
+  `PropertyMemoryBounds`, immutable artifact/hash helpers, conservative
+  correct-QA credit extraction, deterministic intervention summaries, bounded
+  selection, candidate separation/promotion recording, resume, and fail-closed
+  schema validation.
+- `tests/test_checkpoint1_property_memory.py` provides fixture-only coverage;
+  it performs no GPU, paid API, or real-model call.
+- `docs/CURRENT_METHOD.md`, `docs/IMPLEMENTATION_MIGRATION.md`, and
+  `docs/RUNBOOK.md` record the active contract and operation.
+
+The runner interface consumes completed baseline, intervention, and optional
+feedback manifests plus a frozen codebook. `parent_memory_path` enables bounded
+accumulation. `update_plan`, `update_plan_path`, and
+`resulting_prompt_bank` are optional, observational inputs: they permit
+recording an updater decision but never alter it. The compact-summary schema is
+`property_compact_summary_v1`; the snapshot/record schema is
+`property_memory_v1`; the completion manifest is
+`property_memory_manifest_v1`; selection is
+`property_memory_selection_v1`.
+
+Intentionally deferred:
+
+- replacing the deterministic codebook updater with an LLM updater;
+- adding compact memory to the router prompt or changing router updates;
+- changing property proposal acceptance, prompting, or retrieval semantics.
+
 ## 4. Required tests
 
 Add focused tests for:

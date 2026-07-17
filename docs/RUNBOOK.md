@@ -189,6 +189,76 @@ videos whose `video_complete.json` fingerprint matches and whose referenced
 artifacts all still exist. A conflicting fingerprint or incomplete completion
 marker fails closed rather than overwriting results.
 
+## Checkpoint 1 compact property-memory sidecar
+
+Checkpoint 1 is a fixture-tested, model-free sidecar. It does not run
+captioning, QA, proposal, retrieval, feedback, the updater, confirmation, or a
+three-video experiment. Construct `CompactPropertyMemoryRunner` and call
+`run(...)` only after the referenced baseline and intervention artifacts are
+complete. For an updater-decided iteration, pass the already-written update
+plan and resulting bank so candidate promotion is recorded after, rather than
+decided by, the memory layer.
+
+```python
+from surrogate_rollout.optimization.property_memory import (
+    CompactPropertyMemoryRunner,
+)
+
+memory_result = CompactPropertyMemoryRunner().run(
+    iteration_id=iteration_id,
+    iteration_ordinal=iteration_ordinal,
+    prompt_bank=input_prompt_bank,
+    baseline_video_manifest_paths=baseline_video_manifest_paths,
+    intervention_manifest_paths=intervention_manifest_paths,
+    feedback_manifest_paths=feedback_manifest_paths,
+    output_dir=f"{iteration_output}/compact_property_memory",
+    parent_memory_path=parent_memory_snapshot_path,  # None for seed bootstrap
+    update_plan=completed_update_plan,               # optional
+    update_plan_path=completed_update_plan_path,     # optional, hashed lineage
+    resulting_prompt_bank=completed_resulting_bank,  # optional
+)
+```
+
+Artifact layout:
+
+```text
+<iteration>/compact_property_memory/
+├── manifest.json                         # property_memory_manifest_v1
+├── compact_summaries/
+│   ├── correct_qa_property_credit.jsonl  # property_compact_summary_v1
+│   └── intervention_effects.jsonl        # property_compact_summary_v1
+└── property_memory/
+    ├── snapshot.json                     # property_memory_v1 parent unit
+    ├── selection_audit.json
+    ├── properties/<property_id>.json
+    └── candidates/<video_id>__<candidate_id>.json
+```
+
+Defaults are three strong and two weak positives, three harmful, two no-effect,
+and two positive/two negative routing examples. Candidate positive, negative,
+mixed, and no-effect categories use the corresponding small bounds. Ranking is
+strength, distinct video, representative-signature diversity, then recency.
+The selection audit explains retention and eviction; evicted compact examples
+do not delete raw artifacts or immutable summary rows.
+
+Every example contains source paths and SHA-256 hashes. The manifest binds raw
+manifest hashes, parent snapshot hash, input/result bank hashes, optional
+update-plan content/path hash, schema versions, bounds, and selection version.
+Repeat the exact call for exact resume. A partial output directory, a changed
+source or parent, an incompatible memory schema, or a missing/hash-mismatched
+completed artifact fails closed. Do not point `parent_memory_path` at a legacy
+Phase 4 artifact; legacy artifacts remain raw inputs and are not overwritten.
+
+Focused fixture-only command:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_checkpoint1_property_memory.py
+```
+
+The LLM codebook updater and router-prompt consumption of this memory are the
+next checkpoint and are intentionally not active here.
+
 ## 1. Repository and environment
 
 ```bash

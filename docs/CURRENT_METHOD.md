@@ -512,6 +512,88 @@ Then aggregate all intervention feedback across the three-video batch:
 F_{i,j}.
 \]
 
+### 4.6 Checkpoint 1: compact property-centric memory
+
+Before this checkpoint, cross-iteration state retained the current codebook,
+the router's cumulative accepted flip-supervision examples, provisional
+lineage, coverage state, and confirmed/provisional pointers. Complete raw QA,
+routing, caption, reasoning, proposal, retrieval, intervention, feedback, and
+transition artifacts were persisted, but their useful observations were not
+converted into a bounded property-level record. In particular, correct-QA
+evidence, no-effect interventions, rejected or unpromoted candidate histories,
+and the reasons for retaining representative examples were absent from the
+next iteration's compact state.
+
+Checkpoint 1 adds an observational sidecar flow without changing proposal,
+feedback, codebook-update, or router-update decisions:
+
+```text
+immutable raw Phase 4 artifacts
+→ property_compact_summary_v1
+→ property_memory_v1
+```
+
+Raw artifacts remain immutable and authoritative. Every compact example cites
+absolute artifact paths and SHA-256 hashes. The compact layer never replaces a
+QA result, trajectory, caption, routing decision, intervention result, or
+transition artifact.
+
+For a correct, runtime-valid QA, an active property receives credit only when
+the evidence establishes the complete chain:
+
+```text
+routed property
+→ property-related caption information
+→ downstream reasoning reused that information
+→ correct answer
+```
+
+`strong` means the reasoning clearly reused the related caption evidence;
+`weak` means the related evidence was present and reused but decisive use is
+uncertain; `none` means routing or successful co-occurrence did not establish
+the chain. Merely selecting a property never earns credit, and correct-QA
+credit cannot create a candidate or a new property. The Checkpoint 1 default
+analyzer is deterministic and conservative: it requires an actually used and
+routed segment, property-to-caption content overlap, and caption-to-reasoning
+content reuse. Exact caption reuse or at least two reused content tokens is
+strong; one is weak; all other cases are none.
+
+Every completed candidate intervention receives a deterministic effect summary
+from all four transition counts. Any `wrong_to_correct` without a regression is
+`positive`; any `correct_to_wrong` without an improvement is `negative`; both
+is `mixed`; no flip is `no_effect`. This summary does not change current
+intervention or feedback semantics.
+
+One active-property record contains its ID/text, creation reason, intended
+behavior, positive/harmful/no-effect examples, positive/negative routing
+examples, aliases, revision history, and latest decision. Seed entries lacking
+creation artifacts use an explicit `seed_or_legacy` origin; no supporting
+evidence is invented. A candidate has a separate temporary memory containing
+its proposal rationale, reusable instruction, coverage-related active IDs,
+bounded effect examples, and artifact references. It remains separate unless
+the existing updater has already produced an `add` or `merge` decision. Passing
+that immutable update plan and resulting bank lets the sidecar record the
+post-decision promotion; the memory layer cannot cause the decision.
+
+Default per-property limits are three strong and two weak positive examples,
+three harmful examples, two no-effect examples, and two positive plus two
+negative routing examples. Candidate effect categories are bounded by the
+corresponding limits. Selection is deterministic: evidence strength first,
+then distinct source videos, then representative-signature diversity, with
+recency only as the final tie-breaker. Each build writes a selection audit that
+records why every considered example was retained or evicted. Eviction removes
+only a compact memory entry; the raw artifact and immutable compact summary
+remain available.
+
+`CompactPropertyMemoryRunner` rebuilds from an optional parent
+`property_memory_v1` snapshot, the current raw artifacts, the frozen input
+codebook, optional already-decided update plan, and the fixed selection policy.
+Its manifest binds all source hashes, parent hash, bank hashes, bounds, schema,
+and selection policy. Exact matching completion resumes without rebuilding;
+partial output, changed source hashes, or an incompatible parent/completed
+schema fails closed. Completed legacy Phase 4 artifacts are read as raw sources
+and are never reinterpreted or overwritten as memory artifacts.
+
 ## 5. Codebook and router update
 
 Update the codebook and router once, after all property interventions in the
@@ -674,3 +756,6 @@ Do not implement before the first main result:
 - trust-region logic;
 - broad file/class renaming;
 - automatic main-experiment execution by the coding agent.
+- feeding compact memory into an LLM codebook updater;
+- changing the router prompt or router-update policy to consume memory;
+- changing property-proposal semantics based on accumulated memory.
