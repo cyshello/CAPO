@@ -256,8 +256,100 @@ conda run -n local_llm_vllm python -m pytest -q \
   tests/test_checkpoint1_property_memory.py
 ```
 
-The LLM codebook updater and router-prompt consumption of this memory are the
-next checkpoint and are intentionally not active here.
+The memory-conditioned LLM codebook updater is the following checkpoint below;
+router-prompt consumption remains intentionally deferred.
+
+## Checkpoint 2 memory-conditioned LLM codebook updater
+
+Configure the existing orchestrator with `CompactPropertyMemoryRunner` and
+`MemoryConditionedLLMCodebookUpdater`, then invoke the post-feedback checkpoint
+with already-completed iteration manifests. Tests use a callable mock provider;
+no real provider is configured or called by this checkpoint implementation.
+
+```python
+orchestrator = Checkpoint3EOrchestrator(
+    baseline_runner=baseline_runner,
+    intervention_runner=intervention_runner,
+    feedback_runner=feedback_runner,
+    confirmation_evaluator=confirmation_evaluator,
+    property_memory_runner=CompactPropertyMemoryRunner(),
+    llm_codebook_updater=MemoryConditionedLLMCodebookUpdater(
+        response_provider=reviewed_codebook_provider,
+    ),
+)
+
+result = orchestrator.run_memory_conditioned_codebook_checkpoint(
+    iteration_id=iteration_id,
+    iteration_ordinal=iteration_ordinal,
+    prompt_bank=input_prompt_bank,
+    baseline_video_manifest_paths=baseline_video_manifest_paths,
+    intervention_manifest_paths=intervention_manifest_paths,
+    feedback_manifest_paths=feedback_manifest_paths,
+    output_dir=f"{iteration_output}/memory_codebook_checkpoint",
+    state_dir=policy_state_dir,
+)
+```
+
+Prompt:
+
+```text
+optimization/prompts/codebook_updater_v1.txt
+memory_codebook_updater_prompt_v1
+```
+
+Artifacts:
+
+```text
+<iteration>/memory_codebook_checkpoint/
+├── manifest.json
+├── compact_property_memory/
+│   ├── manifest.json
+│   ├── compact_summaries/
+│   └── property_memory/snapshot.json
+└── llm_codebook_updater/
+    ├── manifest.json
+    ├── system_prompt.txt
+    ├── request.json
+    ├── raw_response.txt
+    ├── parsed_plan.json
+    ├── validation_report.json
+    ├── rejected_actions.json
+    ├── applied_plan.json
+    ├── candidate_codebook.json
+    ├── property_id_mapping.json
+    └── promoted_property_memory.json
+
+<state_dir>/property_memory/current.json
+```
+
+`property_id_mapping.json` contains:
+
+```json
+{
+  "schema_version": "property_id_mapping_v1",
+  "old_to_new_property_ids": {
+    "unchanged_or_canonical_id": "same_or_canonical_id",
+    "retired_id": null
+  },
+  "candidate_promotions": {
+    "candidate_id": "validated_active_property_id"
+  }
+}
+```
+
+The state pointer tracks only compact-memory lineage for the unchanged active
+input bank. It is not `confirmed/current.json` or
+`active_provisional.json`. Candidate codebook output is not a production policy
+and must not be passed to confirmation before the deferred router updater builds
+and validates the matching router.
+
+Focused mock-only command:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_checkpoint1_property_memory.py \
+  tests/test_checkpoint2_memory_codebook_updater.py
+```
 
 ## 1. Repository and environment
 

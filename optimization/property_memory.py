@@ -752,6 +752,9 @@ class CompactPropertyMemoryRunner:
             candidate_key = f"{key[0]}::{key[1]}"
             existing = candidates.get(candidate_key, {})
             candidate_examples = list(existing.get("intervention_examples") or ())
+            for field in ("positive_examples", "negative_examples", "mixed_examples",
+                          "no_effect_examples"):
+                candidate_examples.extend(existing.get(field) or ())
             candidate_example = {
                 "example_id": _example_id(effect), "effect": effect["effect"],
                 "video_id": effect["video_id"],
@@ -774,6 +777,7 @@ class CompactPropertyMemoryRunner:
                     proposal.get("covered_by_existing_property_ids") or ()),
                 "intervention_examples": tuple(candidate_examples),
                 "artifact_refs": tuple(filter(None, (
+                    *(existing.get("artifact_refs") or ()),
                     proposal.get("artifact_ref"),
                     proposal.get("retrieval_artifact_ref"),
                     *effect["artifact_refs"]))),

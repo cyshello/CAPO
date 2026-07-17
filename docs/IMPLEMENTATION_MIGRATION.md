@@ -471,6 +471,58 @@ Intentionally deferred:
 - adding compact memory to the router prompt or changing router updates;
 - changing property proposal acceptance, prompting, or retrieval semantics.
 
+### 3.16 Checkpoint 2 implementation log: memory-conditioned codebook updater
+
+Previous behavior: `Checkpoint3EOrchestrator.aggregate_updates()` converted
+accepted flip-only feedback into deterministic codebook decisions and router
+supervision, and `apply_update_plan()` applied both components to one
+provisional pair. It had no `property_memory_v1` input, no tunable centralized
+LLM planning prompt, and no candidate-codebook-only artifact boundary.
+
+Current behavior: `run_memory_conditioned_codebook_checkpoint()` resolves the
+parent memory snapshot from `state_dir/property_memory/current.json`, invokes
+`CompactPropertyMemoryRunner` on the completed iteration artifacts, and passes
+the resulting bounded snapshot and compact intervention summaries directly to
+`MemoryConditionedLLMCodebookUpdater`. It persists the new memory lineage
+pointer separately from production policy pointers. Exact repeat returns the
+completed checkpoint without provider calls; changed/missing artifacts,
+incompatible schemas, a bank/memory-lineage mismatch, or partial output fail
+closed.
+
+Files and interfaces changed:
+
+- `optimization/llm_codebook_updater.py`: strict request/response parsing,
+  bounded request building, action-by-action deterministic validation,
+  candidate bank application, ID mapping, memory promotion, artifact identity,
+  and exact resume.
+- `optimization/prompts/codebook_updater_v1.txt`: centralized tunable system
+  prompt, version `memory_codebook_updater_prompt_v1`.
+- `optimization/final_iteration.py`: optional memory/updater stage injection and
+  `run_memory_conditioned_codebook_checkpoint()` orchestration boundary.
+- `optimization/property_memory.py`: preserves categorized candidate examples
+  across parent-memory accumulation.
+- `tests/test_checkpoint2_memory_codebook_updater.py`: mock-only updater and
+  orchestration coverage.
+- the three authoritative Phase 4 markdown files: active behavior, artifacts,
+  commands, lineage, and deferred boundary.
+
+Artifacts use these schemas:
+
+- request: `memory_codebook_updater_request_v1`;
+- response: `memory_codebook_updater_response_v1`;
+- validation: `memory_codebook_validation_report_v1`;
+- applied plan: `memory_codebook_applied_plan_v1`;
+- candidate codebook: `memory_candidate_codebook_v1`;
+- ID mapping: `property_id_mapping_v1`;
+- updater manifest: `memory_codebook_checkpoint_manifest_v1`;
+- orchestration manifest: `memory_conditioned_codebook_iteration_v1`;
+- memory lineage pointer: `property_memory_lineage_pointer_v1`.
+
+Intentionally deferred: changing the router prompt, translating the mapping
+into router rules/supervision, validating the candidate bank against a candidate
+router, atomic bank/router provisional commit, confirmation of that pair, and
+any production-pointer mutation.
+
 ## 4. Required tests
 
 Add focused tests for:

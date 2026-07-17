@@ -602,6 +602,78 @@ iteration finish.
 Multiple properties may be accepted in one iteration. There is no
 `max_new_entries_per_iteration=1` methodological constraint.
 
+### 5.0 Checkpoint 2: memory-conditioned LLM codebook planning
+
+Before this checkpoint, `aggregate_updates()` deterministically grouped
+accepted correctness-flip feedback by normalized candidate text. It selected
+`add`, `revise`, `merge`, `retire`, or `no_op` from feedback recommendations,
+coverage IDs, positive/negative counts, and a two-video retirement threshold;
+`apply_update_plan()` then changed the bank and router together. That path
+remains available for legacy deterministic iterations and is not
+reinterpreted as an LLM plan.
+
+The new post-feedback checkpoint connects the bounded memory layer inside
+`Checkpoint3EOrchestrator`:
+
+```text
+completed baseline/proposal/intervention/feedback artifacts
+→ resolve property_memory_lineage_pointer_v1
+→ CompactPropertyMemoryRunner
+→ property_memory_v1 + current intervention summaries
+→ memory-conditioned LLM codebook plan
+→ deterministic action validation
+→ candidate codebook + complete old-to-new ID mapping
+```
+
+This checkpoint is deliberately separate from the existing production
+bank/router pair commit. It writes a candidate codebook only. It does not
+change the router, run confirmation, advance coverage, or mutate confirmed or
+active-provisional production pointers. The next router checkpoint must consume
+the candidate codebook and ID mapping before any atomic pair commit.
+
+The centralized system prompt is
+`optimization/prompts/codebook_updater_v1.txt`, version
+`memory_codebook_updater_prompt_v1`. Its request schema is
+`memory_codebook_updater_request_v1` and contains only the current codebook,
+bounded active-property memories, bounded candidate memories, current compact
+intervention summaries, recent no-op/rejection summaries, and audit artifact
+references. It never contains raw frames, unbounded captions, or full reasoning
+histories.
+
+The strict `memory_codebook_updater_response_v1` response contains zero or more
+`add`, `revise`, `merge`, `preserve`, `retire`, or `no_op` actions. Every action
+names target property/candidate IDs, optional proposed ID/text, concise
+reasoning, supporting memory-example/evidence IDs, behaviors to preserve, and
+confidence. The LLM never edits a snapshot directly.
+
+Deterministic validation rejects actions independently when they cite unknown
+properties, candidates, examples, or evidence; add without a completed positive
+intervention; non-reusable or instance/non-visual knowledge text; revise/merge
+that fails to cite and preserve existing positive behavior; invalid merge
+lineage or canonical ID; retirement without harmful support across at least two
+distinct video-or-iteration groups; conflicting mutations; ID/text collisions;
+or malformed schema. Rejections are explicit and do not invalidate otherwise
+independent valid actions.
+
+Validated actions materialize `memory_candidate_codebook_v1` and
+`property_id_mapping_v1`. The mapping contains every old property ID, mapping
+unchanged entries to themselves, merged entries to the canonical ID, and
+retired entries to null; candidate promotions are recorded separately. Merge
+keeps source IDs and texts as aliases and combines bounded compatible memories.
+Revise preserves the existing property ID, origin, positive examples, and
+revision history. Candidate memory remains temporary unless a validated `add`
+or `merge` promotes it.
+
+Example:
+
+```text
+candidate has one positive intervention example
++ related active property has repeated positive memory
+→ updater chooses revise instead of add
+→ validator preserves existing behavior
+→ candidate codebook and ID mapping are produced
+```
+
 ### 5.1 Existing property already covers the behavior
 
 If an accepted candidate is semantically covered by an existing property:

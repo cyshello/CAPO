@@ -279,6 +279,8 @@ class Checkpoint3EOrchestrator:
         feedback_runner: Any, confirmation_evaluator: ConfirmationEvaluator,
         min_retire_support_videos: int = 2,
         require_real_models: bool = True,
+        property_memory_runner: Any | None = None,
+        llm_codebook_updater: Any | None = None,
     ) -> None:
         if min_retire_support_videos < 2:
             raise ValueError("retirement requires at least two support videos")
@@ -288,6 +290,8 @@ class Checkpoint3EOrchestrator:
         self.confirmation_evaluator = confirmation_evaluator
         self.min_retire_support_videos = min_retire_support_videos
         self.require_real_models = require_real_models
+        self.property_memory_runner = property_memory_runner
+        self.llm_codebook_updater = llm_codebook_updater
 
     @classmethod
     def with_real_confirmation(
@@ -1263,6 +1267,158 @@ class Checkpoint3EOrchestrator:
             accepted_feedback_ids=accepted_ids,
             rejected_feedback_count=rejected_count,
             conflict_resolutions=tuple(conflicts))
+
+    def run_memory_conditioned_codebook_checkpoint(
+        self, *, iteration_id: str, iteration_ordinal: int,
+        prompt_bank: PromptBankSnapshot,
+        baseline_video_manifest_paths: tuple[str, ...],
+        intervention_manifest_paths: tuple[str, ...],
+        feedback_manifest_paths: tuple[str, ...],
+        output_dir: str, state_dir: str,
+    ) -> Mapping[str, Any]:
+        """Run the post-feedback memory/codebook checkpoint without router commit.
+
+        This boundary is intentionally separate from ``run``: the existing
+        production iteration commits a bank/router pair, while this checkpoint
+        may only materialize a candidate codebook for the deferred router stage.
+        """
+        if self.property_memory_runner is None or self.llm_codebook_updater is None:
+            raise FinalIterationError(
+                "memory-conditioned codebook checkpoint requires both stage runners")
+        output_dir = os.path.abspath(output_dir)
+        state_dir = os.path.abspath(state_dir)
+        manifest_target = os.path.join(output_dir, "manifest.json")
+        pointer_path = os.path.join(state_dir, "property_memory", "current.json")
+        bank_hash = _object_hash(prompt_bank)
+        input_contract = {
+            "iteration_id": iteration_id, "iteration_ordinal": iteration_ordinal,
+            "input_bank_version": prompt_bank.bank_version,
+            "input_bank_hash": bank_hash,
+            "baseline_manifests": tuple({"path": os.path.abspath(path),
+                                          "hash": _file_hash(path)}
+                                         for path in baseline_video_manifest_paths),
+            "intervention_manifests": tuple({"path": os.path.abspath(path),
+                                              "hash": _file_hash(path)}
+                                             for path in intervention_manifest_paths),
+            "feedback_manifests": tuple({"path": os.path.abspath(path),
+                                          "hash": _file_hash(path)}
+                                         for path in feedback_manifest_paths),
+            "stages": {
+                "property_memory": _stage_identity(self.property_memory_runner),
+                "llm_codebook_updater": _stage_identity(self.llm_codebook_updater),
+            },
+            "state_dir": state_dir,
+        }
+        input_contract_hash = sha256_json(input_contract)
+        if os.path.exists(manifest_target):
+            manifest = _read_json(manifest_target)
+            if manifest.get("schema_version") != \
+                    "memory_conditioned_codebook_iteration_v1" or \
+                    manifest.get("status") != "completed" or \
+                    manifest.get("iteration_id") != iteration_id or \
+                    manifest.get("input_bank_hash") != bank_hash or \
+                    manifest.get("input_contract_hash") != input_contract_hash:
+                raise FinalIterationConflictError(
+                    "incompatible completed memory-codebook checkpoint")
+            artifacts = manifest.get("artifacts") or {}
+            hashes = manifest.get("artifact_hashes") or {}
+            if set(artifacts) != set(hashes) or any(
+                    not os.path.exists(path) or _file_hash(path) != hashes[name]
+                    for name, path in artifacts.items()):
+                raise FinalIterationConflictError(
+                    "memory-codebook checkpoint artifact mismatch")
+            memory_manifest = _read_json(artifacts["property_memory_manifest"])
+            for ref in memory_manifest.get("raw_artifact_refs") or ():
+                if not os.path.exists(str(ref.get("path") or "")) or \
+                        ref.get("sha256") != _file_hash(ref["path"]):
+                    raise FinalIterationConflictError(
+                        "memory-codebook raw artifact closure mismatch")
+            if not os.path.exists(pointer_path):
+                raise FinalIterationConflictError("property-memory lineage pointer is missing")
+            pointer = _read_json(pointer_path)
+            if pointer.get("schema_version") != "property_memory_lineage_pointer_v1" or \
+                    pointer.get("latest_iteration_id") != iteration_id or \
+                    pointer.get("snapshot_hash") != _file_hash(
+                        pointer.get("snapshot_path", "")):
+                raise FinalIterationConflictError(
+                    "property-memory lineage pointer conflicts with completed checkpoint")
+            return {**manifest, "resumed": True}
+        if os.path.isdir(output_dir) and os.listdir(output_dir):
+            raise FinalIterationConflictError(
+                "incomplete memory-codebook checkpoint cannot be resumed")
+
+        parent_memory_path = None
+        if os.path.exists(pointer_path):
+            pointer = _read_json(pointer_path)
+            if pointer.get("schema_version") != "property_memory_lineage_pointer_v1" or \
+                    pointer.get("active_bank_version") != prompt_bank.bank_version or \
+                    pointer.get("active_bank_hash") != bank_hash:
+                raise FinalIterationConflictError(
+                    "property-memory parent does not match active policy lineage")
+            parent_memory_path = str(pointer.get("snapshot_path") or "")
+            if not os.path.exists(parent_memory_path) or \
+                    pointer.get("snapshot_hash") != _file_hash(parent_memory_path):
+                raise FinalIterationConflictError(
+                    "property-memory parent path/hash mismatch")
+
+        memory_result = self.property_memory_runner.run(
+            iteration_id=iteration_id, iteration_ordinal=iteration_ordinal,
+            prompt_bank=prompt_bank,
+            baseline_video_manifest_paths=baseline_video_manifest_paths,
+            intervention_manifest_paths=intervention_manifest_paths,
+            feedback_manifest_paths=feedback_manifest_paths,
+            output_dir=os.path.join(output_dir, "compact_property_memory"),
+            parent_memory_path=parent_memory_path)
+        memory_path = memory_result["property_memory_snapshot_path"]
+        updater_result = self.llm_codebook_updater.run(
+            iteration_id=iteration_id, prompt_bank=prompt_bank,
+            property_memory_snapshot_path=memory_path,
+            intervention_summary_path=memory_result["effect_summary_path"],
+            output_dir=os.path.join(output_dir, "llm_codebook_updater"))
+        updater_manifest_path = os.path.join(
+            output_dir, "llm_codebook_updater", "manifest.json")
+        artifacts = {
+            "property_memory_manifest": os.path.join(
+                output_dir, "compact_property_memory", "manifest.json"),
+            "property_memory_snapshot": memory_path,
+            "intervention_summaries": memory_result["effect_summary_path"],
+            "llm_codebook_updater_manifest": updater_manifest_path,
+            "candidate_codebook": updater_result["artifacts"]["candidate_codebook"],
+            "property_id_mapping": updater_result["artifacts"]["property_id_mapping"],
+            "promoted_property_memory": updater_result["artifacts"][
+                "promoted_property_memory"],
+        }
+        manifest = {
+            "schema_version": "memory_conditioned_codebook_iteration_v1",
+            "status": "completed", "iteration_id": iteration_id,
+            "iteration_ordinal": iteration_ordinal,
+            "input_bank_version": prompt_bank.bank_version,
+            "input_bank_hash": bank_hash,
+            "input_contract_hash": input_contract_hash,
+            "parent_property_memory_path": parent_memory_path,
+            "stages": {
+                "property_memory": _stage_identity(self.property_memory_runner),
+                "llm_codebook_updater": _stage_identity(self.llm_codebook_updater),
+            },
+            "artifacts": artifacts,
+            "artifact_hashes": {name: _file_hash(path)
+                                for name, path in artifacts.items()},
+            "router_updated": False,
+            "production_pointer_mutated": False,
+            "resumed": False,
+        }
+        manifest_path = _write_immutable(manifest_target, manifest)
+        _write_pointer(pointer_path, {
+            "schema_version": "property_memory_lineage_pointer_v1",
+            "latest_iteration_id": iteration_id,
+            "active_bank_version": prompt_bank.bank_version,
+            "active_bank_hash": bank_hash,
+            "snapshot_path": os.path.abspath(memory_path),
+            "snapshot_hash": _file_hash(memory_path),
+            "checkpoint_manifest_path": manifest_path,
+            "checkpoint_manifest_hash": _file_hash(manifest_path),
+        })
+        return _read_json(manifest_path)
 
     def apply_update_plan(
         self, *, prompt_bank: PromptBankSnapshot,
