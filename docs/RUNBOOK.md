@@ -457,9 +457,9 @@ Use isolated output/state roots and the compatible read-only caption cache:
 conda run -n local_llm_vllm python -m dotenv run -- python \
   scripts/run_phase4_bounded_smoke.py \
   --post-intervention-mode provisional_update \
-  --video-id wCkQ138sg6M --gpu 4 --gpus 4,5,6,7 \
-  --output-dir runs/phase4_memory_router_smoke_wCkQ138sg6M_output \
-  --state-dir runs/phase4_memory_router_smoke_wCkQ138sg6M_state \
+  --video-id wCkQ138sg6M --gpu 4 --gpus 4,5 \
+  --output-dir runs/phase4_memory_router_smoke_wCkQ138sg6M_v2_output \
+  --state-dir runs/phase4_memory_router_smoke_wCkQ138sg6M_v2_state \
   --cache-dir runs/phase4_one_video_smoke_json_cache
 ```
 
@@ -468,7 +468,7 @@ no proposal, feedback, codebook-updater, router-updater, routing-probe,
 captioning, or QA model call. Inspect:
 
 ```text
-runs/phase4_memory_router_smoke_wCkQ138sg6M_output/
+runs/phase4_memory_router_smoke_wCkQ138sg6M_v2_output/
 ├── mode_manifests/provisional_update.json
 ├── memory_codebook_checkpoint/
 ├── memory_router_checkpoint/

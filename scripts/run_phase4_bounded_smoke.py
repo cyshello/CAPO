@@ -297,6 +297,24 @@ def main() -> None:
             (gpu, process.pid, process)
             for gpu, process in history_builder._pool_processes.items())
         history_builder.close_worker_pool()
+        gpu_memory_after_close = {}
+        try:
+            query = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,memory.used",
+                 "--format=csv,noheader,nounits"],
+                check=True, capture_output=True, text=True)
+            for line in query.stdout.splitlines():
+                index, memory = (item.strip() for item in line.split(",", 1))
+                if index in caption_gpus:
+                    gpu_memory_after_close[index] = int(memory)
+        except BaseException:
+            gpu_memory_after_close = {gpu: None for gpu in caption_gpus}
+        all_workers_released = (
+            not history_builder._pool_processes and
+            not any(process.is_alive() for _, _, process in worker_processes) and
+            set(gpu_memory_after_close) == set(caption_gpus) and
+            all(memory is not None and memory < 100
+                for memory in gpu_memory_after_close.values()))
         cleanup_path = os.path.join(output_dir, "worker_cleanup.json")
         os.makedirs(os.path.dirname(cleanup_path), exist_ok=True)
         with open(cleanup_path, "w") as handle:
@@ -311,16 +329,17 @@ def main() -> None:
                 } for gpu, pid, process in worker_processes
                 if process.is_alive()),
                 "pool_empty_after_close": not history_builder._pool_processes,
-                "all_workers_released": (
-                    not history_builder._pool_processes and
-                    not any(process.is_alive()
-                            for _, _, process in worker_processes)),
+                "gpu_memory_after_close_mib": gpu_memory_after_close,
+                "all_workers_released": all_workers_released,
                 "component_update_provider_calls": {
                     "codebook": codebook_update_provider.call_count,
                     "router": router_update_provider.call_count,
                 },
             }, handle, sort_keys=True, ensure_ascii=False, indent=2)
             handle.write("\n")
+        if sys.exc_info()[0] is None and not all_workers_released:
+            raise RuntimeError(
+                "bounded smoke workers exited but GPU memory was not released")
     print(result.manifest_path, flush=True)
 
 
