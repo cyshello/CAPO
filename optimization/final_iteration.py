@@ -300,6 +300,9 @@ class Checkpoint3EOrchestrator:
         cls, *, baseline_runner: Any, intervention_runner: Any,
         feedback_runner: Any, confirmation_kwargs: Mapping[str, Any],
         min_retire_support_videos: int = 2,
+        property_memory_runner: Any | None = None,
+        llm_codebook_updater: Any | None = None,
+        llm_router_updater: Any | None = None,
     ) -> "Checkpoint3EOrchestrator":
         """Construct the active path with the concrete history-aware evaluator."""
         from surrogate_rollout.optimization.confirmation_evaluator import (
@@ -313,7 +316,10 @@ class Checkpoint3EOrchestrator:
             confirmation_evaluator=HistoryAwareDVDConfirmationEvaluator(
                 **dict(confirmation_kwargs)),
             min_retire_support_videos=min_retire_support_videos,
-            require_real_models=True)
+            require_real_models=True,
+            property_memory_runner=property_memory_runner,
+            llm_codebook_updater=llm_codebook_updater,
+            llm_router_updater=llm_router_updater)
 
     def _startup_models(self, *, iteration_id: str, output_dir: str) \
             -> Mapping[str, Any] | None:
@@ -1633,6 +1639,17 @@ class Checkpoint3EOrchestrator:
                 "rendered_router_prompt_hash": rendered["prompt_sha256"],
                 "property_memory_path": promoted_memory_path,
                 "property_memory_hash": _file_hash(promoted_memory_path),
+            })
+            _write_pointer(os.path.join(
+                    state_dir, "property_memory", "current.json"), {
+                "schema_version": "property_memory_lineage_pointer_v1",
+                "latest_iteration_id": iteration_id,
+                "active_bank_version": candidate_bank.bank_version,
+                "active_bank_hash": _object_hash(candidate_bank),
+                "snapshot_path": os.path.abspath(promoted_memory_path),
+                "snapshot_hash": _file_hash(promoted_memory_path),
+                "checkpoint_manifest_path": manifest_path,
+                "checkpoint_manifest_hash": _file_hash(manifest_path),
             })
             return _read_json(manifest_path)
         except Exception as exc:

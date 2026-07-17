@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import atexit
+import contextlib
 import multiprocessing
 import os
 import queue
@@ -501,10 +502,14 @@ class HistoryAwareBaselineCaptionViewBuilder:
         self._pool_lock = threading.RLock()
         self._pool_context: Any | None = None
         self._pool_result_queue: Any | None = None
+        self._pool_result_thread: threading.Thread | None = None
+        self._pool_pending: dict[str, queue.Queue] = {}
+        self._pool_startup_errors: list[dict[str, Any]] = []
         self._pool_processes: dict[str, Any] = {}
         self._pool_command_queues: dict[str, Any] = {}
         self._pool_request_counter = 0
         self._pool_caption_cursor = 0
+        self._pool_affinity = threading.local()
         self._pool_registered_with_atexit = False
         self._parent_dvd_backend: Any | None = None
         self._parent_previous_captioner: Any | None = None
@@ -516,7 +521,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
             get_local_qwen_backend,
         )
 
-        vlm = (_LazyLocalQwenBackend() if len(parallel_gpus) > 1
+        vlm = (_LazyLocalQwenBackend() if parallel_gpus
                else get_local_qwen_backend())
         builder = cls(
             router=HistoryAwareVLMRouter(vlm, backend_id=LOCAL_QWEN_BACKEND_ID),
@@ -524,7 +529,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 vlm, backend_id=LOCAL_QWEN_BACKEND_ID),
             parallel_gpus=parallel_gpus,
         )
-        if len(parallel_gpus) > 1:
+        if parallel_gpus:
             builder.segment_captioner.remote_dispatcher = builder
         return builder
 
@@ -545,6 +550,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
         candidate_cache_root: str | None = None,
         cache_manifest_path: str | None = None,
         caption_run_identity_hash: str | None = None,
+        worker_gpus: tuple[str, ...] | None = None,
     ) -> HistoryAwareBaselineViewArtifact:
         kwargs = {
             "sample": sample, "clip_index": clip_index,
@@ -560,8 +566,13 @@ class HistoryAwareBaselineCaptionViewBuilder:
             "caption_run_identity_hash": caption_run_identity_hash,
         }
         blocks = _history_blocks(clip_index, history_block_seconds)
-        if len(self.parallel_gpus) > 1 and blocks:
-            return self._build_parallel(blocks=blocks, **kwargs)
+        selected_gpus = self.parallel_gpus if worker_gpus is None else tuple(
+            str(value) for value in worker_gpus)
+        if not set(selected_gpus) <= set(self.parallel_gpus):
+            raise ValueError("worker_gpus must be a subset of the persistent pool")
+        if selected_gpus and blocks:
+            return self._build_parallel(
+                blocks=blocks, worker_gpus=selected_gpus, **kwargs)
         return self._build_sequential(**kwargs)
 
     def _build_sequential(
@@ -839,11 +850,12 @@ class HistoryAwareBaselineCaptionViewBuilder:
         candidate_cache_root: str | None,
         cache_manifest_path: str | None,
         caption_run_identity_hash: str | None,
+        worker_gpus: tuple[str, ...],
     ) -> HistoryAwareBaselineViewArtifact:
         work_root = os.path.abspath(work_root)
         parallel_root = os.path.join(work_root, "parallel_history_blocks")
         os.makedirs(parallel_root, exist_ok=True)
-        active_gpus = self.parallel_gpus[:min(len(self.parallel_gpus), len(blocks))]
+        active_gpus = worker_gpus[:min(len(worker_gpus), len(blocks))]
         assigned: dict[str, list[tuple[int, tuple[tuple[str, dict], ...], str, str]]] = {
             gpu: [] for gpu in active_gpus
         }
@@ -907,17 +919,20 @@ class HistoryAwareBaselineCaptionViewBuilder:
         assignments: tuple[tuple[str, tuple[Any, ...]], ...],
         common: Mapping[str, Any],
     ) -> tuple[str, ...]:
-        with self._pool_lock:
-            self._ensure_worker_pool()
-            request_ids = []
-            for gpu, jobs in assignments:
-                request_id = self._next_pool_request_id("blocks")
-                request_ids.append(request_id)
+        request_ids = []
+        for gpu, jobs in assignments:
+            request_id = self._register_pool_request("blocks")
+            request_ids.append(request_id)
+            try:
                 self._pool_command_queues[gpu].put({
                     "request_id": request_id, "type": "build_blocks",
                     "jobs": jobs, "common": common,
                 })
-            results = self._collect_pool_results(set(request_ids))
+            except BaseException:
+                self._discard_pool_request(request_id)
+                raise
+        results = [self._wait_pool_result(request_id)
+                   for request_id in request_ids]
         completed = []
         for item in results:
             completed.extend(item["completed"])
@@ -926,6 +941,56 @@ class HistoryAwareBaselineCaptionViewBuilder:
     def _next_pool_request_id(self, prefix: str) -> str:
         self._pool_request_counter += 1
         return f"{prefix}-{self._pool_request_counter:08d}"
+
+    def _register_pool_request(self, prefix: str) -> str:
+        with self._pool_lock:
+            self._ensure_worker_pool()
+            if self._pool_startup_errors:
+                raise RuntimeError(
+                    "persistent caption worker startup failure: "
+                    + dumps_canonical(self._pool_startup_errors[0]))
+            request_id = self._next_pool_request_id(prefix)
+            self._pool_pending[request_id] = queue.Queue(maxsize=1)
+            return request_id
+
+    def _discard_pool_request(self, request_id: str) -> None:
+        with self._pool_lock:
+            self._pool_pending.pop(request_id, None)
+
+    def _wait_pool_result(
+        self, request_id: str, *, timeout_seconds: float = 86400.0,
+    ) -> dict[str, Any]:
+        with self._pool_lock:
+            waiter = self._pool_pending.get(request_id)
+        if waiter is None:
+            raise RuntimeError(f"unknown persistent-pool request: {request_id}")
+        try:
+            item = waiter.get(timeout=timeout_seconds)
+        except queue.Empty as exc:
+            raise RuntimeError(
+                f"persistent caption worker timed out: {request_id}") from exc
+        finally:
+            self._discard_pool_request(request_id)
+        if item.get("request_id") == "startup" or item.get("error"):
+            raise RuntimeError(
+                "persistent caption worker failure: " + dumps_canonical(item))
+        return item
+
+    def _route_pool_results(self) -> None:
+        while True:
+            item = self._pool_result_queue.get()
+            request_id = str(item.get("request_id"))
+            if request_id == "__parent_stop__":
+                return
+            with self._pool_lock:
+                if request_id == "startup":
+                    self._pool_startup_errors.append(item)
+                    waiters = tuple(self._pool_pending.values())
+                else:
+                    waiter = self._pool_pending.get(request_id)
+                    waiters = (waiter,) if waiter is not None else ()
+            for target in waiters:
+                target.put(item)
 
     def _ensure_worker_pool(self) -> None:
         if self._pool_processes:
@@ -936,6 +1001,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
             return
         self._pool_context = multiprocessing.get_context("spawn")
         self._pool_result_queue = self._pool_context.Queue()
+        self._pool_startup_errors.clear()
         for gpu in self.parallel_gpus:
             command_queue = self._pool_context.Queue()
             process = self._pool_context.Process(
@@ -947,6 +1013,10 @@ class HistoryAwareBaselineCaptionViewBuilder:
             process.start()
             self._pool_command_queues[gpu] = command_queue
             self._pool_processes[gpu] = process
+        self._pool_result_thread = threading.Thread(
+            target=self._route_pool_results,
+            name="history-caption-result-router", daemon=True)
+        self._pool_result_thread.start()
         try:
             self._install_parent_vlm_proxy()
         except BaseException:
@@ -955,6 +1025,38 @@ class HistoryAwareBaselineCaptionViewBuilder:
         if not self._pool_registered_with_atexit:
             atexit.register(self.close_worker_pool)
             self._pool_registered_with_atexit = True
+
+    def start_worker_pool(self) -> None:
+        """Start the run-scoped pool without performing a model request."""
+        if not self.parallel_gpus:
+            raise RuntimeError("persistent worker pool requires configured GPUs")
+        with self._pool_lock:
+            self._ensure_worker_pool()
+
+    @contextlib.contextmanager
+    def worker_affinity(self, gpu: str):
+        """Pin all nested caption/frame-inspection calls to one pool worker."""
+        gpu = str(gpu)
+        if gpu not in self.parallel_gpus:
+            raise ValueError("worker affinity must target a configured GPU")
+        previous = getattr(self._pool_affinity, "gpu", None)
+        self._pool_affinity.gpu = gpu
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._pool_affinity.gpu
+            else:
+                self._pool_affinity.gpu = previous
+
+    def _select_caption_gpu(self) -> str:
+        preferred = getattr(self._pool_affinity, "gpu", None)
+        if preferred is not None:
+            return str(preferred)
+        gpu = self.parallel_gpus[
+            self._pool_caption_cursor % len(self.parallel_gpus)]
+        self._pool_caption_cursor += 1
+        return gpu
 
     def _install_parent_vlm_proxy(self) -> None:
         import dvd_backend
@@ -976,45 +1078,18 @@ class HistoryAwareBaselineCaptionViewBuilder:
         self._parent_dvd_backend = None
         self._parent_previous_captioner = None
 
-    def _collect_pool_results(
-        self, request_ids: set[str], *, timeout_seconds: float = 86400.0,
-    ) -> list[dict[str, Any]]:
-        results = []
-        remaining = set(request_ids)
-        while remaining:
-            try:
-                item = self._pool_result_queue.get(timeout=timeout_seconds)
-            except queue.Empty as exc:
-                raise RuntimeError(
-                    f"persistent caption workers timed out: {sorted(remaining)}"
-                ) from exc
-            request_id = str(item.get("request_id"))
-            if request_id == "startup" or request_id not in remaining:
-                raise RuntimeError(
-                    "unexpected persistent caption worker result: "
-                    + dumps_canonical(item))
-            remaining.remove(request_id)
-            if item.get("error"):
-                raise RuntimeError(
-                    "persistent caption worker failure: "
-                    + dumps_canonical(item))
-            results.append(item)
-        return results
-
     def caption_segment(self, **kwargs: Any) -> HistoryAwareCaptionResult:
         """Dispatch selective captioning to the already-loaded GPU pool."""
         with self._pool_lock:
             self._ensure_worker_pool()
-            gpu = self.parallel_gpus[
-                self._pool_caption_cursor % len(self.parallel_gpus)]
-            self._pool_caption_cursor += 1
+            gpu = self._select_caption_gpu()
             global_manifest = kwargs.get("cache_manifest_path")
             manifest_base = global_manifest or config.CACHE_MANIFEST_PATH
             worker_index = self.parallel_gpus.index(gpu)
             worker_manifest = (
                 f"{manifest_base}.persistent_worker_{worker_index:02d}.jsonl")
             _seed_manifest_fragment(global_manifest, worker_manifest)
-            request_id = self._next_pool_request_id("caption")
+            request_id = self._register_pool_request("caption")
             payload = {
                 **kwargs,
                 "sample": dict(kwargs["sample"]),
@@ -1024,13 +1099,18 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 "worker_manifest_path": worker_manifest,
             }
             payload.pop("cache_manifest_path", None)
+        try:
             self._pool_command_queues[gpu].put({
                 "request_id": request_id, "type": "caption_segment",
                 "payload": payload,
             })
-            item = self._collect_pool_results({request_id})[0]
+            item = self._wait_pool_result(request_id)
+        except BaseException:
+            self._discard_pool_request(request_id)
+            raise
+        with self._pool_lock:
             self._merge_cache_fragment(worker_manifest, global_manifest)
-            return HistoryAwareCaptionResult(**item["caption_result"])
+        return HistoryAwareCaptionResult(**item["caption_result"])
 
     def caption_raw_vlm(
         self, *, images: Any, prompt: str, **kwargs: Any,
@@ -1038,10 +1118,8 @@ class HistoryAwareBaselineCaptionViewBuilder:
         """Route DVD frame inspection through an existing Qwen worker."""
         with self._pool_lock:
             self._ensure_worker_pool()
-            gpu = self.parallel_gpus[
-                self._pool_caption_cursor % len(self.parallel_gpus)]
-            self._pool_caption_cursor += 1
-            request_id = self._next_pool_request_id("raw-vlm")
+            gpu = self._select_caption_gpu()
+            request_id = self._register_pool_request("raw-vlm")
             self._pool_command_queues[gpu].put({
                 "request_id": request_id, "type": "raw_vlm",
                 "payload": {
@@ -1049,8 +1127,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
                     "prompt": prompt, "kwargs": dict(kwargs),
                 },
             })
-            return str(self._collect_pool_results(
-                {request_id})[0]["raw_output"])
+        return str(self._wait_pool_result(request_id)["raw_output"])
 
     @staticmethod
     def _merge_cache_fragment(fragment: str, target: str | None) -> None:
@@ -1070,23 +1147,25 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 return
             request_ids = set()
             for gpu, command_queue in self._pool_command_queues.items():
-                request_id = self._next_pool_request_id("shutdown")
+                request_id = self._register_pool_request("shutdown")
                 request_ids.add(request_id)
                 command_queue.put({
                     "request_id": request_id, "type": "shutdown",
                 })
-            cleanup_error = None
-            try:
-                results = self._collect_pool_results(
-                    request_ids, timeout_seconds=30.0)
+        cleanup_error = None
+        try:
+            results = [self._wait_pool_result(
+                request_id, timeout_seconds=30.0) for request_id in request_ids]
+            with self._pool_lock:
                 warnings = [
                     f"GPU {item['gpu']}: {item['cleanup_warning']}"
                     for item in results if item.get("cleanup_warning")]
                 if warnings:
                     cleanup_error = "; ".join(warnings)
-            except BaseException as exc:
-                cleanup_error = f"{type(exc).__name__}: {exc}"
-            finally:
+        except BaseException as exc:
+            cleanup_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            with self._pool_lock:
                 for process in self._pool_processes.values():
                     process.join(timeout=30.0)
                     if process.is_alive():
@@ -1094,13 +1173,19 @@ class HistoryAwareBaselineCaptionViewBuilder:
                         process.join(timeout=10.0)
                 self._pool_processes.clear()
                 self._pool_command_queues.clear()
+                if self._pool_result_queue is not None:
+                    self._pool_result_queue.put({"request_id": "__parent_stop__"})
+                if self._pool_result_thread is not None:
+                    self._pool_result_thread.join(timeout=5.0)
+                self._pool_result_thread = None
                 self._pool_result_queue = None
+                self._pool_pending.clear()
                 self._restore_parent_vlm_proxy()
-            if cleanup_error:
-                print(
-                    "CAPTION_WORKER_CLEANUP_WARNING " + cleanup_error,
-                    flush=True,
-                )
+        if cleanup_error:
+            print(
+                "CAPTION_WORKER_CLEANUP_WARNING " + cleanup_error,
+                flush=True,
+            )
 
     def _merge_parallel_blocks(
         self,

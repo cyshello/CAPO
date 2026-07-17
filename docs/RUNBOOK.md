@@ -15,8 +15,9 @@ test:        10 videos / 30 QAs
 ```
 
 Checkpoint 2 derives eight `previously_cached` train videos as the evidence
-pool and the other two train videos as confirmation. Each iteration selects
-three unique evidence videos and runs all nine QAs. Confirmation runs only
+pool and the other two train videos as confirmation. Each production iteration
+selects `K` unique evidence videos and runs all `3K` QAs. `K=3` is the default
+pilot setting, not a method constraint. Confirmation runs only
 after all eight evidence videos have appeared since the last confirmation.
 There is no separate regression-video subset.
 
@@ -193,7 +194,7 @@ marker fails closed rather than overwriting results.
 
 Checkpoint 1 is a fixture-tested, model-free sidecar. It does not run
 captioning, QA, proposal, retrieval, feedback, the updater, confirmation, or a
-three-video experiment. Construct `CompactPropertyMemoryRunner` and call
+production iteration. Construct `CompactPropertyMemoryRunner` and call
 `run(...)` only after the referenced baseline and intervention artifacts are
 complete. For an updater-decided iteration, pass the already-written update
 plan and resulting bank so candidate promotion is recorded after, rather than
@@ -355,7 +356,7 @@ conda run -n local_llm_vllm python -m pytest -q \
 After the Checkpoint 2 manifest is complete, configure the same orchestrator
 with `MemoryConditionedLLMRouterUpdater` and invoke the router checkpoint. This
 is a mock/provider integration boundary; this implementation task does not run
-a real provider, GPU, confirmation, or regular three-video experiment.
+a real provider, GPU, confirmation, or regular production iteration.
 
 ```python
 orchestrator = Checkpoint3EOrchestrator(
@@ -514,7 +515,7 @@ Do not persist secrets in configs or artifacts.
 
 The final command must cover:
 
-- three-video baseline orchestration;
+- configurable-size evidence baseline orchestration;
 - per-video multi-property proposals;
 - frame-only property-conditioned retrieval;
 - independent frozen-history interventions;
@@ -557,7 +558,7 @@ conda run -n local_llm_vllm python -m pytest -q \
 
 Confirm that artifacts show:
 
-- three source videos;
+- the default three source videos;
 - multiple candidate properties allowed per video;
 - one work item per property-source-video pair;
 - isolated intervention output paths;
@@ -731,16 +732,133 @@ confirmed checkpoint, confirmation evaluation, or canonical pointer is used.
 The bounded smoke keeps its shared SigLIP image/text retrieval embedder on CPU;
 GPUs listed by `--gpus` remain reserved for the persistent Qwen worker pool.
 
-## 6. Main experiment
+## 6. Production memory-conditioned iteration launcher
 
-No automatic main-experiment CLI is provided. The active execution boundary is
-`Checkpoint3EOrchestrator.run`. Construct it through
+The active launcher is `scripts/run_phase4_memory_iteration.py`. It constructs
+the latest Checkpoint 3E component path and does not import or wrap the obsolete
+Stage 4.13/4.14 launcher:
+
+```text
+baseline/intervention/feedback artifacts
+→ property_memory_v1
+→ LLM codebook plan and candidate codebook/ID mapping
+→ LLM router plan and rendered real-router prompt
+→ atomic provisional codebook/router pair
+```
+
+It never runs confirmation and never writes `confirmed/current.json`.
+Production experiments remain manually launched by the user.
+
+CLI selection and scheduling:
+
+- `--num-videos K`: logical iteration size; omitted means `K=3` unless
+  `--video-ids` is supplied;
+- `--video-ids id1,id2,...`: explicit ordered evidence list; if
+  `--num-videos` is also supplied, the count must agree;
+- `--max-parallel-videos P`: deterministic video-wave width;
+- `--gpus 4,5,6,7`: unique iteration-scoped persistent worker set;
+- `--selection-seed`: deterministic initial rotation offset, default zero;
+- `--dry-run-plan`: save selection, waves, identities, paths, and expected
+  stages with zero model calls.
+
+`K` and `P` are independent. For example, `K=8, P=4` produces two ordered
+four-video waves. `P` may not exceed the usable worker count. The launcher
+rejects duplicate/unavailable/busy GPUs before model startup.
+
+Dry-run plan for the default three-video pilot:
+
+```bash
+conda run --no-capture-output -n local_llm_vllm \
+  python -m dotenv run -- python -u \
+  scripts/run_phase4_memory_iteration.py \
+  --dry-run-plan \
+  --iteration-id phase4-memory-pilot-k3-plan \
+  --num-videos 3 --max-parallel-videos 3 --gpus 4,5,6,7 \
+  --output-dir runs/phase4_memory_pilot_k3_plan_output \
+  --state-dir runs/phase4_memory_pilot_k3_plan_state \
+  --cache-dir runs/phase4_memory_pilot_k3_plan_cache
+```
+
+Real `K=3` pilot:
+
+```bash
+conda run --no-capture-output -n local_llm_vllm \
+  python -m dotenv run -- python -u \
+  scripts/run_phase4_memory_iteration.py \
+  --iteration-id phase4-memory-pilot-k3-iteration-001 \
+  --num-videos 3 --max-parallel-videos 3 --gpus 4,5,6,7 \
+  --output-dir runs/phase4_memory_pilot_k3_output \
+  --state-dir runs/phase4_memory_pilot_k3_state \
+  --cache-dir runs/phase4_memory_pilot_k3_cache
+```
+
+Real `K=5` pilot:
+
+```bash
+conda run --no-capture-output -n local_llm_vllm \
+  python -m dotenv run -- python -u \
+  scripts/run_phase4_memory_iteration.py \
+  --iteration-id phase4-memory-pilot-k5-iteration-001 \
+  --num-videos 5 --max-parallel-videos 4 --gpus 4,5,6,7 \
+  --output-dir runs/phase4_memory_pilot_k5_output \
+  --state-dir runs/phase4_memory_pilot_k5_state \
+  --cache-dir runs/phase4_memory_pilot_k5_cache
+```
+
+Full evidence pool in two four-video waves:
+
+```bash
+conda run --no-capture-output -n local_llm_vllm \
+  python -m dotenv run -- python -u \
+  scripts/run_phase4_memory_iteration.py \
+  --iteration-id phase4-memory-full-k8-iteration-001 \
+  --num-videos 8 --max-parallel-videos 4 --gpus 4,5,6,7 \
+  --output-dir runs/phase4_memory_full_k8_output \
+  --state-dir runs/phase4_memory_full_k8_state \
+  --cache-dir runs/phase4_memory_full_k8_cache
+```
+
+The examples intentionally use distinct state roots; they are alternatives,
+not three sequential calls in one coverage cycle. To resume, repeat the exact
+same command. The launcher restores the ordered videos, `K`, parent pair, and
+coverage input from `iteration_identity.json` before consulting newer state
+pointers. Any changed ordered list, count, seed, split hash, parent identity,
+GPU/model/decoding configuration, updater version, or prompt version fails
+closed. A completed repeat returns before worker startup and performs no model
+or updater call.
+
+Artifacts:
+
+```text
+<output_dir>/
+├── iteration_identity.json
+├── iteration_plan.json
+├── startup_models.json                  # real run only
+├── baseline_videos/<video_id>/
+├── baseline_batch_manifest.json
+├── interventions/<video_id>/
+├── feedback/<video_id>/
+├── memory_codebook_checkpoint/
+├── memory_router_checkpoint/
+│   └── provisional_policy_pair/
+├── worker_cleanup/attempt_<NNN>.json
+└── manifest.json                        # only after atomic pair success
+
+<state_dir>/
+├── property_memory/current.json
+├── memory_conditioned_provisional/current.json
+└── production_selection/current.json
+```
+
+The worker cleanup artifact is written from `finally` on success, failure,
+interruption, and completed resume. Router/update failure cannot create the
+top-level completed manifest or a codebook-only policy pair. Raw stage
+artifacts remain in place for diagnosis and exact stage resume.
+
+The underlying active execution boundary remains
 `Checkpoint3EOrchestrator.with_real_confirmation(...)`, which wires
-`HistoryAwareDVDConfirmationEvaluator` to the existing sequential
-history-aware caption builder and DVD QA path. The caller still explicitly
-freezes model/provider settings, component snapshots, coverage state, and
-output root before a real run. The fixture smoke above is the minimal executable
-command until that run configuration is reviewed.
+`HistoryAwareDVDConfirmationEvaluator` to the same history-aware builder and
+DVD QA path while injecting the property-memory and both LLM updater stages.
 
 Use the same configured history builder for evidence baselines and confirmation:
 
@@ -952,7 +1070,7 @@ or fails closed before QA.
 A healthy run satisfies:
 
 - current policy is frozen within an iteration;
-- each of the three batch videos has one complete incumbent caption view;
+- each of the selected `K` batch videos has one complete incumbent caption view;
 - one video may generate multiple candidate properties;
 - every candidate retains source-video and source-QA lineage;
 - every property intervention is independent;

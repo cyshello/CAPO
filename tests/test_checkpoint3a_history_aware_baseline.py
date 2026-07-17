@@ -443,3 +443,47 @@ def test_dvd_raw_frame_inspection_uses_pool_proxy_and_standalone_is_preserved():
         assert dvd_backend._captioner is None
     finally:
         dvd_backend._captioner = original
+
+
+def test_persistent_pool_demultiplexes_concurrent_video_requests():
+    import queue
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    class AliveProcess:
+        def is_alive(self):
+            return True
+
+    builder = HistoryAwareBaselineCaptionViewBuilder(
+        router=object(), segment_captioner=object(), parallel_gpus=("4", "5"))
+    builder._pool_processes = {"4": AliveProcess(), "5": AliveProcess()}
+    builder._pool_result_queue = queue.Queue()
+    barrier = threading.Barrier(2)
+
+    class CommandQueue:
+        def put(self, command):
+            barrier.wait(timeout=2.0)
+            job = command["jobs"][0]
+            builder._pool_result_queue.put({
+                "request_id": command["request_id"],
+                "gpu": str(job[0]),
+                "completed": ((job[0], job[2]),),
+            })
+
+    builder._pool_command_queues = {"4": CommandQueue(), "5": CommandQueue()}
+    builder._pool_result_thread = threading.Thread(
+        target=builder._route_pool_results, daemon=True)
+    builder._pool_result_thread.start()
+    try:
+        def dispatch(gpu, index):
+            return builder._run_gpu_workers(
+                ((gpu, ((index, (), f"manifest-{index}", "fragment"),)),), {})
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(
+                lambda row: dispatch(*row), (("4", 4), ("5", 5))))
+        assert results == (("manifest-4",), ("manifest-5",))
+    finally:
+        builder._pool_result_queue.put({"request_id": "__parent_stop__"})
+        builder._pool_result_thread.join(timeout=2.0)
+        builder._pool_processes.clear()

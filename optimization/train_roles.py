@@ -114,8 +114,8 @@ def initial_coverage(roles: TrainRoleAssignment) -> EvidenceCoverageState:
 def select_evidence_batch(
     state: EvidenceCoverageState, batch_size: int = 3,
 ) -> tuple[tuple[str, ...], EvidenceCoverageState]:
-    if batch_size != 3:
-        raise ValueError("the active method requires batch_size=3")
+    if not 1 <= batch_size <= len(state.rotation_order):
+        raise ValueError("batch_size must fit inside the evidence pool")
     if state.confirmation_due:
         raise RuntimeError("confirmation is due before another evidence iteration")
     order = state.rotation_order
@@ -126,7 +126,7 @@ def select_evidence_batch(
         fill = [video_id for video_id in cyclic if video_id not in selected]
         selected.extend(fill[:batch_size - len(selected)])
     if len(selected) != batch_size or len(set(selected)) != batch_size:
-        raise RuntimeError("failed to select three unique evidence videos")
+        raise RuntimeError("failed to select the requested unique evidence videos")
     covered = used | set(selected)
     covered_ordered = tuple(video_id for video_id in order if video_id in covered)
     cursor = (order.index(selected[-1]) + 1) % len(order)

@@ -47,9 +47,10 @@ class ProvisionalIterationState:
     def __post_init__(self) -> None:
         if not self.iteration_id or not self.parent_confirmed_checkpoint_id:
             raise ValueError("provisional state requires iteration and parent IDs")
-        if len(self.selected_video_ids) != 3 or len(set(self.selected_video_ids)) != 3:
-            raise ValueError("provisional state requires three unique evidence videos")
-        if len(self.property_proposal_paths) != 3:
+        if not self.selected_video_ids or \
+                len(self.selected_video_ids) != len(set(self.selected_video_ids)):
+            raise ValueError("provisional state requires unique evidence videos")
+        if len(self.property_proposal_paths) != len(self.selected_video_ids):
             raise ValueError("provisional state requires one proposal artifact per video")
         if self.accumulated_provisional_iteration_ids and \
                 self.iteration_id not in self.accumulated_provisional_iteration_ids:

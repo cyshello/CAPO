@@ -213,6 +213,7 @@ class BaselinePhaseRunner:
         bounded_smoke_video_id: str | None = None,
         caption_cache_root: str | None = None,
         cache_manifest_path: str | None = None,
+        worker_gpus: tuple[str, ...] | None = None,
     ) -> BaselinePhaseResult:
         if bounded_smoke_video_id is None:
             selected_ids, next_coverage = select_evidence_batch(coverage_state)
@@ -259,6 +260,8 @@ class BaselinePhaseRunner:
                 os.path.abspath(caption_cache_root) if caption_cache_root else None)
             input_identity["cache_manifest_path"] = (
                 os.path.abspath(cache_manifest_path) if cache_manifest_path else None)
+        if worker_gpus is not None:
+            input_identity["worker_gpus"] = tuple(worker_gpus)
         if router_policy.policy_type == "history_aware_vlm":
             input_identity["history_policy"] = {
                 "mode": "sequential_vlm",
@@ -371,6 +374,7 @@ class BaselinePhaseRunner:
                     max_history_captions=max_history_captions,
                     candidate_cache_root=caption_cache_root,
                     cache_manifest_path=cache_manifest_path,
+                    worker_gpus=worker_gpus,
                 )
                 routing_manifest_path = caption_view.routing_manifest_path
                 frames_path = caption_view.frames_path

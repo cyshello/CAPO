@@ -19,8 +19,8 @@ iteration, or optimize the scaffold are superseded. The active data policy is:
 - evidence pool: eight previously inspected/captioned train videos;
 - confirmation holdout: the other two train videos;
 - no separate regression-video subset;
-- exactly three evidence videos and nine baseline QAs per optimization
-  iteration;
+- a configurable number `K` of evidence videos per optimization iteration,
+  with `K=3` as the conservative pilot default and three QAs per video;
 - validation and test remain outside component-update feedback.
 
 ## 1. Core objects
@@ -137,22 +137,23 @@ R^{(k)},
 \right).
 \]
 
-Load exactly three unique videos from the eight-video evidence pool:
+Load `K` unique videos from the eight-video evidence pool:
 
 \[
 \mathcal V^{(k)}
 =
-\{v_1,v_2,v_3\}.
+\{v_1,\ldots,v_K\}, \qquad 1\leq K\leq 8.
 \]
 
 The policy snapshot remains fixed throughout the iteration. Selection rotates
 deterministically through the evidence pool and prioritizes videos not yet used
-since the last confirmation. If only one or two unused videos remain, fill the
-batch from the deterministic rotation without duplicates. Once all eight have
-appeared, confirmation is due and no new evidence iteration starts until the
-confirmation decision is persisted.
+since the last confirmation. If fewer than `K` unused videos remain, fill the
+batch from the deterministic rotation without duplicates. An explicit ordered
+list is allowed only after validation against the same evidence pool. Once all
+eight have appeared, confirmation is due and no new evidence iteration starts
+until the confirmation decision is persisted.
 
-### 3.1 Full-caption the three videos once
+### 3.1 Full-caption the selected videos once
 
 For each selected video, run the current router and captioner over the complete
 video exactly once:
@@ -364,7 +365,11 @@ Important invariants:
 - prompt-budget overflow fails the candidate rather than dropping properties.
 
 All property-source-video interventions may run in parallel. Segment captioning
-within one intervention may also run in parallel.
+within one intervention may also run in parallel. Iteration size `K` and video
+parallelism `P` are independent. Selected videos are partitioned into ordered
+deterministic waves of at most `P` videos, and each wave position maps to one
+of the iteration-scoped persistent GPU workers. Thus `K=8, P=4` runs two
+four-video waves without changing selected-video or result ordering.
 
 ### 3.6 Rerun all QAs of the source video
 
@@ -502,12 +507,12 @@ Feedback may recommend `add`, `revise`, `merge`, `retire`,
 `router_positive`, `router_negative`, or `no_op`. These are evidence-bearing
 recommendations only; aggregation does not apply a component update.
 
-Then aggregate all intervention feedback across the three-video batch:
+Then aggregate all intervention feedback across the `K`-video batch:
 
 \[
 \mathcal F^{(k)}
 =
-\bigcup_{i=1}^{3}
+\bigcup_{i=1}^{K}
 \bigcup_{j=1}^{B_i}
 F_{i,j}.
 \]
@@ -793,7 +798,7 @@ Positive examples come from useful interventions. Negative examples come from
 harmful or unnecessary interventions.
 
 The updated codebook and router are provisional. The next iteration uses that
-provisional policy for a new three-video batch. `correct_to_wrong` flips on the
+provisional policy for a new `K`-video batch. `correct_to_wrong` flips on the
 current source videos are the regression signal; no separate regression-video
 subset is reserved.
 
@@ -835,7 +840,7 @@ promotion is invalid.
 \boxed{
 \begin{aligned}
 &\text{snapshot current policy}\\
-&\rightarrow \text{select and full-caption three evidence videos once}\\
+&\rightarrow \text{select and full-caption K evidence videos once}\\
 &\rightarrow \text{run all baseline QAs}\\
 &\rightarrow \text{propose multiple properties per video}\\
 &\rightarrow \text{property-wise source-video retrieval}\\
@@ -853,8 +858,8 @@ promotion is invalid.
 - The router is a history-aware lightweight VLM.
 - The router is query-independent.
 - The scaffold/composer is fixed.
-- One iteration full-captions exactly three unique evidence videos once under
-  the current policy.
+- One iteration full-captions `K` unique evidence videos once under the current
+  policy; `K=3` is a default pilot setting, not a method constraint.
 - Eight train videos form the evidence pool and the other two form confirmation.
 - Coverage prioritizes unused evidence videos and triggers confirmation after
   all eight have appeared.

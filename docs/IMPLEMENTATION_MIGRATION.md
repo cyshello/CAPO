@@ -9,19 +9,19 @@ per-iteration-confirmation flow are superseded.
   validation, and test.
 - Derive the evidence pool from the eight `previously_cached` train videos.
 - Derive confirmation from the two remaining train videos.
-- Select exactly three unique evidence videos per iteration and run all nine
-  QAs.
+- Select `K` unique evidence videos per iteration and run all `3K` QAs. `K=3`
+  is the conservative default, not a method constraint.
 - Rotate deterministically, prioritizing videos unused since the last
   confirmation.
 - When all eight evidence videos have appeared, confirmation becomes due and
   the tracker resets only after an accept/rollback decision.
 - Do not reserve separate regression videos. Use `correct_to_wrong` flips on
-  the current three source videos.
+  the current `K` source videos.
 - Updates between confirmations are provisional.
 - Validation and test remain outside component-update feedback.
 
 Checkpoint 2 implements only role derivation, rotation/coverage state,
-provisional/confirmed schemas, the reusable three-video baseline phase, and
+provisional/confirmed schemas, the reusable configurable-size baseline phase, and
 zero-or-multiple property proposal records. Real VLM routing, property
 retrieval, interventions, feedback calls, confirmation evaluation, and main
 execution remain deferred.
@@ -48,7 +48,7 @@ that Phase 4 control flow with:
 
 ```text
 current policy snapshot
-→ full-caption three rotating evidence videos
+→ full-caption K rotating evidence videos
 → run all baseline QAs
 → propose multiple properties per video
 → evaluate each property on its source video in an independent selective run
@@ -72,8 +72,8 @@ before editing.
 Refactor the pilot runner into explicit iteration phases:
 
 1. snapshot current codebook/router/scaffold;
-2. select exactly three source videos from the rotating evidence pool;
-3. full-caption those three videos with the current policy;
+2. select `K` source videos from the rotating evidence pool;
+3. full-caption those selected videos with the current policy;
 4. run all baseline QAs for every video;
 5. invoke the property proposer separately per source video;
 6. schedule every property-source-video intervention;
@@ -92,7 +92,8 @@ max_new_entries_per_iteration = 1
 Replace it with explicit controls such as:
 
 ```yaml
-videos_per_iteration: 3
+videos_per_iteration: K  # default 3, up to the evidence-pool size
+max_parallel_videos: P  # independent of K; P <= persistent worker count
 max_property_proposals_per_video: B
 max_parallel_property_interventions: N
 max_selected_segments_per_property: M
@@ -335,7 +336,7 @@ not apply them.
 ### 3.10 `optimization/prompt_bank_update_proposer.py`
 
 Replace first-supported-item behavior with iteration-level aggregation across
-all three current evidence videos and all candidate properties.
+all `K` current evidence videos and all candidate properties.
 
 Support:
 
@@ -587,13 +588,60 @@ Schemas/versions are `memory_router_updater_request_v1`,
 `memory_router_updater_prompt_v1`.
 
 Intentionally deferred: confirmation of this provisional pair, promotion to a
-confirmed production pointer, and any regular three-video or real-model run.
+confirmed production pointer, and any regular production or real-model run.
+
+### 3.18 Production memory-conditioned iteration launcher
+
+The previous repository exposed the latest memory-conditioned path only through
+the isolated one-video bounded smoke. The obsolete Stage 4.13/4.14 launcher did
+not construct the property-memory, LLM codebook, rendered-router, and atomic
+pair chain and remains unused.
+
+`scripts/run_phase4_memory_iteration.py` now constructs the reviewed real
+baseline, intervention, feedback, memory, codebook-updater, and router-updater
+stages directly. `optimization/production_iteration.py` freezes the ordered
+selection and complete resume identity before model startup, runs per-video
+work in deterministic waves, calls both iteration-level updaters once, and
+writes a completed manifest only after the atomic pair exists. A router-stage
+failure can leave candidate diagnostics but cannot create the completed
+iteration or a codebook-only policy pair.
+
+`--num-videos K` defaults logically to three when neither count nor explicit
+IDs are supplied. `--video-ids` preserves explicit order. `--max-parallel-videos
+P` controls only wave width and is bounded by the unique `--gpus` worker set;
+it does not constrain `K`. Selection is seeded, rotating, evidence-pool-only,
+and persists its next position only after atomic success. Exact resume restores
+the frozen parent pair and ordered videos from `iteration_identity.json`, so a
+newer state pointer cannot silently change an existing run.
+
+Files and interfaces changed:
+
+- `optimization/production_iteration.py`: selection, waves, planning,
+  orchestration, atomic completion, and exact-resume validation;
+- `scripts/run_phase4_memory_iteration.py`: reviewed real component assembly,
+  CLI validation, parent-pair resolution, GPU preflight, and cleanup audit;
+- `optimization/train_roles.py` and `optimization/iteration_state.py`:
+  variable-size evidence batches while retaining the default of three;
+- `captioning/history_aware_baseline.py` and `optimization/baseline_phase.py`:
+  persistent single-worker affinity per scheduled video and concurrent
+  request/result demultiplexing across workers;
+- `optimization/final_iteration.py`: real-constructor memory-stage injection
+  and promoted property-memory lineage after atomic pair commit;
+- `tests/test_production_memory_iteration.py`: mock-only production-launcher
+  coverage.
+
+Schemas are `memory_production_iteration_plan_v1`,
+`memory_production_iteration_identity_v1`,
+`memory_production_iteration_manifest_v1`,
+`memory_production_selection_pointer_v1`, and
+`production_worker_cleanup_v1`. Confirmation and confirmed-pointer promotion
+remain explicit, separate, and are not run by this launcher.
 
 ## 4. Required tests
 
 Add focused tests for:
 
-1. one iteration full-captions each of three selected videos once;
+1. one iteration full-captions each of `K` selected videos once;
 2. all baseline QAs run for each video;
 3. one video can produce multiple property candidates;
 4. candidate lineage records source video and source QAs;
@@ -617,7 +665,7 @@ Run the focused tests and complete existing suite.
 ## 5. Minimal implementation order
 
 1. Checkpoint current repository and update documentation.
-2. Add explicit three-video baseline iteration orchestration.
+2. Add explicit configurable-`K` baseline iteration orchestration.
 3. Add per-video multi-property proposal output and lineage.
 4. Implement property-conditioned source-video retrieval.
 5. Add ephemeral force-add property intervention.
@@ -643,7 +691,7 @@ Run the focused tests and complete existing suite.
 ## 7. One-video bounded-smoke boundary
 
 The isolated bounded-smoke adapter is not a replacement for the production
-three-video coverage cycle. It selects one frozen evidence video and its three
+configurable-`K` coverage cycle. It selects one frozen evidence video and its three
 QAs, limits proposals and candidate interventions to one, and uses retrieval
 top-k one. `post_intervention_mode` controls whether execution stops after QA,
 after feedback aggregation, or after isolated provisional update artifacts.
