@@ -38,13 +38,13 @@ def prompt_bank():
     return prompt_bank_from_json(value["prompt_bank"])
 
 
-def proposal(candidate_id):
+def proposal(candidate_id, coverage_hints=()):
     return CandidatePropertyProposal(
         candidate_property_id=candidate_id,
         property_text=f"Track reusable fine-grained actions for {candidate_id}.",
         source_video_id="video-1", source_question_ids=("q1", "q2"),
         motivating_failure_types=("missed_action",),
-        covered_by_existing_property_ids=(), proposal_rationale="fixture",
+        coverage_hints=tuple(coverage_hints), proposal_rationale="fixture",
         proposer_policy_version="fixture_v1")
 
 
@@ -56,7 +56,8 @@ def refs(*segments):
     }
 
 
-def fixture(tmp_path, candidates=("cp_a",), *, empty_candidate=None):
+def fixture(tmp_path, candidates=("cp_a",), *, empty_candidate=None,
+            coverage_hints=()):
     baseline_dir = tmp_path / "baseline"
     frame_map = {}
     histories = []
@@ -111,7 +112,8 @@ def fixture(tmp_path, candidates=("cp_a",), *, empty_candidate=None):
         "frames_path": frames_path, "frozen_histories_path": histories_path,
     })
 
-    proposals = tuple(proposal(candidate_id) for candidate_id in candidates)
+    proposals = tuple(proposal(candidate_id, coverage_hints)
+                      for candidate_id in candidates)
     retrieval_paths = []
     intervention_results = []
     for item in proposals:
@@ -293,6 +295,23 @@ def test_flip_only_feedback_intersection_bounds_aggregation_and_resume(tmp_path)
     resumed = run_feedback(tmp_path, artifacts, provider, bounds=bounds)
     assert resumed.properties[0].resumed
     assert len(provider.calls) == 2
+
+
+def test_proposal_coverage_hints_are_context_only_and_feedback_decides_coverage(
+        tmp_path):
+    artifacts = fixture(tmp_path, coverage_hints=("pe_default",))
+    provider = MockProvider()
+    result = run_feedback(tmp_path, artifacts, provider)
+    aggregate = result.properties[0]
+
+    assert all(call["candidate_property"]["coverage_hints"] == ["pe_default"]
+               for call in provider.calls)
+    assert aggregate.proposal_coverage_hints == ("pe_default",)
+    assert aggregate.coverage_assessment == "mixed"
+    assert aggregate.covered_by_property_ids == ("pe_temporal",)
+    persisted = json.loads(Path(aggregate.result_path).read_text())
+    assert persisted["proposal_coverage_hints"] == ["pe_default"]
+    assert persisted["covered_by_property_ids"] == ["pe_temporal"]
 
 
 def test_empty_s_feedback_rejected_and_sibling_aggregates_independently(tmp_path):

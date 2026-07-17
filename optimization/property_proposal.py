@@ -15,7 +15,7 @@ class CandidatePropertyProposal:
     source_video_id: str
     source_question_ids: tuple[str, ...]
     motivating_failure_types: tuple[str, ...]
-    covered_by_existing_property_ids: tuple[str, ...]
+    coverage_hints: tuple[str, ...]
     proposal_rationale: str
     proposer_policy_version: str
 
@@ -27,7 +27,10 @@ class CandidatePropertyProposal:
         source_video_id: str,
         source_question_ids: tuple[str, ...] | None = None,
         motivating_failure_types: tuple[str, ...] | None = None,
-        covered_by_existing_property_ids: tuple[str, ...] = (),
+        coverage_hints: tuple[str, ...] | None = None,
+        possible_coverage_by_existing_property_ids: (
+            tuple[str, ...] | None) = None,
+        covered_by_existing_property_ids: tuple[str, ...] | None = None,
         proposal_rationale: str | None = None,
         proposer_policy_version: str,
         # Checkpoint 2 compatibility aliases.
@@ -38,6 +41,17 @@ class CandidatePropertyProposal:
         coverage_assessment: str | None = None,
     ) -> None:
         del coverage_assessment
+        supplied_hints = tuple(coverage_hints or ())
+        possible_hints = tuple(possible_coverage_by_existing_property_ids or ())
+        legacy_hints = tuple(covered_by_existing_property_ids or ())
+        nonempty_hint_values = tuple(
+            value for value in (supplied_hints, possible_hints, legacy_hints)
+            if value)
+        if nonempty_hint_values and any(
+                value != nonempty_hint_values[0]
+                for value in nonempty_hint_values[1:]):
+            raise ValueError("proposal coverage hint aliases disagree")
+        normalized_hints = nonempty_hint_values[0] if nonempty_hint_values else ()
         values = {
             "candidate_property_id": candidate_property_id or property_id or "",
             "property_text": property_text or instruction or "",
@@ -46,8 +60,7 @@ class CandidatePropertyProposal:
             "motivating_failure_types": tuple(
                 motivating_failure_types
                 or ((failure_evidence,) if failure_evidence else ())),
-            "covered_by_existing_property_ids": tuple(
-                covered_by_existing_property_ids),
+            "coverage_hints": normalized_hints,
             "proposal_rationale": proposal_rationale or failure_evidence or "",
             "proposer_policy_version": proposer_policy_version,
         }
@@ -67,9 +80,8 @@ class CandidatePropertyProposal:
                 not isinstance(item, str) or not item
                 for item in self.motivating_failure_types):
             raise ValueError("motivating failure types must be unique strings")
-        if len(self.covered_by_existing_property_ids) != len(set(
-                self.covered_by_existing_property_ids)):
-            raise ValueError("covered existing property IDs must be unique")
+        if len(self.coverage_hints) != len(set(self.coverage_hints)):
+            raise ValueError("proposal coverage hints must be unique")
 
     @property
     def property_id(self) -> str:
@@ -89,8 +101,16 @@ class CandidatePropertyProposal:
 
     @property
     def coverage_assessment(self) -> str:
-        return ("covered" if self.covered_by_existing_property_ids
-                else "missing_from_codebook")
+        return "deferred_to_intervention"
+
+    @property
+    def possible_coverage_by_existing_property_ids(self) -> tuple[str, ...]:
+        return self.coverage_hints
+
+    @property
+    def covered_by_existing_property_ids(self) -> tuple[str, ...]:
+        """Legacy read alias; these IDs are non-binding proposal hints."""
+        return self.coverage_hints
 
 
 @dataclass(frozen=True)

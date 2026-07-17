@@ -24,8 +24,8 @@ from surrogate_rollout.prompt_routing.schemas import as_json_dict, dumps_canonic
 from surrogate_rollout.schemas import sha256_text
 
 
-PROPOSAL_POLICY_VERSION = "multi_property_proposer_v3"
-REQUEST_SCHEMA_VERSION = "multimodal_property_proposal_request_v2"
+PROPOSAL_POLICY_VERSION = "multi_property_proposer_v4"
+REQUEST_SCHEMA_VERSION = "multimodal_property_proposal_request_v3"
 INPUT_IDENTITY_SCHEMA_VERSION = "multimodal_property_proposal_identity_v1"
 OUTPUT_FIELDS = frozenset({
     "candidate_property_id", "property_text", "motivating_failure_types",
@@ -258,8 +258,14 @@ def build_proposal_input(
             "Given the questions, ground-truth and baseline predictions, bounded "
             "reasoning, actual used-segment images and baseline captions, and the "
             "current codebook, propose only missing reusable captioning properties. "
-            "Prioritize incorrect QAs and avoid instance-specific wording. Return "
-            "only the strict output schema."
+            "Prioritize incorrect QAs and avoid instance-specific wording. "
+            "covered_by_existing_property_ids are non-binding hints naming active "
+            "properties that may be related or may cover the candidate; use an empty "
+            "list when uncertain. Do not claim definite non-coverage while also "
+            "listing coverage hints unless the rationale explicitly explains partial "
+            "coverage or uncertainty. Propose only visually verifiable captioning "
+            "instructions; never request external, historical, background, or other "
+            "non-visual knowledge. Return only the strict output schema."
         ),
         "max_proposals": max_proposals,
         "qas": tuple(qas),
@@ -269,7 +275,7 @@ def build_proposal_input(
                 "candidate_property_id": "string",
                 "property_text": "concise reusable captioning instruction",
                 "motivating_failure_types": ["snake_case_failure_type"],
-                "covered_by_existing_property_ids": ["active_property_id"],
+                "covered_by_existing_property_ids": [],
                 "proposal_rationale": "brief rationale",
             },),
         },
@@ -338,6 +344,54 @@ def _instance_specific_reason(text: str, context: VideoProposalContext) -> str |
     return None
 
 
+def _non_visual_knowledge_reason(text: str) -> str | None:
+    lowered = text.casefold()
+    direct = (
+        r"\bnon[- ]visual (?:knowledge|information|context|facts?)\b",
+        r"\bexternal (?:knowledge|information|context|facts?|sources?)\b",
+        r"\bbackground (?:knowledge|information|context|facts?|research)\b",
+        r"\bhistorical (?:knowledge|context|background|facts?|research)\b",
+        r"\b(?:world|domain|prior) knowledge\b",
+        r"\bbeyond (?:what is|the content) (?:visible|shown|depicted)\b",
+        r"\boutside (?:the|of the) (?:frames?|video|visual evidence)\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in direct):
+        return "requires non-visual or external/background/historical knowledge"
+    knowledge_object = (
+        r"(?:external|background|historical|biographical|real[- ]world) "
+        r"(?:context|knowledge|information|facts?|details?)"
+    )
+    if re.search(
+            rf"\b(?:add|include|provide|supply|infer|research|explain|use)\b"
+            rf".{{0,80}}\b{knowledge_object}\b", lowered):
+        return "requires non-visual or external/background/historical knowledge"
+    return None
+
+
+def _coverage_contradiction_reason(
+    coverage_hints: tuple[str, ...], rationale: str,
+) -> str | None:
+    if not coverage_hints:
+        return None
+    lowered = rationale.casefold()
+    definite_noncoverage = (
+        r"\bnot covered by (?:any |the )?existing",
+        r"\bno existing propert(?:y|ies) cover",
+        r"\bnone of (?:the )?existing propert(?:y|ies)",
+        r"\bunrelated to (?:all |the )?existing propert(?:y|ies)",
+        r"\bentirely missing from (?:the )?(?:current )?codebook",
+    )
+    uncertainty = (
+        r"\bmay\b", r"\bmight\b", r"\bpossibly\b", r"\buncertain\b",
+        r"\bpartially\b", r"\bpartial coverage\b", r"\bnot fully covered\b",
+        r"\brelated\b", r"\boverlap\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in definite_noncoverage) and \
+            not any(re.search(pattern, lowered) for pattern in uncertainty):
+        return "contradictory_coverage_hints_without_uncertainty"
+    return None
+
+
 def parse_proposal_output(
     raw: str,
     context: VideoProposalContext,
@@ -380,16 +434,16 @@ def parse_proposal_output(
             raise PropertyProposalParseError(
                 f"proposal {candidate_id} property_text is empty or too long")
         failures = row["motivating_failure_types"]
-        covered = row["covered_by_existing_property_ids"]
+        reported_coverage = row["covered_by_existing_property_ids"]
         rationale = row["proposal_rationale"]
         for name, items in (("motivating_failure_types", failures),
-                            ("covered_by_existing_property_ids", covered)):
+                            ("covered_by_existing_property_ids", reported_coverage)):
             if not isinstance(items, list) or any(
                     not isinstance(item, str) or not item for item in items):
                 raise PropertyProposalParseError(
                     f"proposal {candidate_id} {name} must be a string array")
         if not failures or len(failures) != len(set(failures)) or \
-                len(covered) != len(set(covered)):
+                len(reported_coverage) != len(set(reported_coverage)):
             raise PropertyProposalParseError(
                 f"proposal {candidate_id} requires unique lineage and failure types")
         if any(not re.fullmatch(r"[a-z][a-z0-9_]*", item)
@@ -399,7 +453,7 @@ def parse_proposal_output(
         if not isinstance(rationale, str) or not rationale.strip():
             raise PropertyProposalParseError(
                 f"proposal {candidate_id} rationale must be non-empty")
-        unknown_coverage = set(covered) - set(active)
+        unknown_coverage = set(reported_coverage) - set(active)
         if unknown_coverage:
             raise PropertyProposalParseError(
                 f"proposal {candidate_id} covers unknown properties: "
@@ -413,16 +467,26 @@ def parse_proposal_output(
         if reason:
             rejected.append({"candidate_property_id": candidate_id, "reason": reason})
             continue
-        computed_coverage = active_by_text.get(text_key)
-        id_coverage = candidate_id if candidate_id in active else None
-        coverage = tuple(dict.fromkeys(
-            [*covered,
-             *([computed_coverage] if computed_coverage else []),
-             *([id_coverage] if id_coverage else [])]))
-        if coverage:
+        reason = _non_visual_knowledge_reason(text)
+        if reason:
+            rejected.append({"candidate_property_id": candidate_id, "reason": reason})
+            continue
+        coverage_hints = tuple(reported_coverage)
+        reason = _coverage_contradiction_reason(coverage_hints, rationale)
+        if reason:
+            rejected.append({"candidate_property_id": candidate_id, "reason": reason})
+            continue
+        if candidate_id in active:
             rejected.append({
                 "candidate_property_id": candidate_id,
-                "reason": "covered_by_active_codebook:" + ",".join(coverage),
+                "reason": "candidate_property_id_collides_with_active_property",
+            })
+            continue
+        computed_coverage = active_by_text.get(text_key)
+        if computed_coverage:
+            rejected.append({
+                "candidate_property_id": candidate_id,
+                "reason": "exact_property_text_match:" + computed_coverage,
             })
             continue
         proposals.append(CandidatePropertyProposal(
@@ -431,7 +495,7 @@ def parse_proposal_output(
             source_video_id=context.video_id,
             source_question_ids=source_question_ids,
             motivating_failure_types=tuple(failures),
-            covered_by_existing_property_ids=coverage,
+            coverage_hints=coverage_hints,
             proposal_rationale=rationale.strip(),
             proposer_policy_version=policy_version,
         ))

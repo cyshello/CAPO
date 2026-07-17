@@ -229,8 +229,10 @@ def _proposal_from_json(value: Mapping[str, Any]) -> CandidatePropertyProposal:
         source_video_id=value["source_video_id"],
         source_question_ids=tuple(value["source_question_ids"]),
         motivating_failure_types=tuple(value["motivating_failure_types"]),
-        covered_by_existing_property_ids=tuple(
-            value.get("covered_by_existing_property_ids") or ()),
+        coverage_hints=tuple(
+            value.get("coverage_hints")
+            or value.get("possible_coverage_by_existing_property_ids")
+            or value.get("covered_by_existing_property_ids") or ()),
         proposal_rationale=value["proposal_rationale"],
         proposer_policy_version=value["proposer_policy_version"],
     )

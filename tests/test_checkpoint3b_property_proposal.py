@@ -168,6 +168,10 @@ def test_proposal_request_bounds_reasoning_and_used_segment_evidence(tmp_path):
     assert all(len(item) <= 1201 for row in request["qas"]
                for item in row["bounded_reasoning"])
     assert "payload_truncation" not in request
+    assert request["output_schema"]["proposals"][0][
+        "covered_by_existing_property_ids"] == []
+    assert "non-binding hints" in request["task"]
+    assert "non-visual knowledge" in request["task"]
 
 
 def test_openai_provider_builds_exact_multimodal_body(tmp_path):
@@ -208,7 +212,7 @@ def test_policy_persists_private_identity_and_exact_provider_body(tmp_path):
     artifact_dir = Path(ctx.proposal_artifact_dir)
     assert json.loads((artifact_dir / "provider_request.json").read_text()) == {
         "exact": True,
-        "request_schema": "multimodal_property_proposal_request_v2",
+        "request_schema": "multimodal_property_proposal_request_v3",
     }
     model_request = (artifact_dir / "request.json").read_text()
     private_identity = (artifact_dir / "input_identity.json").read_text()
@@ -230,6 +234,56 @@ def test_instance_specific_answer_leaking_and_codebook_duplicates_are_rejected(t
     assert accepted == ()
     assert {item["candidate_property_id"] for item in rejected} == {
         "cp_video", "cp_answer", "cp_existing"}
+    exact = next(item for item in rejected
+                 if item["candidate_property_id"] == "cp_existing")
+    assert exact["reason"] == "exact_property_text_match:pe_default"
+
+
+def test_coverage_hints_are_non_binding_and_persisted_for_later_feedback(tmp_path):
+    ctx = context(tmp_path)
+    provider = Provider({"proposals": [proposal(
+        "cp_roles",
+        "Describe visually observable instructional interactions and roles clearly.",
+        covered_by_existing_property_ids=["pe_default", "pe_temporal"],
+        proposal_rationale=(
+            "This may overlap general visual and temporal properties, but the "
+            "intervention should determine whether explicit role distinctions help."),
+    )]})
+    result = tuple(MultiPropertyProposalPolicy(
+        response_provider=provider).propose(ctx))
+
+    assert len(result) == 1
+    assert result[0].coverage_hints == ("pe_default", "pe_temporal")
+    assert result[0].covered_by_existing_property_ids == result[0].coverage_hints
+    assert result[0].coverage_assessment == "deferred_to_intervention"
+    parsed = json.loads((Path(ctx.proposal_artifact_dir) /
+                         "parsed_output.json").read_text())
+    assert parsed["proposals"][0]["coverage_hints"] == [
+        "pe_default", "pe_temporal"]
+    assert "covered_by_existing_property_ids" not in parsed["proposals"][0]
+
+
+def test_contradictory_coverage_and_nonvisual_knowledge_are_explicitly_rejected(
+        tmp_path):
+    ctx = context(tmp_path)
+    raw = json.dumps({"proposals": [
+        proposal(
+            "cp_contradiction", "Describe visually observable teaching roles.",
+            covered_by_existing_property_ids=["pe_default"],
+            proposal_rationale="No existing property covers this instruction."),
+        proposal(
+            "cp_history", "Provide historical context for depicted events.",
+            proposal_rationale="External context could explain the scene."),
+    ]})
+    accepted, rejected = parse_proposal_output(
+        raw, ctx, max_proposals=4, max_property_text_chars=240)
+
+    assert accepted == ()
+    assert {item["candidate_property_id"]: item["reason"] for item in rejected} == {
+        "cp_contradiction": "contradictory_coverage_hints_without_uncertainty",
+        "cp_history": (
+            "requires non-visual or external/background/historical knowledge"),
+    }
 
 
 def test_duplicate_and_malformed_proposals_fail_strictly(tmp_path):
@@ -247,6 +301,19 @@ def test_duplicate_and_malformed_proposals_fail_strictly(tmp_path):
             malformed, ctx, max_proposals=4, max_property_text_chars=240)
 
 
+def test_active_property_id_collision_is_deterministically_rejected(tmp_path):
+    accepted, rejected = parse_proposal_output(
+        json.dumps({"proposals": [proposal(
+            "pe_default", "Describe visually observable teaching roles.")]}),
+        context(tmp_path), max_proposals=1, max_property_text_chars=240)
+
+    assert accepted == ()
+    assert rejected == ({
+        "candidate_property_id": "pe_default",
+        "reason": "candidate_property_id_collides_with_active_property",
+    },)
+
+
 def test_exact_proposal_resume_skips_provider_and_stale_input_fails_closed(tmp_path):
     provider = Provider({"proposals": [
         proposal("cp_color", "Record salient object colors precisely.")]})
@@ -260,4 +327,14 @@ def test_exact_proposal_resume_skips_provider_and_stale_input_fails_closed(tmp_p
     stale = context(tmp_path, prediction="C")
     with pytest.raises(PropertyProposalConflictError):
         policy.propose(stale)
+    assert len(provider.calls) == 1
+
+
+def test_zero_proposal_resume_remains_provider_free(tmp_path):
+    provider = Provider({"proposals": []})
+    policy = MultiPropertyProposalPolicy(response_provider=provider)
+    ctx = context(tmp_path)
+
+    assert policy.propose(ctx) == ()
+    assert policy.propose(ctx) == ()
     assert len(provider.calls) == 1

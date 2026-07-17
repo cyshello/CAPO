@@ -320,6 +320,24 @@ the current codebook. Offline reconstruction from the v2 baseline produced a
 `*_multimodal_*` output/state roots below; reuse the identity-matched caption
 cache.
 
+`multi_property_proposer_v4` changes coverage handling without weakening
+deterministic duplicate or knowledge-grounding checks. The provider field
+`covered_by_existing_property_ids` now means possible relation or coverage and
+is parsed and persisted as non-binding `coverage_hints`. Exact normalized text
+matches and active-ID collisions still reject before retrieval, as do malformed
+lineage, instance leakage, and non-visual/external/background/historical
+knowledge instructions. Semantic coverage is assessed only from post-
+intervention correctness-flip feedback using Checkpoint 3D
+`coverage_assessment` and `covered_by_property_ids`. Existing serialized
+`covered_by_existing_property_ids` proposal records remain readable through a
+legacy alias; completed top-level bounded-smoke manifests retain their normal
+exact-resume behavior.
+
+`flip_only_property_feedback_v2` carries the proposal `coverage_hints` into
+the bounded feedback request and aggregate artifact as context and lineage.
+They do not populate `covered_by_property_ids`; only the post-intervention
+feedback response can do that.
+
 History-block-parallel baseline captioning is available through `--gpus`. The
 comma-separated list creates at most one run-scoped persistent Qwen/vLLM worker
 per GPU;

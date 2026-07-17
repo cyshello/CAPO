@@ -132,6 +132,7 @@ class PropertyFeedbackAggregate:
     rejected_feedback_count: int
     supporting_s_feedback: tuple[str, ...]
     evidence_references: tuple[str, ...]
+    proposal_coverage_hints: tuple[str, ...]
     coverage_assessment: str
     covered_by_property_ids: tuple[str, ...]
     recommendation_evidence: tuple[Mapping[str, str], ...]
@@ -399,7 +400,7 @@ def parse_feedback_output(
 
 
 class PropertyFeedbackRunner:
-    policy_version = "flip_only_property_feedback_v1"
+    policy_version = "flip_only_property_feedback_v2"
 
     def __init__(
         self,
@@ -538,6 +539,7 @@ class PropertyFeedbackRunner:
                     "negative_flip_count": 0, "unchanged_count": 0,
                     "accepted_feedback_count": 0, "rejected_feedback_count": 0,
                     "supporting_s_feedback": (), "evidence_references": (),
+                    "proposal_coverage_hints": proposal.coverage_hints,
                     "coverage_assessment": "uncertain",
                     "covered_by_property_ids": (), "recommendation_evidence": (),
                     "qa_feedback": (),
@@ -631,6 +633,7 @@ class PropertyFeedbackRunner:
                     "unchanged_count": 0, "accepted_feedback_count": 0,
                     "rejected_feedback_count": 0,
                     "supporting_s_feedback": (), "evidence_references": (),
+                    "proposal_coverage_hints": proposal.coverage_hints,
                     "coverage_assessment": "uncertain",
                     "covered_by_property_ids": (), "recommendation_evidence": (),
                     "qa_feedback": (),
@@ -788,10 +791,11 @@ class PropertyFeedbackRunner:
                     transition=transition, used_before=used_before,
                     used_after=used_after, s_feedback=(),
                     request={
-                        "schema_version": "property_flip_feedback_request_v1",
+                        "schema_version": "property_flip_feedback_request_v2",
                         "candidate_property": {
                             "candidate_property_id": proposal.candidate_property_id,
                             "property_text": proposal.property_text,
+                            "coverage_hints": proposal.coverage_hints,
                         },
                         "transition": transition,
                         "s_sim": selected, "s_used_before": used_before,
@@ -870,6 +874,7 @@ class PropertyFeedbackRunner:
             "rejected_feedback_count": len(rejected),
             "supporting_s_feedback": supporting,
             "evidence_references": references,
+            "proposal_coverage_hints": proposal.coverage_hints,
             "coverage_assessment": coverage,
             "covered_by_property_ids": covered_ids,
             "recommendation_evidence": recommendation_evidence,
@@ -899,7 +904,7 @@ class PropertyFeedbackRunner:
                 if property_id != proposal.candidate_property_id and \
                         property_id in active and property_id not in relevant_ids:
                     relevant_ids.append(property_id)
-        for property_id in proposal.covered_by_existing_property_ids:
+        for property_id in proposal.coverage_hints:
             if property_id in active and property_id not in relevant_ids:
                 relevant_ids.append(property_id)
         relevant_ids = relevant_ids[:self.bounds.max_codebook_entries]
@@ -961,7 +966,7 @@ class PropertyFeedbackRunner:
                     f"segments.{segment_id}.after_caption"),
             })
         request = {
-            "schema_version": "property_flip_feedback_request_v1",
+            "schema_version": "property_flip_feedback_request_v2",
             "task": (
                 "Return strict JSON credit or blame for the reusable candidate "
                 "captioning property. Use only supplied evidence. The evidence "
@@ -970,6 +975,7 @@ class PropertyFeedbackRunner:
             "candidate_property": {
                 "candidate_property_id": proposal.candidate_property_id,
                 "property_text": proposal.property_text,
+                "coverage_hints": proposal.coverage_hints,
             },
             "transition": transition,
             "qa_context": {
@@ -1170,6 +1176,8 @@ class PropertyFeedbackRunner:
             rejected_feedback_count=int(value.get("rejected_feedback_count", 0)),
             supporting_s_feedback=tuple(value.get("supporting_s_feedback") or ()),
             evidence_references=tuple(value.get("evidence_references") or ()),
+            proposal_coverage_hints=tuple(
+                value.get("proposal_coverage_hints") or ()),
             coverage_assessment=value.get("coverage_assessment", "uncertain"),
             covered_by_property_ids=tuple(
                 value.get("covered_by_property_ids") or ()),

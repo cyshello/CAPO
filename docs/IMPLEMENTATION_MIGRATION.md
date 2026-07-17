@@ -169,10 +169,20 @@ Output:
 - source video ID;
 - source QA IDs;
 - concise failure evidence;
-- codebook coverage assessment;
+- non-binding possible-codebook-coverage hints;
 - reusable property instruction.
 
 Do not directly mutate the codebook.
+
+Treat proposer `covered_by_existing_property_ids` as hints and persist them
+internally as `coverage_hints`; never veto a candidate merely because this list
+is non-empty. Deterministic proposal rejection is limited to exact normalized
+text matches, active property-ID collisions, duplicate or malformed lineage,
+instance-specific leakage, and non-visual/external/background/historical
+knowledge instructions. Require explicit uncertainty or partial-coverage text
+when hints and rationale would otherwise contradict. Defer semantic coverage
+to Checkpoint 3D `coverage_assessment` and `covered_by_property_ids`, which feed
+the Checkpoint 3E add/revise/merge/router/no-op rules.
 
 Do not send source-video ID, question ID, segment ID, provider priority rank,
 tool-call ID, or payload-truncation metadata. Preserve these only in a private

@@ -234,13 +234,24 @@ to the model. Focused cited/inspected/returned segments take priority, with a
 deterministic representative sample from consumed segments only when needed.
 
 The current codebook and a source-free output schema complete the multimodal
-request. The provider returns only reusable property content and coverage
-judgments; source video and all three source QA IDs are reattached internally
-after parsing. The text portion and every transformed image are independently
-bounded and identity-bound. `request.json` records the logical model input,
-`provider_request.json` records the exact secret-free API body, and
-`input_identity.json` records private source/segment/frame lineage that is never
-sent to the provider.
+request. Provider-reported `covered_by_existing_property_ids` are non-binding
+hints only and are stored internally as `coverage_hints`. A non-empty hint list
+does not reject a proposal. Proposal parsing rejects only deterministic exact
+text or active-ID collisions, malformed or duplicate lineage, instance-specific
+leakage, and instructions requiring non-visual, external, background, or
+historical knowledge. Contradictory coverage claims require an explicit partial
+coverage or uncertainty explanation. Source video and all three source QA IDs
+are reattached internally after parsing. The text portion and every transformed
+image are independently bounded and identity-bound. `request.json` records the
+logical model input, `provider_request.json` records the exact secret-free API
+body, and `input_identity.json` records private source/segment/frame lineage
+that is never sent to the provider.
+
+Semantic coverage is deliberately deferred until after retrieval,
+intervention, and correctness-flip feedback. Checkpoint 3D
+`coverage_assessment` and `covered_by_property_ids`, rather than proposal hints,
+drive the iteration-level `add`, `revise`, `merge`, router-supervision, or
+`no_op` decision.
 
 Near-duplicate candidates may be grouped for reporting, but every
 property-source-video pair remains independently evaluable.
