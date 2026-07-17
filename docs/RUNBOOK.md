@@ -436,6 +436,8 @@ intervention, QA, and feedback artifacts. Repeating a completed mode performs
 an exact resume. Calling an earlier mode does not remove or overwrite later
 artifacts. `state-dir/provisional_update/` is smoke-local: no coverage-cycle,
 confirmed checkpoint, confirmation evaluation, or canonical pointer is used.
+The bounded smoke keeps its shared SigLIP image/text retrieval embedder on CPU;
+GPUs listed by `--gpus` remain reserved for the persistent Qwen worker pool.
 
 ## 6. Main experiment
 

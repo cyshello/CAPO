@@ -52,7 +52,10 @@ from surrogate_rollout.retrieval.property_retrieval import (
     PropertyFrameRetriever,
     PropertyRetrievalBatchRunner,
 )
-from surrogate_rollout.retrieval.visual_index import load_or_build_visual_index
+from surrogate_rollout.retrieval.visual_index import (
+    SiglipEmbedder,
+    load_or_build_visual_index,
+)
 
 
 ROOT = REPO_ROOT
@@ -68,6 +71,28 @@ def _load_json(path: str) -> dict:
 
 def _text_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _build_retrieval_runner(*, cache_dir: str, video_duration_seconds):
+    """Keep SigLIP off GPUs reserved for the persistent Qwen worker pool."""
+    retrieval_embedder = SiglipEmbedder(
+        model_id=config.VISUAL_INDEX_MODEL_ID, device="cpu")
+
+    def visual_index_loader(sample: dict, video_id: str):
+        from surrogate_rollout.evaluation.dvd_qa import resolve_frames_dir
+
+        frames_dir = resolve_frames_dir(sample, video_id)
+        return load_or_build_visual_index(
+            video_id=video_id, frames_dir=frames_dir,
+            duration=video_duration_seconds(sample["video_path"]),
+            embedder=retrieval_embedder,
+            root=os.path.join(cache_dir, "visual_indexes"),
+            model_id=config.VISUAL_INDEX_MODEL_ID)
+
+    return PropertyRetrievalBatchRunner(
+        retriever=PropertyFrameRetriever(
+            embedder=retrieval_embedder, top_k=1),
+        visual_index_loader=visual_index_loader)
 
 
 def main() -> None:
@@ -155,19 +180,9 @@ def main() -> None:
         response_provider=OpenAIPropertyProposalProvider(
             model=args.feedback_model), max_proposals=1)
 
-    def visual_index_loader(sample: dict, video_id: str):
-        from surrogate_rollout.evaluation.dvd_qa import resolve_frames_dir
-
-        frames_dir = resolve_frames_dir(sample, video_id)
-        return load_or_build_visual_index(
-            video_id=video_id, frames_dir=frames_dir,
-            duration=video_duration_seconds(sample["video_path"]),
-            root=os.path.join(cache_dir, "visual_indexes"),
-            model_id=config.VISUAL_INDEX_MODEL_ID)
-
-    retrieval_runner = PropertyRetrievalBatchRunner(
-        retriever=PropertyFrameRetriever(top_k=1),
-        visual_index_loader=visual_index_loader)
+    retrieval_runner = _build_retrieval_runner(
+        cache_dir=cache_dir,
+        video_duration_seconds=video_duration_seconds)
     baseline_runner = BaselinePhaseRunner(
         proposal_policy=proposal_policy,
         history_aware_builder=history_builder,
@@ -229,6 +244,7 @@ def main() -> None:
                 "feedback_model": args.feedback_model,
                 "dvd_max_iterations": args.dvd_max_iterations,
                 "gpu": primary_gpu,
+                "retrieval_device": "cpu",
                 "dvd_text_backend": "codex",
                 "dvd_use_openai_tools": False,
                 "base_prompt_hash": _text_hash(prompts.caption_prompt),
