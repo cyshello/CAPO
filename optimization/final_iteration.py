@@ -281,6 +281,7 @@ class Checkpoint3EOrchestrator:
         require_real_models: bool = True,
         property_memory_runner: Any | None = None,
         llm_codebook_updater: Any | None = None,
+        llm_router_updater: Any | None = None,
     ) -> None:
         if min_retire_support_videos < 2:
             raise ValueError("retirement requires at least two support videos")
@@ -292,6 +293,7 @@ class Checkpoint3EOrchestrator:
         self.require_real_models = require_real_models
         self.property_memory_runner = property_memory_runner
         self.llm_codebook_updater = llm_codebook_updater
+        self.llm_router_updater = llm_router_updater
 
     @classmethod
     def with_real_confirmation(
@@ -1419,6 +1421,233 @@ class Checkpoint3EOrchestrator:
             "checkpoint_manifest_hash": _file_hash(manifest_path),
         })
         return _read_json(manifest_path)
+
+    def run_memory_conditioned_router_checkpoint(
+        self, *, iteration_id: str,
+        parent_router_policy: RouterPolicySnapshot,
+        codebook_checkpoint_manifest_path: str,
+        output_dir: str, state_dir: str,
+    ) -> Mapping[str, Any]:
+        """Finish the memory-conditioned update as one provisional policy pair.
+
+        This uses a checkpoint-local pointer. It does not touch coverage-cycle,
+        active-provisional, or confirmed production pointers.
+        """
+        if self.llm_router_updater is None:
+            raise FinalIterationError(
+                "memory-conditioned router checkpoint requires its stage runner")
+        output_dir = os.path.abspath(output_dir)
+        state_dir = os.path.abspath(state_dir)
+        manifest_target = os.path.join(output_dir, "manifest.json")
+        failure_target = os.path.join(output_dir, "failure.json")
+        pointer_path = os.path.join(
+            state_dir, "memory_conditioned_provisional", "current.json")
+        codebook_manifest_path = os.path.abspath(codebook_checkpoint_manifest_path)
+        codebook_checkpoint = _read_json(codebook_manifest_path)
+        if codebook_checkpoint.get("schema_version") != \
+                "memory_conditioned_codebook_iteration_v1" or \
+                codebook_checkpoint.get("status") != "completed" or \
+                codebook_checkpoint.get("iteration_id") != iteration_id:
+            raise FinalIterationConflictError(
+                "incompatible memory-conditioned codebook checkpoint")
+        checkpoint_artifacts = codebook_checkpoint.get("artifacts") or {}
+        checkpoint_hashes = codebook_checkpoint.get("artifact_hashes") or {}
+        if set(checkpoint_artifacts) != set(checkpoint_hashes) or any(
+                not os.path.exists(path) or _file_hash(path) != checkpoint_hashes[name]
+                for name, path in checkpoint_artifacts.items()):
+            raise FinalIterationConflictError("codebook-checkpoint artifact mismatch")
+        updater_manifest_path = checkpoint_artifacts["llm_codebook_updater_manifest"]
+        codebook_updater_manifest = _read_json(updater_manifest_path)
+        if codebook_updater_manifest.get("schema_version") != \
+                "memory_codebook_checkpoint_manifest_v1" or \
+                codebook_updater_manifest.get("status") != "completed":
+            raise FinalIterationConflictError("incompatible codebook-updater artifacts")
+        updater_artifacts = codebook_updater_manifest.get("artifacts") or {}
+        candidate_codebook_path = checkpoint_artifacts["candidate_codebook"]
+        mapping_path = checkpoint_artifacts["property_id_mapping"]
+        promoted_memory_path = checkpoint_artifacts["promoted_property_memory"]
+        required = ("applied_plan", "validation_report")
+        if any(name not in updater_artifacts for name in required):
+            raise FinalIterationConflictError("incomplete codebook-updater audit closure")
+        input_contract = {
+            "schema_version": "memory_router_atomic_input_v1",
+            "iteration_id": iteration_id,
+            "parent_router": as_json_dict(parent_router_policy),
+            "codebook_checkpoint_path": codebook_manifest_path,
+            "codebook_checkpoint_hash": _file_hash(codebook_manifest_path),
+            "candidate_codebook_hash": _file_hash(candidate_codebook_path),
+            "property_id_mapping_hash": _file_hash(mapping_path),
+            "property_memory_hash": _file_hash(promoted_memory_path),
+            "codebook_applied_plan_hash": _file_hash(updater_artifacts["applied_plan"]),
+            "codebook_validation_hash": _file_hash(
+                updater_artifacts["validation_report"]),
+            "router_updater": _stage_identity(self.llm_router_updater),
+            "state_dir": state_dir,
+        }
+        fingerprint = sha256_json(input_contract)
+        if os.path.exists(manifest_target):
+            manifest = _read_json(manifest_target)
+            if manifest.get("schema_version") != \
+                    "memory_conditioned_atomic_policy_pair_v1" or \
+                    manifest.get("status") != "committed" or \
+                    manifest.get("input_fingerprint") != fingerprint:
+                raise FinalIterationConflictError(
+                    "incompatible completed atomic policy-pair checkpoint")
+            artifacts, hashes = manifest.get("artifacts") or {}, \
+                manifest.get("artifact_hashes") or {}
+            if set(artifacts) != set(hashes) or any(
+                    not os.path.exists(path) or _file_hash(path) != hashes[name]
+                    for name, path in artifacts.items()):
+                raise FinalIterationConflictError("atomic policy-pair artifact mismatch")
+            if not os.path.exists(pointer_path):
+                raise FinalIterationConflictError("atomic provisional-pair pointer missing")
+            pointer = _read_json(pointer_path)
+            if pointer.get("schema_version") != \
+                    "memory_conditioned_provisional_pair_pointer_v1" or \
+                    pointer.get("pair_manifest_hash") != _file_hash(manifest_target):
+                raise FinalIterationConflictError("atomic provisional-pair pointer mismatch")
+            candidate_bank = prompt_bank_from_json(
+                _read_json(artifacts["provisional_codebook"]))
+            candidate_router = router_policy_from_json(
+                _read_json(artifacts["provisional_router"]))
+            from surrogate_rollout.prompt_routing.structured_router_policy import (
+                validate_rendered_prompt_configuration,
+            )
+            validate_rendered_prompt_configuration(candidate_router, candidate_bank)
+            return {**manifest, "resumed": True}
+        if os.path.exists(failure_target) or (
+                os.path.isdir(output_dir) and os.listdir(output_dir)):
+            raise FinalIterationConflictError(
+                "incomplete or failed atomic policy-pair checkpoint cannot be resumed")
+
+        try:
+            router_result = self.llm_router_updater.run(
+                iteration_id=iteration_id,
+                parent_router_policy=parent_router_policy,
+                candidate_codebook_path=candidate_codebook_path,
+                property_id_mapping_path=mapping_path,
+                property_memory_snapshot_path=promoted_memory_path,
+                codebook_applied_plan_path=updater_artifacts["applied_plan"],
+                codebook_validation_report_path=updater_artifacts[
+                    "validation_report"],
+                output_dir=os.path.join(output_dir, "llm_router_updater"))
+            candidate_wrapper = _read_json(candidate_codebook_path)
+            candidate_bank = prompt_bank_from_json(candidate_wrapper["candidate_bank"])
+            candidate_router = router_policy_from_json(_read_json(
+                router_result["artifacts"]["candidate_router_policy"]))
+            errors = validate_router_against_bank(candidate_router, candidate_bank)
+            if errors:
+                raise FinalIterationError("; ".join(errors))
+            from surrogate_rollout.prompt_routing.structured_router_policy import (
+                validate_rendered_prompt_configuration,
+            )
+            validate_rendered_prompt_configuration(candidate_router, candidate_bank)
+            active_bank_ids = {entry.prompt_id for entry in candidate_bank.entries
+                               if entry.status == "active"}
+            structured = _read_json(
+                router_result["artifacts"]["structured_router_policy"])
+            structured_ids = {row["property_id"] for row in structured["properties"]}
+            if structured_ids != active_bank_ids:
+                raise FinalIterationError("candidate codebook/router ID-space mismatch")
+
+            pair_root = os.path.join(output_dir, "provisional_policy_pair")
+            bank_path = _write_immutable(
+                os.path.join(pair_root, "provisional_codebook.json"), candidate_bank)
+            router_path = _write_immutable(
+                os.path.join(pair_root, "provisional_router.json"), candidate_router)
+            pair_artifacts = {
+                "provisional_codebook": bank_path,
+                "provisional_router": router_path,
+                "property_memory_snapshot": promoted_memory_path,
+                "candidate_codebook_source": candidate_codebook_path,
+                "property_id_mapping": mapping_path,
+                "structured_router_policy": router_result["artifacts"][
+                    "structured_router_policy"],
+                "rendered_router_prompt": router_result["artifacts"][
+                    "rendered_router_prompt"],
+                "codebook_applied_plan": updater_artifacts["applied_plan"],
+                "codebook_validation_report": updater_artifacts[
+                    "validation_report"],
+                "router_applied_plan": router_result["artifacts"]["applied_plan"],
+                "router_validation_report": router_result["artifacts"][
+                    "validation_report"],
+                "codebook_updater_manifest": updater_manifest_path,
+                "router_updater_manifest": os.path.join(
+                    output_dir, "llm_router_updater", "manifest.json"),
+            }
+            mapping = _read_json(mapping_path)
+            rendered = _read_json(pair_artifacts["rendered_router_prompt"])
+            pair = {
+                "schema_version": "atomic_provisional_policy_pair_v1",
+                "status": "committed", "iteration_id": iteration_id,
+                "parent_policy_pair": {
+                    "input_bank_version": codebook_checkpoint["input_bank_version"],
+                    "input_bank_hash": codebook_checkpoint["input_bank_hash"],
+                    "router_version": parent_router_policy.router_version,
+                    "router_hash": _object_hash(parent_router_policy),
+                },
+                "candidate_policy_pair": {
+                    "bank_version": candidate_bank.bank_version,
+                    "bank_hash": _object_hash(candidate_bank),
+                    "router_version": candidate_router.router_version,
+                    "router_hash": _object_hash(candidate_router),
+                    "rendered_router_prompt_hash": rendered["prompt_sha256"],
+                    "structured_router_policy_schema_version": structured[
+                        "schema_version"],
+                },
+                "old_to_new_property_ids": mapping[
+                    "old_to_new_property_ids"],
+                "candidate_promotions": mapping["candidate_promotions"],
+                "artifacts": pair_artifacts,
+                "artifact_hashes": {name: _file_hash(path)
+                                    for name, path in pair_artifacts.items()},
+                "confirmed_production_pointer_mutated": False,
+                "confirmation_run": False,
+            }
+            pair_path = _write_immutable(
+                os.path.join(pair_root, "policy_pair.json"), pair)
+            artifacts = {**pair_artifacts, "atomic_policy_pair": pair_path}
+            manifest = {
+                "schema_version": "memory_conditioned_atomic_policy_pair_v1",
+                "status": "committed", "iteration_id": iteration_id,
+                "input_fingerprint": fingerprint,
+                "artifacts": artifacts,
+                "artifact_hashes": {name: _file_hash(path)
+                                    for name, path in artifacts.items()},
+                "candidate_bank_version": candidate_bank.bank_version,
+                "candidate_router_version": candidate_router.router_version,
+                "rendered_router_prompt_hash": rendered["prompt_sha256"],
+                "confirmed_production_pointer_mutated": False,
+                "confirmation_run": False, "resumed": False,
+            }
+            manifest_path = _write_immutable(manifest_target, manifest)
+            _write_pointer(pointer_path, {
+                "schema_version": "memory_conditioned_provisional_pair_pointer_v1",
+                "iteration_id": iteration_id,
+                "pair_manifest_path": manifest_path,
+                "pair_manifest_hash": _file_hash(manifest_path),
+                "policy_pair_path": pair_path,
+                "policy_pair_hash": _file_hash(pair_path),
+                "bank_path": bank_path, "bank_hash": _file_hash(bank_path),
+                "router_path": router_path, "router_hash": _file_hash(router_path),
+                "rendered_router_prompt_hash": rendered["prompt_sha256"],
+                "property_memory_path": promoted_memory_path,
+                "property_memory_hash": _file_hash(promoted_memory_path),
+            })
+            return _read_json(manifest_path)
+        except Exception as exc:
+            _write_immutable(failure_target, {
+                "schema_version": "memory_conditioned_atomic_policy_pair_failure_v1",
+                "status": "failed", "iteration_id": iteration_id,
+                "input_fingerprint": fingerprint,
+                "error_type": type(exc).__name__, "error": str(exc),
+                "rollback": {
+                    "router_version": parent_router_policy.router_version,
+                    "codebook_checkpoint_committed_as_pair": False,
+                    "provisional_pair_pointer_written": False,
+                },
+            })
+            raise
 
     def apply_update_plan(
         self, *, prompt_bank: PromptBankSnapshot,

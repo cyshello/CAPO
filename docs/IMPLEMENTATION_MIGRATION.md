@@ -518,10 +518,71 @@ Artifacts use these schemas:
 - orchestration manifest: `memory_conditioned_codebook_iteration_v1`;
 - memory lineage pointer: `property_memory_lineage_pointer_v1`.
 
-Intentionally deferred: changing the router prompt, translating the mapping
-into router rules/supervision, validating the candidate bank against a candidate
-router, atomic bank/router provisional commit, confirmation of that pair, and
-any production-pointer mutation.
+At the Checkpoint 2 boundary, router-prompt updating, ID remapping, candidate
+bank/router validation, and atomic pair commit were intentionally deferred.
+Checkpoint 3 below resolves those items; confirmation and production-pointer
+mutation remain deferred.
+
+### 3.17 Checkpoint 3 implementation log: router prompt and atomic pair
+
+Previous behavior: deterministic updates accumulated bounded
+`supervision_examples`, while `HistoryAwareVLMRouter` still rendered its fixed
+hard-coded instruction plus the request. There was no structured editable
+routing policy, rendered-prompt artifact/hash, memory-conditioned router LLM,
+or atomic continuation from the Checkpoint 2 candidate codebook.
+
+Current behavior: `MemoryConditionedLLMRouterUpdater` reads the validated
+candidate codebook and complete ID mapping, remaps legacy guidance
+deterministically, joins bounded positive/negative routing memory with current
+candidate intervention effects, and sends only those summaries plus validated
+codebook actions to `optimization/prompts/router_updater_v1.txt`. Strict JSON
+actions are individually validated. The LLM never writes a prompt or router
+snapshot directly.
+
+`structured_router_policy_v1` keeps the immutable protocol separately from
+per-property selection/avoidance guidance, two positive/two negative examples,
+aliases, and remapped IDs. `history_aware_router_prompt_renderer_v1` produces
+`rendered_router_prompt_v1`; the exact text and hash are installed in the
+candidate `RouterPolicySnapshot` and consumed by the real history-aware VLM
+router. Invalid/stale IDs, unsupported example polarity, question/answer/gold/
+prediction/reasoning leakage, conflicts, retired guidance, protocol changes,
+and hash mismatch fail closed.
+
+`Checkpoint3EOrchestrator.run_memory_conditioned_router_checkpoint()` validates
+the complete Checkpoint 2 artifact closure and creates
+`atomic_provisional_policy_pair_v1` only after bank and router share the same
+active property-ID space and both updater plans/validation reports are present.
+It writes only `state_dir/memory_conditioned_provisional/current.json`. Router
+failure leaves the candidate codebook uncommitted as a pair, records immutable
+failure evidence, and preserves the parent policy. Exact resume verifies every
+artifact and the rendered prompt hash before making zero provider calls.
+
+Files and interfaces changed:
+
+- `prompt_routing/structured_router_policy.py`: structured policy schema,
+  deterministic ID remapping, fixed scaffold validation, rendering, prompt
+  hashing, and candidate-router installation;
+- `prompt_routing/policies/history_aware_vlm_router.py`: loads the installed
+  rendered prompt and includes its hash/version in request and decision
+  identity while preserving the legacy path;
+- `optimization/llm_router_updater.py` and
+  `optimization/prompts/router_updater_v1.txt`: bounded request, strict plan,
+  deterministic validation/application, complete audit artifacts, and resume;
+- `optimization/final_iteration.py`: separate atomic provisional-pair boundary;
+- `optimization/llm_codebook_updater.py`: preserves bounded routing examples
+  when property memories merge;
+- `tests/test_checkpoint3_memory_router_updater.py`: mock-only checkpoint tests.
+
+Schemas/versions are `memory_router_updater_request_v1`,
+`memory_router_updater_response_v1`, `memory_router_updater_plan_v1`,
+`memory_router_validation_report_v1`, `memory_router_applied_plan_v1`,
+`memory_router_updater_manifest_v1`, `structured_router_policy_v1`,
+`rendered_router_prompt_v1`, `atomic_provisional_policy_pair_v1`, and
+`memory_conditioned_atomic_policy_pair_v1`; the system prompt is
+`memory_router_updater_prompt_v1`.
+
+Intentionally deferred: confirmation of this provisional pair, promotion to a
+confirmed production pointer, and any regular three-video or real-model run.
 
 ## 4. Required tests
 

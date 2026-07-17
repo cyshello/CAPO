@@ -256,8 +256,7 @@ conda run -n local_llm_vllm python -m pytest -q \
   tests/test_checkpoint1_property_memory.py
 ```
 
-The memory-conditioned LLM codebook updater is the following checkpoint below;
-router-prompt consumption remains intentionally deferred.
+The memory-conditioned LLM codebook updater is the following checkpoint below.
 
 ## Checkpoint 2 memory-conditioned LLM codebook updater
 
@@ -349,6 +348,97 @@ Focused mock-only command:
 conda run -n local_llm_vllm python -m pytest -q \
   tests/test_checkpoint1_property_memory.py \
   tests/test_checkpoint2_memory_codebook_updater.py
+```
+
+## Checkpoint 3 memory-conditioned router prompt and atomic pair
+
+After the Checkpoint 2 manifest is complete, configure the same orchestrator
+with `MemoryConditionedLLMRouterUpdater` and invoke the router checkpoint. This
+is a mock/provider integration boundary; this implementation task does not run
+a real provider, GPU, confirmation, or regular three-video experiment.
+
+```python
+orchestrator = Checkpoint3EOrchestrator(
+    baseline_runner=baseline_runner,
+    intervention_runner=intervention_runner,
+    feedback_runner=feedback_runner,
+    confirmation_evaluator=confirmation_evaluator,
+    llm_router_updater=MemoryConditionedLLMRouterUpdater(
+        response_provider=reviewed_router_update_provider,
+    ),
+)
+
+result = orchestrator.run_memory_conditioned_router_checkpoint(
+    iteration_id=iteration_id,
+    parent_router_policy=input_router_policy,
+    codebook_checkpoint_manifest_path=(
+        f"{iteration_output}/memory_codebook_checkpoint/manifest.json"),
+    output_dir=f"{iteration_output}/memory_router_checkpoint",
+    state_dir=policy_state_dir,
+)
+```
+
+Prompt and versions:
+
+```text
+optimization/prompts/router_updater_v1.txt
+memory_router_updater_prompt_v1
+structured_router_policy_v1
+history_aware_router_prompt_renderer_v1
+rendered_router_prompt_v1
+```
+
+Artifacts:
+
+```text
+<iteration>/memory_router_checkpoint/
+├── manifest.json                         # written only after atomic success
+├── failure.json                          # failure only; no pair pointer
+├── llm_router_updater/
+│   ├── manifest.json
+│   ├── parent_structured_router_policy.json
+│   ├── system_prompt.txt
+│   ├── request.json
+│   ├── raw_response.txt
+│   ├── parsed_plan.json
+│   ├── validation_report.json
+│   ├── rejected_actions.json
+│   ├── applied_plan.json
+│   ├── structured_router_policy.json
+│   ├── rendered_router_prompt.json
+│   ├── rendered_router_prompt.txt
+│   ├── router_prompt.diff
+│   └── candidate_router_policy.json
+└── provisional_policy_pair/
+    ├── provisional_codebook.json
+    ├── provisional_router.json
+    └── policy_pair.json                  # atomic_provisional_policy_pair_v1
+
+<state_dir>/memory_conditioned_provisional/current.json
+```
+
+The updater accepts only bounded memory/effect IDs and targets active IDs in
+the candidate codebook. Selection guidance and positive examples require
+positive demonstrated effects; avoidance guidance and negative examples
+require negative demonstrated effects. The validator rejects stale IDs,
+unsupported examples, question/answer/gold/prediction/reasoning leakage,
+conflicting writes, retired guidance, mapping inconsistencies, protocol or
+selection-limit changes, and rendered-prompt hash mismatches.
+
+The provisional pair references/hashes its parent pair, property memory,
+candidate codebook, complete ID mapping, structured policy, rendered prompt,
+and both updater plans and validation reports. The final manifest and separate
+pointer are written only after both components validate in one property-ID
+space. A failure preserves all diagnostic artifacts, does not write the pair
+pointer, and cannot resume as success. Exact repeat of a completed invocation
+verifies closure and performs no provider call. This path never modifies
+`confirmed/current.json` or coverage-cycle `active_provisional.json`.
+
+Focused mock-only command:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_checkpoint3_memory_router_updater.py
 ```
 
 ## 1. Repository and environment

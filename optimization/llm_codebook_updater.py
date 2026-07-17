@@ -713,6 +713,15 @@ class MemoryConditionedLLMCodebookUpdater:
                                     *source_memory.get(field, ())]
                         target[field] = list({item["example_id"]: item
                                               for item in combined}.values())[:limit]
+                    target_routing = target.setdefault(
+                        "routing_examples", {"positive": [], "negative": []})
+                    source_routing = source_memory.get("routing_examples") or {}
+                    for polarity in ("positive", "negative"):
+                        combined = [*target_routing.get(polarity, ()),
+                                    *source_routing.get(polarity, ())]
+                        target_routing[polarity] = list({
+                            item["example_id"]: item for item in combined
+                        }.values())[:2]
                     del by_property[source]
             elif action["action"] == "retire":
                 by_property.pop(action["target_property_ids"][0], None)

@@ -674,6 +674,72 @@ candidate has one positive intervention example
 → candidate codebook and ID mapping are produced
 ```
 
+### 5.0.1 Checkpoint 3: memory-conditioned router prompt and atomic pair
+
+Before Checkpoint 3, deterministic `apply_update_plan()` could append compact
+`supervision_examples` to router configuration, but the real history-aware VLM
+router still used one hard-coded instruction prefix. Accumulated supervision
+therefore did not define a separately versioned, rendered inference prompt.
+
+Checkpoint 3 consumes only the validated candidate codebook, complete
+old-to-new ID mapping, bounded routing memory/current intervention evidence,
+and validated codebook actions:
+
+```text
+candidate codebook + ID mapping + bounded routing evidence
+→ memory_router_updater_prompt_v1
+→ strict memory_router_updater_response_v1
+→ deterministic action validation
+→ structured_router_policy_v1
+→ rendered_router_prompt_v1
+→ atomic_provisional_policy_pair_v1
+```
+
+The protocol scaffold remains fixed: routing is query-independent; inputs are
+current frames and bounded preceding caption history; only active property IDs
+may be returned; the selection limit, strict one-key JSON schema, fail-closed
+parser, and no-fallback behavior remain unchanged. Editable per-property state
+contains `selection_guidance`, `avoidance_guidance`, up to two demonstrated
+positive examples, up to two demonstrated negative examples, aliases, and
+remapped source IDs. `prompt_routing/structured_router_policy.py` renders this
+state deterministically. The resulting text is stored in the candidate
+`RouterPolicySnapshot.configuration`, and `HistoryAwareVLMRouter` uses that
+exact text in later calls. Its schema/renderer versions and SHA-256 enter the
+router snapshot, request identity, decision artifact, provisional lineage, and
+therefore routing-dependent resume/cache identity.
+
+The centralized router-updater prompt is
+`optimization/prompts/router_updater_v1.txt`, version
+`memory_router_updater_prompt_v1`. Actions may set selection or avoidance
+guidance, add bounded positive or negative examples, preserve, or no-op. The
+validator rejects unknown candidate-codebook IDs, unknown memory/evidence IDs,
+polarity-inconsistent examples, unsupported mutations, downstream QA leakage,
+conflicting guidance writes, stale mappings, or prompt/protocol changes.
+Codebook merges remap old guidance and aliases to one canonical ID;
+retirements remove obsolete guidance before LLM actions.
+
+Persistence is two-phase. Router request/response/validation/rendering
+artifacts may exist without a committed pair, but a codebook is not made active
+alone. Only after the candidate bank, candidate router, active ID space,
+rendered prompt content/hash, and both updater validation reports agree does
+`memory_conditioned_atomic_policy_pair_v1` write one
+`atomic_provisional_policy_pair_v1` and the separate
+`memory_conditioned_provisional_pair_pointer_v1`. Any provider, validation,
+rendering, hashing, or persistence failure records `failure.json`, leaves that
+pointer absent, and retains the parent pair. This checkpoint never writes
+`confirmed/current.json` or coverage-cycle `active_provisional.json` and does
+not run confirmation.
+
+Example:
+
+```text
+property is useful across multiple videos
++ one harmful case is context-specific
+→ codebook property is preserved
+→ router updater adds avoidance guidance
+→ next iteration uses the newly rendered router prompt
+```
+
 ### 5.1 Existing property already covers the behavior
 
 If an accepted candidate is semantically covered by an existing property:
@@ -828,6 +894,4 @@ Do not implement before the first main result:
 - trust-region logic;
 - broad file/class renaming;
 - automatic main-experiment execution by the coding agent.
-- feeding compact memory into an LLM codebook updater;
-- changing the router prompt or router-update policy to consume memory;
 - changing property-proposal semantics based on accumulated memory.

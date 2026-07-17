@@ -16,6 +16,9 @@ from surrogate_rollout.prompt_routing.schemas import (
     dumps_canonical,
 )
 from surrogate_rollout.schemas import sha256_text
+from surrogate_rollout.prompt_routing.structured_router_policy import (
+    validate_rendered_prompt_configuration,
+)
 
 
 REQUEST_SCHEMA_VERSION = "history_aware_vlm_router_request_v1"
@@ -158,6 +161,7 @@ class HistoryAwareVLMRouter:
         active_property_ids = tuple(entry.prompt_id for entry in active)
         output_schema = build_router_output_schema(
             active_property_ids, limit)
+        validate_rendered_prompt_configuration(router_policy, prompt_bank)
         request = {
             "schema_version": REQUEST_SCHEMA_VERSION,
             "current_segment": {
@@ -186,11 +190,23 @@ class HistoryAwareVLMRouter:
                 "evidence": item.get("evidence"),
                 "context_hash": item.get("context_hash"),
             } for item in supervision)
-        prompt = (
-            "Select zero or more active caption properties for the current "
-            "video segment. Return only strict JSON matching output_schema; "
-            "do not use Markdown or add keys.\n" + dumps_canonical(request)
-        )
+        rendered_prompt = router_policy.configuration.get("rendered_router_prompt")
+        if rendered_prompt:
+            request["router_prompt_identity"] = {
+                "structured_policy_schema_version": router_policy.configuration[
+                    "structured_router_policy_schema_version"],
+                "renderer_version": router_policy.configuration[
+                    "router_prompt_renderer_version"],
+                "rendered_prompt_hash": router_policy.configuration[
+                    "rendered_router_prompt_hash"],
+            }
+            prompt_prefix = str(rendered_prompt)
+        else:
+            prompt_prefix = (
+                "Select zero or more active caption properties for the current "
+                "video segment. Return only strict JSON matching output_schema; "
+                "do not use Markdown or add keys.")
+        prompt = prompt_prefix + "\n" + dumps_canonical(request)
         raw = self.vlm.caption(
             frames,
             prompt,
@@ -211,7 +227,8 @@ class HistoryAwareVLMRouter:
             raise HistoryAwareRouterError(
                 f"router selected {len(selected)} properties; maximum is {limit}")
 
-        request_hash = sha256_text(dumps_canonical(request))
+        request_hash = sha256_text(
+            prompt if rendered_prompt else dumps_canonical(request))
         output_hash = sha256_text(raw)
         self.last_exchange = RouterExchange(
             request=request, request_hash=request_hash,
@@ -232,5 +249,7 @@ class HistoryAwareVLMRouter:
                 "raw_output": raw,
                 "deduplicated_property_ids": selected,
                 "stable_order": "active_codebook_order",
+                "rendered_router_prompt_hash": router_policy.configuration.get(
+                    "rendered_router_prompt_hash"),
             },
         )
