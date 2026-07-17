@@ -10,7 +10,10 @@ from typing import Any, Callable, Mapping
 
 from surrogate_rollout import config
 from surrogate_rollout.captioning.candidate_captions import build_clip_index
-from surrogate_rollout.evaluation.dvd_qa import run_dvd_qa
+from surrogate_rollout.evaluation.dvd_qa import (
+    dvd_qa_execution_identity,
+    run_dvd_qa,
+)
 from surrogate_rollout.mixed_views.builder import MixedViewBuilder
 from surrogate_rollout.optimization.property_proposal import CandidatePropertyProposal
 from surrogate_rollout.prompt_routing.intervention_composer import (
@@ -617,5 +620,5 @@ class PropertyInterventionBatchRunner:
         name = getattr(self.qa_fn, "__qualname__", type(self.qa_fn).__qualname__)
         return {
             "runner": f"{module}.{name}",
-            "dvd_max_iterations": dvd_max_iterations,
+            **dvd_qa_execution_identity(dvd_max_iterations),
         }

@@ -144,6 +144,12 @@ PROPERTY_PROPOSAL_MAX_CAPTIONS = 30
 PROPERTY_PROPOSAL_MAX_TEXT_CHARS = 240
 PROPERTY_RETRIEVAL_TOP_K = 5
 
+# Downstream DVD caption-database retrieval.  The model-facing tool still
+# exposes top_k for compatibility, but the harness deterministically executes
+# every clip_search_tool call with this value.
+DVD_CLIP_SEARCH_TOP_K = 16
+DVD_CLIP_SEARCH_POLICY_VERSION = "fixed_clip_search_top_k_v1"
+
 # CLIP retrieval defaults (PHASE2_3 §9-10)
 RETRIEVAL_TOP_K = 8
 DEFAULT_SELECTION_POLICY = "trace_plus_prompt_delta_clip"

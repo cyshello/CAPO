@@ -14,7 +14,10 @@ from surrogate_rollout.captioning.history_aware_baseline import (
     DEFAULT_MAX_HISTORY_CAPTIONS,
     HistoryAwareBaselineCaptionViewBuilder,
 )
-from surrogate_rollout.evaluation.dvd_qa import run_dvd_qa
+from surrogate_rollout.evaluation.dvd_qa import (
+    dvd_qa_execution_identity,
+    run_dvd_qa,
+)
 from surrogate_rollout.optimization.iteration_state import (
     ComponentVersions,
     ProvisionalIterationState,
@@ -252,6 +255,7 @@ class BaselinePhaseRunner:
             "parent_confirmed_checkpoint_id": parent_confirmed_checkpoint_id,
             "property_retrieval_policy_version": getattr(
                 self.property_retrieval_runner, "policy_version", None),
+            "downstream_qa": dvd_qa_execution_identity(dvd_max_iterations),
         }
         if bounded_smoke_video_id is not None:
             input_identity["execution_scope"] = execution_scope

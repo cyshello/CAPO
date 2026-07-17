@@ -637,6 +637,19 @@ Schemas are `memory_production_iteration_plan_v1`,
 `production_worker_cleanup_v1`. Confirmation and confirmed-pointer promotion
 remain explicit, separate, and are not run by this launcher.
 
+### 3.19 Fixed downstream DVD clip-search budget
+
+Previously, the DVD tool schema advised the QA model to use its default
+`clip_search_tool` budget, but the model could explicitly request any `top_k`.
+The vendored `OVERWRITE_CLIP_SEARCH_TOPK` path also checks the misspelled key
+`topk`, so it does not constrain the actual `top_k` argument. The harness now
+forces every executed DVD clip search to `top_k=16` at the instrumentation
+boundary without editing vendored DVD code. Raw model arguments stay in the
+trajectory; tool events retain both requested and executed arguments plus
+`fixed_clip_search_top_k_v1`. The value and policy version enter baseline,
+intervention, confirmation, and production resume identities. Phase 4
+property-frame retrieval top-k remains a separate setting.
+
 ## 4. Required tests
 
 Add focused tests for:

@@ -11,6 +11,10 @@ from surrogate_rollout.instrumentation import (
     _wrap_frame_inspect,
     _wrap_retrieval_tool,
 )
+from surrogate_rollout.evaluation.dvd_qa import (
+    _constrain_clip_search_schema,
+    dvd_qa_execution_identity,
+)
 
 
 class FakeDB:
@@ -47,6 +51,45 @@ def test_hits_captured_and_result_unchanged():
     assert ev["n_hits"] == 3
     assert ev["hits"][0]["time_start_secs"] == 0.0
     assert ev["error"] is None
+
+
+def test_clip_search_top_k_is_forced_and_requested_value_is_preserved():
+    rec = RunRecorder()
+    wrapped = _wrap_retrieval_tool(
+        clip_search_tool, rec, forced_top_k=16)
+    db = FakeDB(HITS * 4)
+    out = wrapped(database=db, event_description="x", top_k=5)
+    assert out == "16 captions"
+    event = rec.tool_events[0]
+    assert event["args"]["top_k"] == 16
+    assert event["requested_args"]["top_k"] == 5
+    assert event["argument_override"] == {
+        "field": "top_k", "executed_value": 16,
+        "policy_version": "fixed_clip_search_top_k_v1",
+    }
+
+
+def test_clip_search_schema_and_execution_identity_are_fixed_to_16():
+    class Agent:
+        function_schemas = [{
+            "function": {
+                "name": "clip_search_tool",
+                "parameters": {"properties": {"top_k": {
+                    "type": "integer", "description": "model selected",
+                }}},
+            },
+        }]
+
+    agent = Agent()
+    _constrain_clip_search_schema(agent, 16)
+    field = agent.function_schemas[0]["function"]["parameters"][
+        "properties"]["top_k"]
+    assert field["enum"] == [16]
+    assert field["default"] == 16
+    identity = dvd_qa_execution_identity(10)
+    assert identity["clip_search_top_k"] == 16
+    assert identity["clip_search_policy_version"] == \
+        "fixed_clip_search_top_k_v1"
 
 
 def test_query_method_restored_after_call():

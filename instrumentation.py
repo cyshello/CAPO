@@ -28,6 +28,8 @@ import json
 import time
 from typing import Any
 
+from surrogate_rollout import config
+
 
 class RunRecorder:
     def __init__(self) -> None:
@@ -75,9 +77,14 @@ def _hit_record(hit: dict) -> dict:
     }
 
 
-def _wrap_retrieval_tool(tool, recorder: RunRecorder):
+def _wrap_retrieval_tool(
+    tool, recorder: RunRecorder, *, forced_top_k: int | None = None,
+):
     @functools.wraps(tool)
     def wrapped(database, **kwargs):
+        requested_kwargs = dict(kwargs)
+        if forced_top_k is not None:
+            kwargs["top_k"] = forced_top_k
         hits: list[dict] = []
         orig_query = database.query
 
@@ -96,14 +103,21 @@ def _wrap_retrieval_tool(tool, recorder: RunRecorder):
             raise
         finally:
             database.query = orig_query
-            recorder.tool_events.append({
+            event = {
                 "tool": tool.__name__,
                 "args": {k: v for k, v in kwargs.items()},
                 "hits": [_hit_record(h) for h in hits],
                 "n_hits": len(hits),
                 "latency_seconds": time.time() - t0,
                 "error": error,
-            })
+            }
+            if forced_top_k is not None:
+                event["requested_args"] = requested_kwargs
+                event["argument_override"] = {
+                    "field": "top_k", "executed_value": forced_top_k,
+                    "policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
+                }
+            recorder.tool_events.append(event)
         return result
 
     return wrapped
@@ -178,7 +192,9 @@ def _wrap_router_factory(make_router, recorder: RunRecorder):
     return factory
 
 
-def install(recorder: RunRecorder | None = None) -> RunRecorder:
+def install(
+    recorder: RunRecorder | None = None, *, clip_search_top_k: int | None = None,
+) -> RunRecorder:
     """Patch dvd_core tool names and dvd_backend.make_router. Call BEFORE
     run_dvd (agent binds tools at construction). Idempotent per recorder."""
     import dvd.dvd_core as dvd_core
@@ -191,7 +207,10 @@ def install(recorder: RunRecorder | None = None) -> RunRecorder:
     orig_inspect = dvd_core.frame_inspect_tool
     orig_factory = dvd_backend.make_router
 
-    dvd_core.clip_search_tool = _wrap_retrieval_tool(orig_clip, rec)
+    if clip_search_top_k is not None and clip_search_top_k < 1:
+        raise ValueError("clip_search_top_k must be positive")
+    dvd_core.clip_search_tool = _wrap_retrieval_tool(
+        orig_clip, rec, forced_top_k=clip_search_top_k)
     dvd_core.global_browse_tool = _wrap_retrieval_tool(orig_browse, rec)
     dvd_core.frame_inspect_tool = _wrap_frame_inspect(orig_inspect, rec)
     dvd_backend.make_router = _wrap_router_factory(orig_factory, rec)

@@ -197,6 +197,8 @@ class HistoryAwareDVDConfirmationEvaluator:
             "text_fallback_model": config.TEXT_FALLBACK_MODEL,
             "tool_vlm_max_frames": config.TOOL_VLM_MAX_FRAMES,
             "use_transcript": config.USE_TRANSCRIPT,
+            "clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
+            "clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
         }
         downstream_extra = as_json_dict(downstream_qa_configuration or {})
         conflicting = {
@@ -272,6 +274,8 @@ class HistoryAwareDVDConfirmationEvaluator:
             "text_fallback_model": config.TEXT_FALLBACK_MODEL,
             "tool_vlm_max_frames": config.TOOL_VLM_MAX_FRAMES,
             "use_transcript": config.USE_TRANSCRIPT,
+            "clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
+            "clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
         }
         if live_dvd != self._dvd_runtime_defaults:
             raise ConfirmationEvaluationConflictError(

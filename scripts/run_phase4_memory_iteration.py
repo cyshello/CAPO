@@ -411,6 +411,8 @@ def main() -> None:
         "retrieval_device": "cpu",
         "max_proposals_per_video": args.max_proposals_per_video,
         "property_retrieval_top_k": args.property_retrieval_top_k,
+        "dvd_clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
+        "dvd_clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
         "codebook_updater_prompt_version": "memory_codebook_updater_prompt_v1",
         "router_updater_prompt_version": "memory_router_updater_prompt_v1",
         "structured_router_policy_version": "structured_router_policy_v1",

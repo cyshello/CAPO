@@ -123,6 +123,13 @@ proxy and must never lazily initialize another local Qwen/vLLM engine. Without
 an active pool, the original standalone `dvd_backend.get_captioner()` behavior
 is unchanged.
 
+Downstream DVD caption-database retrieval is also fixed across policies.
+Every `clip_search_tool` call executes with `top_k=16`, even if the tool-calling
+model supplies another value or omits it. The raw requested arguments remain
+in the trajectory, while `tool_events.jsonl` records the normalized executed
+arguments and the override policy. This setting is separate from Phase 4
+property-frame retrieval and is part of QA cache/resume identity.
+
 ## 3. One optimization iteration
 
 At iteration \(k\), snapshot the current policy:

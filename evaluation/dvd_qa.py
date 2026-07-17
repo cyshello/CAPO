@@ -32,6 +32,34 @@ for _p in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
 _BACKEND_INSTALLED = False
 
 
+def dvd_qa_execution_identity(max_iterations: int) -> dict[str, object]:
+    return {
+        "policy_version": "dvd_qa_execution_v2",
+        "dvd_max_iterations": int(max_iterations),
+        "clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
+        "clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
+    }
+
+
+def _constrain_clip_search_schema(agent: object, top_k: int) -> None:
+    """Tell the tool-calling model the same value enforced at execution."""
+    schemas = getattr(agent, "function_schemas", ())
+    for schema in schemas:
+        function = schema.get("function") or {}
+        if function.get("name") != "clip_search_tool":
+            continue
+        properties = (function.get("parameters") or {}).get("properties") or {}
+        field = properties.get("top_k")
+        if not isinstance(field, dict):
+            raise RuntimeError("DVD clip_search_tool schema is missing top_k")
+        field["enum"] = [top_k]
+        field["default"] = top_k
+        field["description"] = (
+            f"Fixed by the execution policy. Always use {top_k}.")
+        return
+    raise RuntimeError("DVD clip_search_tool schema is missing")
+
+
 def ensure_backend(
     gpu: str | None = None,
     *,
@@ -170,12 +198,14 @@ def run_dvd_qa(
     clip_keys = [k for k in captions
                  if k not in ("subject_registry", "character_registry")]
 
-    recorder = instrumentation.install()
+    recorder = instrumentation.install(
+        clip_search_top_k=config.DVD_CLIP_SEARCH_TOP_K)
     t0 = time.time()
     messages: list[dict] = []
     errors: list[dict] = []
     try:
         agent = DVDCoreAgent(db_path, captions_path, max_iterations)
+        _constrain_clip_search_schema(agent, config.DVD_CLIP_SEARCH_TOP_K)
         messages = agent.run(question)
     except Exception as e:
         import traceback
@@ -227,6 +257,8 @@ def run_dvd_qa(
         json.dump(refs.as_json(), f, indent=2)
     result_json = result.as_json()
     result_json.pop("trajectory")
+    result_json["qa_execution_identity"] = dvd_qa_execution_identity(
+        max_iterations)
     with open(os.path.join(run_dir, "result.json"), "w") as f:
         json.dump(result_json, f, indent=2, default=str)
     return result

@@ -855,6 +855,13 @@ interruption, and completed resume. Router/update failure cannot create the
 top-level completed manifest or a codebook-only policy pair. Raw stage
 artifacts remain in place for diagnosis and exact stage resume.
 
+All new QA runs deterministically execute DVD `clip_search_tool` with
+`top_k=16`. This is `DVD_CLIP_SEARCH_TOP_K`, not
+`--property-retrieval-top-k`. If the model requests another value, the raw
+trajectory preserves that request and `tool_events.jsonl` records
+`requested_args`, executed `args.top_k=16`, and the override policy. Runs made
+before this policy are intentionally identity-incompatible with new runs.
+
 The underlying active execution boundary remains
 `Checkpoint3EOrchestrator.with_real_confirmation(...)`, which wires
 `HistoryAwareDVDConfirmationEvaluator` to the same history-aware builder and
