@@ -748,7 +748,7 @@ def test_history_router_receives_compact_supervision_without_qa_data():
         def __init__(self):
             self.prompt = None
 
-        def caption(self, frames, prompt, max_tokens):
+        def caption(self, frames, prompt, max_tokens, **kwargs):
             self.prompt = prompt
             return '{"property_ids": []}'
 

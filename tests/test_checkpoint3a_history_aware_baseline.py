@@ -19,6 +19,8 @@ from surrogate_rollout.prompt_routing.persistence import (
 from surrogate_rollout.prompt_routing.policies.history_aware_vlm_router import (
     HistoryAwareRouterError,
     HistoryAwareVLMRouter,
+    STRUCTURED_OUTPUT_VERSION,
+    build_router_output_schema,
     parse_router_output,
 )
 from surrogate_rollout.prompt_routing.schemas import SegmentContext
@@ -77,12 +79,46 @@ def test_router_strict_json_deduplicates_and_restores_codebook_order():
     assert "SECRET ANSWER" not in request_prompt
     assert "used_segments" not in request_prompt
     assert vlm.calls[0][0] == ("frame-0.jpg",)
+    schema = vlm.calls[0][2]["json_schema"]
+    assert schema == build_router_output_schema(
+        tuple(entry.prompt_id for entry in bank.entries if entry.status == "active"),
+        3,
+    )
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["property_ids"]["maxItems"] == 3
     request = json.loads(request_prompt.split("\n", 1)[1])
     assert set(request) == {
         "active_codebook", "current_segment", "max_selected_properties",
         "output_schema", "preceding_caption_history", "schema_version",
     }
     assert request["max_selected_properties"] == 3
+    assert request["output_schema"] == schema
+    assert HistoryAwareVLMRouter(vlm).configuration_identity[
+        "structured_output"]["version"] == STRUCTURED_OUTPUT_VERSION
+
+
+def test_qwen_sampling_enforces_json_schema_without_fallback():
+    from surrogate_rollout.captioning.qwen25_vl import Qwen25VLCaptioner
+
+    captioner = object.__new__(Qwen25VLCaptioner)
+    captioner.default_max_tokens = 256
+    schema = build_router_output_schema(("pe_default",), 1)
+    sampling = captioner._sampling(
+        64, 0.0, 1.0, json_schema=schema)
+
+    assert sampling.structured_outputs.json == schema
+    assert sampling.structured_outputs.disable_fallback is True
+    assert sampling.structured_outputs.disable_additional_properties is True
+
+
+def test_qwen_sampling_remains_unconstrained_without_schema():
+    from surrogate_rollout.captioning.qwen25_vl import Qwen25VLCaptioner
+
+    captioner = object.__new__(Qwen25VLCaptioner)
+    captioner.default_max_tokens = 256
+    sampling = captioner._sampling(64, 0.0, 1.0)
+
+    assert sampling.structured_outputs is None
 
 
 def test_empty_property_ids_uses_only_base_caption_prompt():
@@ -231,3 +267,179 @@ def test_sequential_history_is_shared_persisted_cached_and_resumable(tmp_path):
     assert len(vlm.calls) == before
     assert resumed.resumed_segment_count == 3
     assert resumed.router_call_count == resumed.caption_call_count == 0
+
+
+def test_parallel_captioning_schedules_history_blocks_and_merges_deterministically(
+        tmp_path):
+    bank, policy, scaffold, contract = components()
+    worker_calls = {}
+
+    def fixture_executor(assignments, common):
+        manifests = []
+        worker_bank = prompt_bank_from_json(common["prompt_bank"])
+        worker_policy = router_policy_from_json(common["router_policy"])
+        worker_scaffold = scaffold_policy_from_json(common["scaffold_policy"])
+        worker_contract = scaffold_contract_from_json(common["scaffold_contract"])
+        for gpu, jobs in assignments:
+            vlm = SharedMockVLM()
+            worker_calls[gpu] = vlm.calls
+            worker = HistoryAwareBaselineCaptionViewBuilder(
+                router=HistoryAwareVLMRouter(vlm),
+                segment_captioner=HistoryAwareSegmentCaptioner(vlm),
+                merge_fn=lambda values: {"merged_count": len(values)},
+            )
+            for _, block_clips, block_root, fragment_path in jobs:
+                artifact = worker.build(
+                    sample=common["sample"], clip_index=list(block_clips),
+                    prompt_bank=worker_bank, router_policy=worker_policy,
+                    scaffold_policy=worker_scaffold,
+                    scaffold_contract=worker_contract,
+                    base_prompt_template=common["base_prompt_template"],
+                    merge_prompt=common["merge_prompt"], work_root=block_root,
+                    history_block_seconds=common["history_block_seconds"],
+                    max_history_captions=common["max_history_captions"],
+                    candidate_cache_root=common["candidate_cache_root"],
+                    cache_manifest_path=fragment_path,
+                )
+                manifests.append(artifact.routing_manifest_path)
+        return tuple(manifests)
+
+    parent_vlm = SharedMockVLM()
+    builder = HistoryAwareBaselineCaptionViewBuilder(
+        router=HistoryAwareVLMRouter(parent_vlm),
+        segment_captioner=HistoryAwareSegmentCaptioner(parent_vlm),
+        merge_fn=lambda values: {"merged_count": len(values)},
+        parallel_gpus=("4", "5"), parallel_executor=fixture_executor,
+    )
+    clips = [
+        ("0_10", {"files": [tmp_path / "f0.jpg"], "transcript": "zero"}),
+        ("10_20", {"files": [tmp_path / "f1.jpg"], "transcript": "one"}),
+        ("300_310", {"files": [tmp_path / "f2.jpg"], "transcript": "two"}),
+        ("600_610", {"files": [tmp_path / "f3.jpg"], "transcript": "three"}),
+    ]
+    sample = {
+        "sample_id": "sample", "video_path": str(tmp_path / "video.mp4"),
+        "extra": {"videoID": "video-1", "subtitle_path": None},
+    }
+    artifact = builder.build(
+        sample=sample, clip_index=clips, prompt_bank=bank,
+        router_policy=policy, scaffold_policy=scaffold,
+        scaffold_contract=contract,
+        base_prompt_template=(
+            "TRANSCRIPT_PLACEHOLDER CLIP_START_TIME CLIP_END_TIME "
+            "ROUTED_INSTRUCTIONS_PLACEHOLDER"),
+        merge_prompt="merge", work_root=str(tmp_path / "parallel"),
+        history_block_seconds=300, max_history_captions=30,
+        candidate_cache_root=str(tmp_path / "cache"),
+        cache_manifest_path=str(tmp_path / "cache_manifest.jsonl"),
+    )
+
+    assert parent_vlm.calls == []
+    assert set(worker_calls) == {"4", "5"}
+    assert artifact.segment_ids == tuple(segment_id for segment_id, _ in clips)
+    histories = [json.loads(line) for line in
+                 Path(artifact.frozen_histories_path).read_text().splitlines()]
+    assert [item["preceding_segment_ids"] for item in histories] == [
+        [], ["0_10"], [], []]
+    manifest = json.loads(Path(artifact.routing_manifest_path).read_text())
+    assert manifest["parallel_captioning"] == {
+        "scheduler_version": "history_block_gpu_scheduler_v1",
+        "unit": "history_block", "worker_count": 2,
+        "gpu_ids": ["4", "5"], "block_count": 3,
+        "merge_order": "ascending_segment_start",
+    }
+    assert manifest["router_calls"] == manifest["caption_calls"] == 4
+    assert len(Path(tmp_path / "cache_manifest.jsonl").read_text().splitlines()) == 4
+    captions = json.loads(Path(artifact.captions_path).read_text())
+    assert captions["subject_registry"] == {"merged_count": 4}
+
+    reassigned = HistoryAwareBaselineCaptionViewBuilder(
+        router=HistoryAwareVLMRouter(parent_vlm),
+        segment_captioner=HistoryAwareSegmentCaptioner(parent_vlm),
+        merge_fn=lambda values: {"merged_count": len(values)},
+        parallel_gpus=("7", "6"), parallel_executor=fixture_executor,
+    ).build(
+        sample=sample, clip_index=clips, prompt_bank=bank,
+        router_policy=policy, scaffold_policy=scaffold,
+        scaffold_contract=contract,
+        base_prompt_template=(
+            "TRANSCRIPT_PLACEHOLDER CLIP_START_TIME CLIP_END_TIME "
+            "ROUTED_INSTRUCTIONS_PLACEHOLDER"),
+        merge_prompt="merge", work_root=str(tmp_path / "parallel"),
+        history_block_seconds=300, max_history_captions=30,
+        candidate_cache_root=str(tmp_path / "cache"),
+        cache_manifest_path=str(tmp_path / "cache_manifest.jsonl"),
+    )
+    assert reassigned.captions_hash == artifact.captions_hash
+    assert reassigned.resumed_segment_count == 4
+    assert reassigned.router_call_count == reassigned.caption_call_count == 0
+    assert len(Path(tmp_path / "cache_manifest.jsonl").read_text().splitlines()) == 4
+    reassigned_manifest = json.loads(
+        Path(reassigned.routing_manifest_path).read_text())
+    assert reassigned_manifest["parallel_captioning"]["gpu_ids"] == ["7", "6"]
+
+
+def test_parallel_gpu_ids_must_be_unique(tmp_path):
+    vlm = SharedMockVLM()
+    with pytest.raises(ValueError, match="unique"):
+        HistoryAwareBaselineCaptionViewBuilder(
+            router=HistoryAwareVLMRouter(vlm),
+            segment_captioner=HistoryAwareSegmentCaptioner(vlm),
+            parallel_gpus=("4", "4"),
+        )
+
+
+def test_segment_captioner_can_reuse_persistent_remote_worker():
+    class ForbiddenLocalVLM:
+        def caption(self, *_args, **_kwargs):
+            raise AssertionError("persistent dispatch must not load a parent VLM")
+
+    class RemoteDispatcher:
+        def __init__(self):
+            self.calls = []
+
+        def caption_segment(self, **kwargs):
+            self.calls.append(kwargs)
+            return "remote-result"
+
+    remote = RemoteDispatcher()
+    captioner = HistoryAwareSegmentCaptioner(
+        ForbiddenLocalVLM(), remote_dispatcher=remote)
+    result = captioner.caption(
+        sample={"video_path": "video.mp4"}, video_id="video-1",
+        segment_id="0_10", clip_info={"files": ["frame.jpg"]},
+        composed_prompt=object(), history_snapshot={"history_hash": "h"},
+        merge_prompt="merge")
+
+    assert result == "remote-result"
+    assert remote.calls[0]["segment_id"] == "0_10"
+
+
+def test_dvd_raw_frame_inspection_uses_pool_proxy_and_standalone_is_preserved():
+    import dvd_backend
+
+    vlm = SharedMockVLM()
+    builder = HistoryAwareBaselineCaptionViewBuilder(
+        router=HistoryAwareVLMRouter(vlm),
+        segment_captioner=HistoryAwareSegmentCaptioner(vlm),
+        parallel_gpus=("4", "5"),
+    )
+    original = dvd_backend._captioner
+    standalone = object()
+    try:
+        dvd_backend._captioner = standalone
+        assert dvd_backend.get_captioner() is standalone
+        assert builder._parent_dvd_backend is None
+
+        dvd_backend._captioner = None
+        calls = []
+        builder.caption_raw_vlm = lambda **kwargs: calls.append(kwargs) or "remote"
+        builder._install_parent_vlm_proxy()
+        assert dvd_backend.get_captioner().caption(
+            ["frame.jpg"], "inspect", max_tokens=512) == "remote"
+        assert calls == [{
+            "images": ["frame.jpg"], "prompt": "inspect", "max_tokens": 512}]
+        builder._restore_parent_vlm_proxy()
+        assert dvd_backend._captioner is None
+    finally:
+        dvd_backend._captioner = original

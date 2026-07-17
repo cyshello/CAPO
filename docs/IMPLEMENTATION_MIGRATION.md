@@ -115,6 +115,38 @@ the current policy and persists:
 
 Do not derive candidate histories from recaptioned outputs.
 
+`HistoryAwareBaselineCaptionViewBuilder` supports optional history-block data
+parallelism. With more than one configured GPU it spawns one process per active
+GPU, initializes one persistent local Qwen/vLLM backend in that process, and
+assigns complete history blocks round-robin. Segments remain sequential within
+a block. The parent performs a deterministic source-order merge only after all
+blocks complete. Per-worker cache-manifest fragments avoid concurrent append
+corruption and are checked and merged into the configured manifest by the
+parent. Block artifacts are stable resume units; changing worker/GPU assignment
+does not change semantic cache keys.
+
+Workers remain alive for the complete run and accept both full-history-block
+and selective-segment caption commands. Do not join them between stages: the
+parent advances after receiving task completion records and reuses the loaded
+engines for later videos/interventions. At the run boundary, request an
+explicit worker shutdown, call the vLLM EngineCore shutdown path, then join with
+a bounded termination fallback. A worker task failure fails that task without
+silently loading a second parent-process Qwen instance.
+
+Route DVD `frame_inspect_tool` raw vision requests through the same pool by
+installing a parent-process captioner proxy only while the pool is active.
+Preserve standalone lazy Qwen initialization when no pool exists. Baseline QA
+completion is fail-closed: any runtime/tool error, null prediction, or parse
+failure prevents the property proposer from being called, even though all
+three QA attempts and their failure artifacts are persisted first.
+
+The history-aware Qwen router must pass a per-codebook JSON Schema to vLLM
+structured decoding. The schema allows only `property_ids`, restricts values to
+the frozen active property IDs, and enforces the current maximum array length.
+Use structured-output decoding with fallback disabled. Do not apply this
+constraint to normal caption generation, and include the structured-output
+policy/version in router configuration identity.
+
 ### 3.3 Property proposal stage
 
 Adapt `optimization/policies/llm_feedback.py` or add a narrowly scoped property
@@ -122,10 +154,13 @@ proposal policy.
 
 Input per source video:
 
-- all baseline QA outcomes;
-- prioritize incorrect QA evidence;
-- relevant reasoning excerpts;
-- relevant incumbent captions and frames;
+- all baseline QA outcomes, ordered to prioritize incorrect QA evidence;
+- question, choices, ground truth, and baseline prediction without question ID;
+- at most three sanitized reasoning events per QA, excluding tool-call IDs and
+  source/question/segment identifiers;
+- at most three actual used-segment evidence items per QA, each containing one
+  deterministic representative frame and its incumbent caption without the
+  segment ID;
 - current codebook.
 
 Output:
@@ -138,6 +173,16 @@ Output:
 - reusable property instruction.
 
 Do not directly mutate the codebook.
+
+Do not send source-video ID, question ID, segment ID, provider priority rank,
+tool-call ID, or payload-truncation metadata. Preserve these only in a private
+`input_identity.json` used for lineage and resume identity. Bound reasoning
+event count/characters, evidence count, caption characters, transformed image
+bytes, and total text characters before the provider call. `request.json`
+stores the logical source-free multimodal input; `provider_request.json` stores
+the exact secret-free OpenAI request body, including data-URL image blocks.
+Attach source video and all three source QA IDs internally after strict output
+parsing rather than asking the model to repeat them.
 
 ### 3.4 Similarity retrieval
 

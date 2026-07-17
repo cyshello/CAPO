@@ -2,7 +2,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from surrogate_rollout.optimization.baseline_phase import BaselinePhaseRunner
+import pytest
+
+from surrogate_rollout.optimization.baseline_phase import (
+    BaselinePhaseRunner,
+    qa_execution_failure_reasons,
+)
 from surrogate_rollout.optimization.property_proposal import (
     CandidatePropertyProposal,
 )
@@ -178,6 +183,8 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
         assert len(histories) == 2
         assert json.loads(histories[0])["preceding_segment_ids"] == []
         assert json.loads(histories[1])["preceding_segment_ids"] == ["0_10"]
+
+
     summary = json.loads(Path(result.manifest_path).read_text())
     assert summary["calls"] == {
         "confirmation_evaluations": 0,
@@ -256,3 +263,67 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
     assert resumed_later_mode.resumed is True
     assert bounded_captioner.calls == [bounded_video]
     assert len(bounded_proposer.calls) == len(bounded_retrieval.calls) == 1
+
+
+def test_baseline_qa_execution_failure_blocks_property_proposer(tmp_path):
+    manifest = json.loads((ROOT / "split_manifest.json").read_text())
+    roles = derive_train_roles(manifest)
+    video = roles.evidence_videos[0]
+    samples = {}
+    for index, question_id in zip(video.provider_indices, video.question_ids):
+        samples[index] = {
+            "sample_id": f"sample-{index}", "question": f"question {index}",
+            "answer": "A", "options": ["A", "B"],
+            "video_path": f"/video/{video.video_id}.mp4",
+            "extra": {"videoID": video.video_id, "subtitle_path": None},
+            "question_id": question_id,
+        }
+    qa_calls = []
+
+    def qa_fn(**kwargs):
+        qa_calls.append(kwargs["question_id"])
+        failed = len(qa_calls) == 2
+        return DVDRunResult(
+            question_id=kwargs["question_id"], video_id=video.video_id,
+            prediction=None if failed else "A",
+            parsed_answer=None if failed else "A", ground_truth="A",
+            score=0.0 if failed else 1.0, trajectory=[],
+            references=ReferenceSets(), total_segments=1, token_usage={},
+            latency_seconds=0.01, caption_cache_tag="fixture",
+            captions_path=kwargs["captions_path"],
+            database_path=kwargs["database_path"],
+            errors=([{"stage": "dvd_qa", "type": "RuntimeError"}]
+                    if failed else []))
+
+    proposer = FixtureProposalPolicy()
+    runner = BaselinePhaseRunner(
+        routing_fn=lambda **kwargs: SimpleNamespace(
+            composed_prompts=tuple(SimpleNamespace(
+                segment_id=item.segment_id,
+                prompt_text="prompt TRANSCRIPT_PLACEHOLDER")
+                for item in kwargs["contexts"]),
+            manifest_path=str(tmp_path / "routing.json")),
+        caption_view_builder=FakeCaptionViewBuilder(), qa_fn=qa_fn,
+        clip_index_fn=lambda *_args: [("0_10", {"files": ["frame.jpg"]})],
+        proposal_policy=proposer)
+    bank, router, scaffold, contract = components()
+    with pytest.raises(RuntimeError, match="before property proposal"):
+        runner.run(
+            roles=roles, coverage_state=initial_coverage(roles),
+            sample_loader=samples.__getitem__, prompt_bank=bank,
+            router_policy=router, scaffold_policy=scaffold,
+            scaffold_contract=contract, phase4_config=Phase4Config(),
+            base_prompt_template="base", merge_prompt="merge",
+            output_dir=str(tmp_path / "failed"),
+            parent_confirmed_checkpoint_id="confirmed",
+            bounded_smoke_video_id=video.video_id)
+
+    assert len(qa_calls) == 3
+    assert proposer.calls == []
+    failure = json.loads((tmp_path / "failed" / "baseline" / video.video_id /
+                          "baseline_qa_failures.json").read_text())
+    assert failure["property_proposer_called"] is False
+    assert failure["qa_failures"][0]["reasons"] == [
+        "runtime_or_parse_errors", "null_prediction", "parse_failure"]
+    assert qa_execution_failure_reasons({
+        "prediction": "B", "parsed_answer": "B", "errors": []}) == ()

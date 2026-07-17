@@ -61,6 +61,8 @@ Checkpoint 3B artifacts:
 <iteration>/
 ├── property_proposals/<video_id>/model_artifacts/
 │   ├── request.json
+│   ├── input_identity.json
+│   ├── provider_request.json
 │   ├── raw_output.txt
 │   ├── parsed_output.json
 │   ├── rejections.json
@@ -232,6 +234,8 @@ The final command must cover:
 ```bash
 conda run -n local_llm_vllm python -m pytest -q \
   tests/test_checkpoint3e_final_iteration.py \
+  tests/test_startup_models.py \
+  tests/test_bounded_smoke.py \
   tests/test_checkpoint3d_interventional_feedback.py \
   tests/test_checkpoint3c_property_intervention.py \
   tests/test_checkpoint3b_property_proposal.py \
@@ -271,45 +275,141 @@ Confirm that artifacts show:
 
 ## 5. One-video bounded smoke
 
-Prerequisite: export `OPENAI_API_KEY`. All three commands use evidence video
+Prerequisite: store `OPENAI_API_KEY` in the repository-local `.env` with file
+mode `600`. The commands use `python-dotenv` to inject it only into the child
+process; they never print or persist the key. All three commands use evidence video
 `0RxMZBLeqRI` and its three frozen train QAs, `max_proposals=1`, retrieval
 top-k one, and at most one intervention. Output, state, and cache roots are
 separate siblings. Reuse the same three paths when progressing modes.
 
+The first 2026-07-17 pre-schema attempt reached real-model startup validation on GPU
+4 but stopped on the first segment because unconstrained Qwen output was not
+strict JSON. Its partial immutable roots are
+`runs/phase4_one_video_smoke_{output,state}` and must not be reused or
+overwritten. Router version `router_v9002` uses vLLM JSON Schema structured
+decoding with fallback disabled.
+
+The second 2026-07-17 attempt validated schema-constrained routing over all 184
+segments and completed all three baseline QAs. It then stopped before the
+OpenAI property-proposal call because the 71,767-character request exceeded the
+40,000-character hard limit. Its partial immutable output/state roots are
+`runs/phase4_one_video_smoke_json_{output,state}`. Proposer version
+`multi_property_proposer_v2` now persists deterministic truncation metadata and
+reduces that frozen request to 23,878 characters by retaining three reasoning
+events per QA and twelve relevant captions. Use the new `*_json_v2_*`
+output/state roots below. Reuse the identity-matched
+`runs/phase4_one_video_smoke_json_cache`; completed caption entries are
+immutable and avoid regenerating the same 184 captions.
+
+The third 2026-07-17 `qa_only` invocation completed successfully at
+`runs/phase4_one_video_smoke_json_v2_output/run_manifest.json`. It validated
+184 schema-constrained router calls, 184 caption-cache hits, three baseline QAs,
+the 23,783-character persisted proposal request, and zero confirmation calls.
+The provider returned one proposal, which the strict proposal policy rejected
+as already covered by active `pe_default`; therefore retrieval, intervention,
+and candidate-QA work-item lists are valid but empty. This is an allowed
+zero-proposal completion, not evidence that the real intervention path ran.
+
+`multi_property_proposer_v3` supersedes that text-only proposal request. Its
+model-visible input contains no source-video, question, segment, priority,
+tool-call, or truncation identifiers. It sends, per QA, question and
+answer/prediction context, three bounded sanitized reasoning events, and three
+actual used-segment representative images paired with baseline captions, plus
+the current codebook. Offline reconstruction from the v2 baseline produced a
+13,388-character text payload and nine bounded image blocks. Use new
+`*_multimodal_*` output/state roots below; reuse the identity-matched caption
+cache.
+
+History-block-parallel baseline captioning is available through `--gpus`. The
+comma-separated list creates at most one run-scoped persistent Qwen/vLLM worker
+per GPU;
+segments inside each 300-second history block stay sequential, while distinct
+blocks run concurrently. `--gpu` selects the primary GPU for DVD QA; selective
+caption interventions are sent back to the persistent caption pool so the
+parent never loads a competing Qwen instance. Workers remain loaded across
+baseline videos, proposals, retrieval, interventions, and confirmation, and
+shut down only at the explicit run boundary. Each block resumes from
+`history_aware_baseline/parallel_history_blocks/block_<index>/segment_state/`.
+Workers write `worker_<index>_cache_manifest.jsonl` fragments, and only the
+parent merges them into the configured caption manifest after all workers
+succeed. `routing_manifest.json` records the scheduler version, worker/GPU and
+block counts, and deterministic merge rule. GPU assignment is not part of the
+semantic caption-cache key.
+
+The first multi-GPU attempt on 2026-07-17 completed all 184 segment states but
+stalled before the parent merge because the parent joined one-build workers
+whose vLLM EngineCore processes remained alive. The run-scoped worker protocol
+supersedes that lifecycle: the parent consumes completion messages without a
+join, and the bounded runner closes workers in `finally`. Stop the old hung
+invocation, then repeat the exact QA-only command below with the same three
+roots. All completed block states and caption caches resume; do not delete or
+rename them.
+
+That resumed attempt reached QA but exposed a second lifecycle issue: DVD
+`frame_inspect_tool` tried to initialize a parent Qwen on GPU 4 while the
+persistent worker already occupied it. Two QAs failed with null predictions,
+yet the older baseline contract treated them as ordinary incorrect answers and
+called the proposer. The current adapter routes raw frame inspection through
+the worker pool and fails before proposal on runtime errors, null predictions,
+or parse failures. When the exact command below sees the invalid completed QA
+mode, it moves only invalid QA/proposal/retrieval/intervention/mode artifacts to
+`invalid_attempts/qa_execution_failure_<NNN>/`, leaves the 184 caption artifacts
+in place, reruns all three QAs, and regenerates the proposal only after all
+three succeed.
+
+The repaired 2026-07-17 resume completed successfully in `qa_only` mode at
+`runs/phase4_one_video_smoke_parallel_multimodal_output/run_manifest.json`.
+Its merged routing manifest records 184 resumed segments, zero router calls,
+and zero caption calls. All three QA executions returned non-null parsed
+answers with empty error lists: QAs 9 and 11 were correct, and QA 10 was a
+valid incorrect answer. Only then did the v3 proposer regenerate its request
+and provider artifacts. The provider returned `pe_historical_context`, which
+the strict policy rejected as covered by active `pe_default`, so the completed
+mode contains zero accepted proposals and no intervention. The archived failed
+attempt remains recoverable under
+`invalid_attempts/qa_execution_failure_001/`. Confirmation was disabled and no
+production state or coverage pointer was written.
+
+Secure the environment file once:
+
+```bash
+chmod 600 .env
+```
+
 QA only:
 
 ```bash
-conda run -n local_llm_vllm python \
+conda run -n local_llm_vllm python -m dotenv run -- python \
   scripts/run_phase4_bounded_smoke.py \
   --post-intervention-mode qa_only \
-  --video-id 0RxMZBLeqRI --gpu 0 \
-  --output-dir runs/phase4_one_video_smoke_output \
-  --state-dir runs/phase4_one_video_smoke_state \
-  --cache-dir runs/phase4_one_video_smoke_cache
+  --video-id 0RxMZBLeqRI --gpu 4 --gpus 4,5,6,7 \
+  --output-dir runs/phase4_one_video_smoke_parallel_multimodal_output \
+  --state-dir runs/phase4_one_video_smoke_parallel_multimodal_state \
+  --cache-dir runs/phase4_one_video_smoke_json_cache
 ```
 
 Continue through flip-only feedback and property aggregation:
 
 ```bash
-conda run -n local_llm_vllm python \
+conda run -n local_llm_vllm python -m dotenv run -- python \
   scripts/run_phase4_bounded_smoke.py \
   --post-intervention-mode feedback_only \
-  --video-id 0RxMZBLeqRI --gpu 0 \
-  --output-dir runs/phase4_one_video_smoke_output \
-  --state-dir runs/phase4_one_video_smoke_state \
-  --cache-dir runs/phase4_one_video_smoke_cache
+  --video-id 0RxMZBLeqRI --gpu 4 --gpus 4,5,6,7 \
+  --output-dir runs/phase4_one_video_smoke_parallel_multimodal_output \
+  --state-dir runs/phase4_one_video_smoke_parallel_multimodal_state \
+  --cache-dir runs/phase4_one_video_smoke_json_cache
 ```
 
 Continue through isolated provisional bank/router artifacts:
 
 ```bash
-conda run -n local_llm_vllm python \
+conda run -n local_llm_vllm python -m dotenv run -- python \
   scripts/run_phase4_bounded_smoke.py \
   --post-intervention-mode provisional_update \
-  --video-id 0RxMZBLeqRI --gpu 0 \
-  --output-dir runs/phase4_one_video_smoke_output \
-  --state-dir runs/phase4_one_video_smoke_state \
-  --cache-dir runs/phase4_one_video_smoke_cache
+  --video-id 0RxMZBLeqRI --gpu 4 --gpus 4,5,6,7 \
+  --output-dir runs/phase4_one_video_smoke_parallel_multimodal_output \
+  --state-dir runs/phase4_one_video_smoke_parallel_multimodal_state \
+  --cache-dir runs/phase4_one_video_smoke_json_cache
 ```
 
 Each invocation writes `run_manifest.json` and an immutable mode manifest under

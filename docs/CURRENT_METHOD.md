@@ -65,6 +65,14 @@ The router must not receive:
 - retrieved or consumed segment IDs;
 - downstream predictions.
 
+The local Qwen/vLLM router uses a fail-closed JSON Schema decoding constraint.
+For the frozen active codebook, `property_ids` is the only permitted output
+field, its items are restricted to active property IDs, and its array length is
+bounded by the current selection limit. Structured-output fallback is disabled:
+if the installed backend cannot enforce the schema, routing fails instead of
+silently reverting to unconstrained text generation. This constraint applies
+only to routing; ordinary segment caption generation remains unconstrained.
+
 A fixed deterministic composer builds the captioning prompt:
 
 \[
@@ -88,6 +96,32 @@ C(s_{i,t},h_{i,t},\theta_{i,t}).
 History is restricted to configured temporal blocks. Different blocks may be
 processed independently, while segments within one block use preceding
 captions as local history.
+
+When multiple caption GPUs are configured, the exact temporal history block is
+also the scheduling unit. One persistent worker process owns one Qwen/vLLM
+instance on one GPU and processes every segment assigned to a block in temporal
+order. Blocks are assigned deterministically and may execute concurrently;
+their routing decisions, composed prompts, histories, cache rows, captions, and
+registries are merged back in ascending source-segment order. Workers append to
+private cache-manifest fragments, and the parent validates and merges those
+fragments after every worker succeeds. GPU assignment is execution metadata,
+not a caption-cache identity field; the history boundary rule and complete
+history-aware semantic identity remain unchanged.
+
+The GPU workers are run-scoped services rather than one-build subprocesses.
+After a block batch returns, they remain on their command queues and reuse the
+same loaded Qwen/vLLM engines for later evidence videos, selective property
+captioning, and confirmation captioning in that process. The parent waits for
+task results, not worker process exit. Selective caption calls use the same
+worker-private manifest discipline and merge completed registrations in the
+parent. Only the explicit run boundary shuts down the vLLM EngineCore and joins
+the workers; a bounded smoke performs this cleanup in `finally`.
+
+DVD `frame_inspect_tool` vision calls are raw-VLM tasks on this same pool. While
+the pool is active, the parent installs a lightweight `dvd_backend` captioner
+proxy and must never lazily initialize another local Qwen/vLLM engine. Without
+an active pool, the original standalone `dvd_backend.get_captioner()` behavior
+is unchanged.
 
 ## 3. One optimization iteration
 
@@ -160,6 +194,10 @@ Run every QA associated with each video using its incumbent caption memory:
 \]
 
 Persist the answer, correctness, reasoning trace, and used segment IDs.
+Runtime/tool errors, null predictions, and parse failures are QA execution
+failures rather than incorrect answers. Run and persist all three QA attempts,
+then fail the video before property proposal if any attempt did not complete
+successfully. Only three successfully parsed QA results may enter proposal.
 
 ### 3.3 Propose multiple properties per video
 
@@ -184,6 +222,25 @@ Each candidate must record its lineage:
 - proposed property instruction.
 
 Candidates are not added to the codebook yet.
+
+Property-proposal model input preserves all three QA outcomes but contains no
+source-video ID, question ID, segment ID, provider priority rank, tool-call ID,
+or payload-truncation metadata. For each QA it contains the question and answer
+choices, ground truth and baseline prediction, at most three bounded sanitized
+reasoning events, and at most three actual used-segment evidence items. Each
+evidence item pairs one deterministic representative frame with its incumbent
+baseline caption; segment lineage remains in a private artifact and is not sent
+to the model. Focused cited/inspected/returned segments take priority, with a
+deterministic representative sample from consumed segments only when needed.
+
+The current codebook and a source-free output schema complete the multimodal
+request. The provider returns only reusable property content and coverage
+judgments; source video and all three source QA IDs are reattached internally
+after parsing. The text portion and every transformed image are independently
+bounded and identity-bound. `request.json` records the logical model input,
+`provider_request.json` records the exact secret-free API body, and
+`input_identity.json` records private source/segment/frame lineage that is never
+sent to the provider.
 
 Near-duplicate candidates may be grouped for reporting, but every
 property-source-video pair remains independently evaluable.

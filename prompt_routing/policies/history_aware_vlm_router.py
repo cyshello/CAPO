@@ -20,6 +20,7 @@ from surrogate_rollout.schemas import sha256_text
 
 REQUEST_SCHEMA_VERSION = "history_aware_vlm_router_request_v1"
 OUTPUT_SCHEMA_VERSION = "history_aware_vlm_router_output_v2"
+STRUCTURED_OUTPUT_VERSION = "history_aware_vlm_router_json_schema_v1"
 DEFAULT_MAX_SELECTED_PROPERTIES = 3
 
 
@@ -64,20 +65,44 @@ def parse_router_output(raw: str) -> tuple[str, ...]:
     return tuple(selected)
 
 
+def build_router_output_schema(
+    active_property_ids: tuple[str, ...],
+    max_selected_properties: int,
+) -> dict[str, Any]:
+    """Build the exact vLLM JSON constraint for one frozen codebook."""
+    return {
+        "type": "object",
+        "properties": {
+            "property_ids": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": list(active_property_ids),
+                },
+                "maxItems": max_selected_properties,
+            },
+        },
+        "required": ["property_ids"],
+        "additionalProperties": False,
+    }
+
+
 class HistoryAwareVLMRouter:
     """PromptRouter adapter using the same local multimodal backend as captions."""
 
     policy_type = "history_aware_vlm"
 
     def __init__(self, vlm: Any, *, max_selected_properties: int = 3,
-                 max_tokens: int = 256, model_id: str | None = None) -> None:
+                 max_tokens: int = 256, model_id: str | None = None,
+                 backend_id: str | None = None) -> None:
         if max_selected_properties < 1:
             raise ValueError("max_selected_properties must be positive")
         self.vlm = vlm
         self.max_selected_properties = max_selected_properties
         self.max_tokens = max_tokens
         self.model_id = model_id or config.CAPTION_MODEL_ID
-        self.backend_id = f"{type(vlm).__module__}.{type(vlm).__qualname__}"
+        self.backend_id = backend_id or (
+            f"{type(vlm).__module__}.{type(vlm).__qualname__}")
         self.last_exchange: RouterExchange | None = None
 
     @property
@@ -89,6 +114,11 @@ class HistoryAwareVLMRouter:
             "backend": self.backend_id,
             "max_selected_properties": self.max_selected_properties,
             "max_tokens": self.max_tokens,
+            "structured_output": {
+                "version": STRUCTURED_OUTPUT_VERSION,
+                "constraint": "json_schema",
+                "disable_fallback": True,
+            },
             "real_model": True,
         }
 
@@ -125,6 +155,9 @@ class HistoryAwareVLMRouter:
             "max_selected_properties", self.max_selected_properties))
         limit = min(configured, router_policy.max_selected_entries,
                     prompt_bank.max_selected_entries)
+        active_property_ids = tuple(entry.prompt_id for entry in active)
+        output_schema = build_router_output_schema(
+            active_property_ids, limit)
         request = {
             "schema_version": REQUEST_SCHEMA_VERSION,
             "current_segment": {
@@ -142,7 +175,7 @@ class HistoryAwareVLMRouter:
                 "instruction": entry.prompt_text,
             } for entry in active),
             "max_selected_properties": limit,
-            "output_schema": {"property_ids": ["property_id"]},
+            "output_schema": output_schema,
         }
         supervision = tuple(router_policy.configuration.get(
             "supervision_examples") or ())[-100:]
@@ -158,8 +191,13 @@ class HistoryAwareVLMRouter:
             "video segment. Return only strict JSON matching output_schema; "
             "do not use Markdown or add keys.\n" + dumps_canonical(request)
         )
-        raw = self.vlm.caption(frames, prompt, max_tokens=int(
-            router_policy.configuration.get("max_tokens", self.max_tokens)))
+        raw = self.vlm.caption(
+            frames,
+            prompt,
+            max_tokens=int(router_policy.configuration.get(
+                "max_tokens", self.max_tokens)),
+            json_schema=output_schema,
+        )
         proposed = parse_router_output(raw)
         known = {entry.prompt_id for entry in active}
         unknown = set(proposed) - known

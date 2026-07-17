@@ -13,6 +13,9 @@ from surrogate_rollout.optimization.final_iteration import (
     FinalIterationConflictError,
     _write_immutable,
 )
+from surrogate_rollout.optimization.baseline_phase import (
+    qa_execution_failure_reasons,
+)
 from surrogate_rollout.optimization.property_proposal import CandidatePropertyProposal
 from surrogate_rollout.optimization.startup_models import (
     build_startup_model_manifest,
@@ -75,6 +78,65 @@ def _file_hash(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_jsonl(path: str) -> tuple[dict[str, Any], ...]:
+    with open(path) as handle:
+        return tuple(json.loads(line) for line in handle if line.strip())
+
+
+def _completed_mode_has_invalid_baseline_qa(mode_manifest: str) -> bool:
+    mode = _read_json(mode_manifest)
+    if "baseline_manifest_path" not in mode:
+        qa_manifest = os.path.join(os.path.dirname(mode_manifest), "qa_only.json")
+        if not os.path.exists(qa_manifest):
+            return False
+        mode = _read_json(qa_manifest)
+    baseline = _read_json(mode["baseline_manifest_path"])
+    for video_path in baseline.get("video_manifest_paths") or ():
+        video = _read_json(video_path)
+        rows = _read_jsonl(video["baseline_qas_path"])
+        if len(rows) != 3 or any(qa_execution_failure_reasons(row) for row in rows):
+            return True
+    return False
+
+
+def _archive_invalid_qa_attempt(output_dir: str, video_id: str) -> str:
+    """Preserve invalid downstream artifacts while retaining caption blocks."""
+    archive_parent = os.path.join(output_dir, "invalid_attempts")
+    attempt = 1
+    while os.path.exists(os.path.join(
+            archive_parent, f"qa_execution_failure_{attempt:03d}")):
+        attempt += 1
+    archive = os.path.join(
+        archive_parent, f"qa_execution_failure_{attempt:03d}")
+    relative_targets = (
+        os.path.join("baseline", "baseline", video_id, "qa"),
+        os.path.join("baseline", "baseline", video_id, "baseline_qas.jsonl"),
+        os.path.join("baseline", "baseline", video_id, "video_complete.json"),
+        os.path.join("baseline", "property_proposals"),
+        os.path.join("baseline", "property_retrieval"),
+        os.path.join("baseline", "iteration_state"),
+        os.path.join("baseline", "manifest.json"),
+        "intervention", "feedback", "mode_manifests", "run_manifest.json",
+    )
+    moved = []
+    for relative in relative_targets:
+        source = os.path.join(output_dir, relative)
+        if not os.path.exists(source):
+            continue
+        target = os.path.join(archive, relative)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.replace(source, target)
+        moved.append(relative)
+    os.makedirs(archive, exist_ok=True)
+    _atomic_write_text(os.path.join(archive, "archive_manifest.json"), json.dumps({
+        "schema_version": "bounded_smoke_invalid_qa_archive_v1",
+        "reason": "qa_execution_failure_not_captioning_incorrectness",
+        "video_id": video_id, "moved_paths": moved,
+        "caption_artifacts_preserved_in_place": True,
+    }, sort_keys=True, ensure_ascii=False, indent=2) + "\n")
+    return os.path.abspath(archive)
 
 
 def _proposal_from_json(value: Mapping[str, Any]) -> CandidatePropertyProposal:
@@ -278,6 +340,14 @@ class BoundedSmokeRunner:
                 feedback_runner=self.feedback_runner,
                 confirmation_evaluator=self.update_engine.confirmation_evaluator)
             log_startup_models(output_dir, startup)
+
+        if requested_mode_completed_before_run and \
+                _completed_mode_has_invalid_baseline_qa(requested_manifest):
+            archive = _archive_invalid_qa_attempt(output_dir, video_id)
+            print("INVALID_QA_ATTEMPT_ARCHIVED " + archive, flush=True)
+            requested_mode_completed_before_run = False
+            requested_manifest = os.path.join(
+                output_dir, "mode_manifests", f"{mode.value}.json")
 
         if requested_mode_completed_before_run:
             requested = _read_json(requested_manifest)

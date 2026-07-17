@@ -81,10 +81,23 @@ def main() -> None:
     parser.add_argument("--video-id", default=DEFAULT_VIDEO_ID)
     parser.add_argument("--components", default=DEFAULT_COMPONENTS)
     parser.add_argument("--split-manifest", default=config.SPLIT_MANIFEST_PATH)
-    parser.add_argument("--gpu", default="0")
+    parser.add_argument(
+        "--gpu", default=None,
+        help="primary GPU for downstream QA and selective intervention")
+    parser.add_argument(
+        "--gpus", default=None,
+        help="comma-separated GPUs for history-block-parallel baseline captioning")
     parser.add_argument("--feedback-model", default=config.FEEDBACK_MODEL)
     parser.add_argument("--dvd-max-iterations", type=int, default=10)
     args = parser.parse_args()
+    caption_gpus = tuple(
+        value.strip() for value in str(args.gpus or "").split(",")
+        if value.strip())
+    if len(caption_gpus) != len(set(caption_gpus)):
+        raise SystemExit("--gpus must contain unique GPU IDs")
+    primary_gpu = str(args.gpu or (caption_gpus[0] if caption_gpus else "0"))
+    if not caption_gpus:
+        caption_gpus = (primary_gpu,)
 
     components = _load_json(args.components)
     roles = derive_train_roles(_load_json(args.split_manifest))
@@ -113,7 +126,7 @@ def main() -> None:
     bank = prompt_bank_from_json(components["prompt_bank"])
     source_router = router_policy_from_json(components["router_policy"])
     router = replace(
-        source_router, router_version="router_v9001",
+        source_router, router_version="router_v9002",
         parent_router_version=source_router.router_version,
         policy_type="history_aware_vlm",
         configuration={
@@ -134,9 +147,10 @@ def main() -> None:
     state_dir = os.path.abspath(args.state_dir)
     cache_dir = os.path.abspath(args.cache_dir)
     ensure_backend(
-        args.gpu, preload_captioner=True,
+        primary_gpu, preload_captioner=len(caption_gpus) == 1,
         text_backend="codex", use_openai_tools=False)
-    history_builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen()
+    history_builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen(
+        parallel_gpus=caption_gpus)
     proposal_policy = MultiPropertyProposalPolicy(
         response_provider=OpenAIPropertyProposalProvider(
             model=args.feedback_model), max_proposals=1)
@@ -174,7 +188,7 @@ def main() -> None:
         cache_root=os.path.join(cache_dir, "confirmation_disabled"),
         cache_manifest_path=os.path.join(
             cache_dir, "confirmation_disabled_manifest.jsonl"),
-        gpu=args.gpu, dvd_max_iterations=args.dvd_max_iterations,
+        gpu=primary_gpu, dvd_max_iterations=args.dvd_max_iterations,
         downstream_qa_configuration={
             "text_backend": "codex", "use_openai_tools": False})
     update_engine = Checkpoint3EOrchestrator(
@@ -199,43 +213,46 @@ def main() -> None:
     revision = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True,
         capture_output=True, text=True).stdout.strip()
-    result = runner.run(
-        iteration_id=f"bounded-smoke-{record.video_id}",
-        video_id=record.video_id, roles=roles,
-        coverage_state=initial_coverage(roles),
-        phase4_config=phase4_config,
-        prompt_bank=bank, router_policy=router,
-        scaffold_policy=scaffold, scaffold_contract=contract,
-        output_dir=output_dir, state_dir=state_dir, cache_dir=cache_dir,
-        execution_identity={
-            "source_revision": revision, "seed": 0,
-            "provider_indices": record.provider_indices,
-            "question_ids": record.question_ids,
-            "feedback_model": args.feedback_model,
-            "dvd_max_iterations": args.dvd_max_iterations,
-            "gpu": args.gpu,
-            "dvd_text_backend": "codex",
-            "dvd_use_openai_tools": False,
-            "base_prompt_hash": _text_hash(prompts.caption_prompt),
-            "merge_prompt_hash": _text_hash(prompts.merge_prompt),
-            "components_path": os.path.abspath(args.components),
-            "split_manifest_path": os.path.abspath(args.split_manifest),
-        },
-        baseline_kwargs={
-            "sample_loader": sample_loader,
-            "base_prompt_template": prompts.caption_prompt,
-            "merge_prompt": prompts.merge_prompt,
-            "parent_confirmed_checkpoint_id": "bounded_smoke_input",
-            "source_revision": revision, "gpu": args.gpu,
-            "dvd_max_iterations": args.dvd_max_iterations,
-        },
-        intervention_kwargs={
-            "sample_loader": sample_loader,
-            "base_prompt_template": prompts.caption_prompt,
-            "merge_prompt": prompts.merge_prompt,
-            "gpu": args.gpu,
-            "dvd_max_iterations": args.dvd_max_iterations,
-        })
+    try:
+        result = runner.run(
+            iteration_id=f"bounded-smoke-{record.video_id}",
+            video_id=record.video_id, roles=roles,
+            coverage_state=initial_coverage(roles),
+            phase4_config=phase4_config,
+            prompt_bank=bank, router_policy=router,
+            scaffold_policy=scaffold, scaffold_contract=contract,
+            output_dir=output_dir, state_dir=state_dir, cache_dir=cache_dir,
+            execution_identity={
+                "source_revision": revision, "seed": 0,
+                "provider_indices": record.provider_indices,
+                "question_ids": record.question_ids,
+                "feedback_model": args.feedback_model,
+                "dvd_max_iterations": args.dvd_max_iterations,
+                "gpu": primary_gpu,
+                "dvd_text_backend": "codex",
+                "dvd_use_openai_tools": False,
+                "base_prompt_hash": _text_hash(prompts.caption_prompt),
+                "merge_prompt_hash": _text_hash(prompts.merge_prompt),
+                "components_path": os.path.abspath(args.components),
+                "split_manifest_path": os.path.abspath(args.split_manifest),
+            },
+            baseline_kwargs={
+                "sample_loader": sample_loader,
+                "base_prompt_template": prompts.caption_prompt,
+                "merge_prompt": prompts.merge_prompt,
+                "parent_confirmed_checkpoint_id": "bounded_smoke_input",
+                "source_revision": revision, "gpu": primary_gpu,
+                "dvd_max_iterations": args.dvd_max_iterations,
+            },
+            intervention_kwargs={
+                "sample_loader": sample_loader,
+                "base_prompt_template": prompts.caption_prompt,
+                "merge_prompt": prompts.merge_prompt,
+                "gpu": primary_gpu,
+                "dvd_max_iterations": args.dvd_max_iterations,
+            })
+    finally:
+        history_builder.close_worker_pool()
     print(result.manifest_path, flush=True)
 
 

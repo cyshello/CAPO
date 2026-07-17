@@ -132,6 +132,20 @@ def _used_segments(reference_sets: Mapping[str, tuple[str, ...]]) -> tuple[str, 
     return tuple(sorted(fallback))
 
 
+def qa_execution_failure_reasons(value: Mapping[str, Any]) -> tuple[str, ...]:
+    """Separate evaluator/runtime failure from a valid incorrect prediction."""
+    reasons = []
+    if value.get("errors"):
+        reasons.append("runtime_or_parse_errors")
+    prediction = value.get("prediction")
+    if prediction is None or not str(prediction).strip():
+        reasons.append("null_prediction")
+    parsed = value.get("parsed_answer")
+    if parsed is None or not str(parsed).strip():
+        reasons.append("parse_failure")
+    return tuple(reasons)
+
+
 @dataclass(frozen=True)
 class BaselinePhaseResult:
     run_id: str
@@ -449,6 +463,24 @@ class BaselinePhaseRunner:
             qa_path = os.path.join(video_dir, "baseline_qas.jsonl")
             _atomic_write_text(qa_path, "".join(
                 dumps_canonical(item) + "\n" for item in qa_rows))
+
+            qa_failures = tuple({
+                "question_id": item["question_id"],
+                "reasons": qa_execution_failure_reasons(item),
+                "errors": item["errors"],
+            } for item in qa_rows if qa_execution_failure_reasons(item))
+            if qa_failures:
+                failure_path = _write(os.path.join(
+                    video_dir, "baseline_qa_failures.json"), {
+                        "schema_version": "baseline_qa_execution_failure_v1",
+                        "status": "failed_before_property_proposal",
+                        "video_id": record.video_id,
+                        "qa_failures": qa_failures,
+                        "property_proposer_called": False,
+                    })
+                raise RuntimeError(
+                    "baseline QA execution failed before property proposal: "
+                    + failure_path)
 
             proposal_context = VideoProposalContext(
                 video_id=record.video_id, baseline_run_id=run_id,

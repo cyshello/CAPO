@@ -2,11 +2,14 @@ import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from surrogate_rollout.optimization.policies.property_proposal import (
     MultiPropertyProposalPolicy,
+    OpenAIPropertyProposalProvider,
     PropertyProposalConflictError,
     PropertyProposalParseError,
+    build_proposal_request,
     parse_proposal_output,
 )
 from surrogate_rollout.optimization.property_proposal import VideoProposalContext
@@ -24,8 +27,19 @@ def context(tmp_path, *, prediction="B"):
             "question_id": "q1", "question": "What color is the moving car?",
             "options": ["red", "green", "blue"], "ground_truth": "green car",
             "prediction": prediction, "is_correct": False,
-            "reasoning_trace": [{"step": "looked at motion"}],
+            "reasoning_trace": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-secret",
+                    "type": "function",
+                    "function": {
+                        "name": "frame_inspect_tool",
+                        "arguments": json.dumps({
+                            "segment_id": "0_10", "database": "/secret/db"}),
+                }}],
+            }],
             "used_segments": ["0_10"],
+            "reference_sets": {"frame_inspected_segments": ["0_10"]},
         },
         {
             "question_id": "q2", "question": "What happens after the door opens?",
@@ -33,14 +47,24 @@ def context(tmp_path, *, prediction="B"):
             "prediction": "B", "is_correct": True,
             "reasoning_trace": [{"step": "ordered actions"}],
             "used_segments": ["10_20"],
+            "reference_sets": {"returned_segments": ["10_20"]},
         },
         {
             "question_id": "q3", "question": "Which label appears briefly?",
             "options": ["EXIT", "SHOP", "HOME"], "ground_truth": "EXIT",
             "prediction": "EXIT", "is_correct": True,
             "reasoning_trace": [], "used_segments": ["20_30"],
+            "reference_sets": {"consumed_segments": ["20_30"]},
         },
     )
+    frame_references = {}
+    for index, segment_id in enumerate(("0_10", "10_20", "20_30")):
+        paths = []
+        for frame_index in range(3):
+            path = tmp_path / f"frame-{index}-{frame_index}.jpg"
+            Image.new("RGB", (32, 24), (index * 50, frame_index * 50, 10)).save(path)
+            paths.append(str(path))
+        frame_references[segment_id] = tuple(paths)
     return VideoProposalContext(
         video_id="video-1", baseline_run_id="baseline-1",
         baseline_qa_results=rows,
@@ -49,18 +73,17 @@ def context(tmp_path, *, prediction="B"):
             "10_20": {"caption": "A door opens."},
             "20_30": {"caption": "A sign is visible."},
         },
-        frame_references={}, frozen_histories=(),
+        frame_references=frame_references, frozen_histories=(),
         prompt_bank=prompt_bank_from_json(data["prompt_bank"]),
         proposal_artifact_dir=str(tmp_path / "proposal"),
     )
 
 
 def proposal(candidate_id, text, qids=("q1",), **over):
+    del qids
     value = {
         "candidate_property_id": candidate_id,
         "property_text": text,
-        "source_video_id": "video-1",
-        "source_question_ids": list(qids),
         "motivating_failure_types": ["missing_visual_attribute"],
         "covered_by_existing_property_ids": [],
         "proposal_rationale": "The baseline omitted a reusable visual detail.",
@@ -94,15 +117,103 @@ def test_zero_one_and_multiple_proposals_with_complete_video_request(
     assert len(result) == expected
     request = provider.calls[0]
     assert len(request["qas"]) == 3
-    assert request["qas"][0]["question_id"] == "q1"  # incorrect first
     assert request["qas"][0]["answer_choices"] == ["red", "green", "blue"]
-    assert request["qas"][0]["gold_answer"] == "green car"
+    assert request["qas"][0]["ground_truth"] == "green car"
+    serialized = json.dumps(request, sort_keys=True)
+    for forbidden in (
+        "source_video_id", "segment_id", "question_id", "priority_rank",
+        "payload_truncation", "call-secret", "/secret/db"):
+        assert forbidden not in serialized
+    assert request["qas"][0]["used_segment_evidence"][0][
+        "representative_image"]["base64_data"]
     if expected == 2:
-        assert result[1].source_question_ids == ("q1", "q2")
+        assert result[1].source_question_ids == ("q1", "q2", "q3")
     artifact_dir = Path(context(tmp_path).proposal_artifact_dir)
     assert (artifact_dir / "raw_output.txt").exists()
+    identity = json.loads((artifact_dir / "input_identity.json").read_text())
+    assert identity["source_video_id"] == "video-1"
+    assert identity["qas"][0]["question_id"] == "q1"
     parsed = json.loads((artifact_dir / "parsed_output.json").read_text())
     assert len(parsed["proposals"]) == expected
+
+
+def test_proposal_request_bounds_reasoning_and_used_segment_evidence(tmp_path):
+    ctx = context(tmp_path)
+    large_rows = tuple({
+        **row,
+        "reasoning_trace": tuple(
+            {"step": f"{index}-" + "x" * 1000} for index in range(20)),
+    } for row in ctx.baseline_qa_results)
+    bounded = VideoProposalContext(
+        video_id=ctx.video_id,
+        baseline_run_id=ctx.baseline_run_id,
+        baseline_qa_results=large_rows,
+        captions=ctx.captions,
+        frame_references=ctx.frame_references,
+        frozen_histories=ctx.frozen_histories,
+        prompt_bank=ctx.prompt_bank,
+        proposal_artifact_dir=ctx.proposal_artifact_dir,
+    )
+
+    request = build_proposal_request(
+        bounded,
+        max_proposals=1,
+        max_trace_events_per_qa=20,
+        max_captions=30,
+        max_payload_chars=40000,
+    )
+
+    assert all(len(row["bounded_reasoning"]) <= 3 for row in request["qas"])
+    assert all(len(row["used_segment_evidence"]) <= 3 for row in request["qas"])
+    assert all(len(item) <= 1201 for row in request["qas"]
+               for item in row["bounded_reasoning"])
+    assert "payload_truncation" not in request
+
+
+def test_openai_provider_builds_exact_multimodal_body(tmp_path):
+    request = build_proposal_request(
+        context(tmp_path), max_proposals=1, max_trace_events_per_qa=3,
+        max_captions=3, max_payload_chars=40000)
+    provider = OpenAIPropertyProposalProvider(model="gpt-test", api_key="unused")
+    body = provider.build_request_body(request)
+    content = body["messages"][0]["content"]
+
+    assert content[0]["type"] == "text"
+    assert sum(item["type"] == "image_url" for item in content) == 3
+    assert all(item["image_url"]["url"].startswith("data:image/jpeg;base64,")
+               for item in content if item["type"] == "image_url")
+    assert "base64_data" not in content[0]["text"]
+
+
+def test_policy_persists_private_identity_and_exact_provider_body(tmp_path):
+    class MultimodalProvider:
+        supports_multimodal_request = True
+
+        def __init__(self):
+            self.calls = []
+
+        def build_request_body(self, request):
+            return {"exact": True, "request_schema": request["schema_version"]}
+
+        def __call__(self, request):
+            self.calls.append(request)
+            return json.dumps({"proposals": []})
+
+    provider = MultimodalProvider()
+    ctx = context(tmp_path)
+    result = MultiPropertyProposalPolicy(response_provider=provider).propose(ctx)
+
+    assert result == ()
+    assert isinstance(provider.calls[0], dict)
+    artifact_dir = Path(ctx.proposal_artifact_dir)
+    assert json.loads((artifact_dir / "provider_request.json").read_text()) == {
+        "exact": True,
+        "request_schema": "multimodal_property_proposal_request_v2",
+    }
+    model_request = (artifact_dir / "request.json").read_text()
+    private_identity = (artifact_dir / "input_identity.json").read_text()
+    assert "source_video_id" not in model_request
+    assert "source_video_id" in private_identity
 
 
 def test_instance_specific_answer_leaking_and_codebook_duplicates_are_rejected(tmp_path):

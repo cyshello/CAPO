@@ -60,10 +60,17 @@ class FakeBaseline:
                 "video_id": video_id, "proposals": [proposal]})
             retrieval_path = _write(root / "retrieval.json", {
                 "candidate_property_id": "candidate-1", "s_sim": ["0_10"]})
+            qa_path = root / "baseline" / video_id / "baseline_qas.jsonl"
+            qa_path.parent.mkdir(parents=True, exist_ok=True)
+            qa_path.write_text("".join(json.dumps({
+                "question_id": f"q{index}", "prediction": "A",
+                "parsed_answer": "A", "errors": [],
+            }) + "\n" for index in range(3)))
             _write(complete_path, {
                 "video_id": video_id,
                 "property_proposal_path": proposal_path,
                 "property_retrieval_paths": [retrieval_path],
+                "baseline_qas_path": str(qa_path.resolve()),
             })
             _write(manifest_path, {"status": "completed", "video_id": video_id})
         return SimpleNamespace(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Mapping
+
 from .base import (
     BaseCaptioner,
     ImagesInput,
@@ -96,13 +98,30 @@ class Qwen25VLCaptioner(BaseCaptioner):
             multi_modal_data["image"] = image_inputs
         return {"prompt": text, "multi_modal_data": multi_modal_data}
 
-    def _sampling(self, max_tokens: int | None, temperature: float, top_p: float):
+    def _sampling(
+        self,
+        max_tokens: int | None,
+        temperature: float,
+        top_p: float,
+        *,
+        json_schema: Mapping[str, Any] | None = None,
+    ):
         from vllm import SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+
+        structured_outputs = None
+        if json_schema is not None:
+            structured_outputs = StructuredOutputsParams(
+                json=dict(json_schema),
+                disable_fallback=True,
+                disable_additional_properties=True,
+            )
 
         return SamplingParams(
             max_tokens=max_tokens or self.default_max_tokens,
             temperature=temperature,
             top_p=top_p,
+            structured_outputs=structured_outputs,
         )
 
     def caption_batch(
@@ -113,6 +132,7 @@ class Qwen25VLCaptioner(BaseCaptioner):
         max_tokens: int | None = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        json_schema: Mapping[str, Any] | None = None,
         **kwargs,
     ) -> list[str]:
         prompts = broadcast_prompt(prompt, len(images_list))
@@ -122,6 +142,11 @@ class Qwen25VLCaptioner(BaseCaptioner):
         ]
         outputs = self.llm.generate(
             inputs,
-            self._sampling(max_tokens, temperature, top_p),
+            self._sampling(
+                max_tokens,
+                temperature,
+                top_p,
+                json_schema=json_schema,
+            ),
         )
         return [output.outputs[0].text.strip() for output in outputs]
