@@ -29,10 +29,23 @@ RECOMMENDATION_LABELS = (
     "router_negative", "no_op",
 )
 COVERAGE_LABELS = ("uncovered", "partially_covered", "covered", "uncertain")
+FEEDBACK_REQUEST_SCHEMA_VERSION = "property_flip_feedback_request_v3"
 OUTPUT_FIELDS = frozenset({
     "assessment", "coverage_assessment", "covered_by_property_ids",
     "evidence", "recommendation",
 })
+
+
+def _proposal_context(proposal: CandidatePropertyProposal) -> dict[str, Any]:
+    return {
+        "candidate_property_id": proposal.candidate_property_id,
+        "property_text": proposal.property_text,
+        "source_question_ids": proposal.source_question_ids,
+        "source_qa_baseline_correct": proposal.source_qa_baseline_correct,
+        "applicability": as_json_dict(proposal.applicability),
+        "coverage_hints": proposal.coverage_hints,
+        "failure_analysis": proposal.failure_analysis,
+    }
 
 
 class InterventionalFeedbackError(RuntimeError):
@@ -400,7 +413,7 @@ def parse_feedback_output(
 
 
 class PropertyFeedbackRunner:
-    policy_version = "flip_only_property_feedback_v2"
+    policy_version = "flip_only_property_feedback_v3"
 
     def __init__(
         self,
@@ -791,12 +804,8 @@ class PropertyFeedbackRunner:
                     transition=transition, used_before=used_before,
                     used_after=used_after, s_feedback=(),
                     request={
-                        "schema_version": "property_flip_feedback_request_v2",
-                        "candidate_property": {
-                            "candidate_property_id": proposal.candidate_property_id,
-                            "property_text": proposal.property_text,
-                            "coverage_hints": proposal.coverage_hints,
-                        },
+                        "schema_version": FEEDBACK_REQUEST_SCHEMA_VERSION,
+                        "candidate_property": _proposal_context(proposal),
                         "transition": transition,
                         "s_sim": selected, "s_used_before": used_before,
                         "s_used_after": used_after, "s_feedback": (),
@@ -855,8 +864,11 @@ class PropertyFeedbackRunner:
             "input_fingerprint": fingerprint,
             "candidate_property_id": proposal.candidate_property_id,
             "property_text": proposal.property_text,
+            "applicability": as_json_dict(proposal.applicability),
+            "failure_analysis": proposal.failure_analysis,
             "source_video_id": proposal.source_video_id,
             "source_question_ids": proposal.source_question_ids,
+            "source_qa_baseline_correct": proposal.source_qa_baseline_correct,
             "flip_question_ids": tuple(
                 item.question_id for item in qa_feedback
                 if item.transition in FLIP_TRANSITIONS),
@@ -955,6 +967,7 @@ class PropertyFeedbackRunner:
                 "force_added_candidate_property": {
                     "candidate_property_id": proposal.candidate_property_id,
                     "property_text": proposal.property_text,
+                    "applicability": as_json_dict(proposal.applicability),
                 },
                 "before_caption": _bounded_text(
                     _caption_text(baseline_captions.get(segment_id)),
@@ -966,17 +979,13 @@ class PropertyFeedbackRunner:
                     f"segments.{segment_id}.after_caption"),
             })
         request = {
-            "schema_version": "property_flip_feedback_request_v2",
+            "schema_version": FEEDBACK_REQUEST_SCHEMA_VERSION,
             "task": (
                 "Return strict JSON credit or blame for the reusable candidate "
                 "captioning property. Use only supplied evidence. The evidence "
                 "sentence must be general and must not mention lineage IDs, "
                 "timestamps, answer choices, or ground-truth answers."),
-            "candidate_property": {
-                "candidate_property_id": proposal.candidate_property_id,
-                "property_text": proposal.property_text,
-                "coverage_hints": proposal.coverage_hints,
-            },
+            "candidate_property": _proposal_context(proposal),
             "transition": transition,
             "qa_context": {
                 "question": baseline_qa.get("question"),

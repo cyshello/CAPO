@@ -159,6 +159,15 @@ object array. Raw output and `caption_parse_result_v2` are saved in
 descriptions remain failures. Contract/parser versions enter cache and resume
 identity so v1 cache files remain immutable and are not reinterpreted.
 
+`caption_parse_retry_v1` adds up to five parse-failure retries after the
+initial caption call. It does not retry runtime/backend exceptions and does not
+alter property text, frames, transcript, frozen history, or decoding. New
+artifacts use `history_aware_caption_cache_v3` and retain every raw attempt and
+parse reason. Existing valid v2 cache entries remain compatible; existing
+invalid v2 entries remain immutable and receive a versioned retry sidecar.
+After five unsuccessful retries, the segment remains invalid and the existing
+selected-segment intervention failure path is unchanged.
+
 ### 3.3 Property proposal stage
 
 Adapt `optimization/policies/llm_feedback.py` or add a narrowly scoped property
@@ -170,43 +179,84 @@ Input per source video:
 - question, choices, ground truth, and baseline prediction without question ID;
 - at most three sanitized reasoning events per QA, excluding tool-call IDs and
   source/question/segment identifiers;
-- at most three actual used-segment evidence items per QA, each containing one
-  deterministic representative frame and its incumbent caption without the
-  segment ID;
+- the complete union of `explicitly_cited_segments` and
+  `frame_inspected_segments` in private provenance, while the provider payload
+  packs timestamp-ranged explicitly cited evidence first and compact
+  inspected-only summaries second under a fixed evidence-character budget;
+- structurally split `baseline_generated_description` and `source_transcript`
+  when the known raw transcript suffix marker is present;
+- no `returned_segments` or general consumed/used-segment fallback;
 - current codebook.
 
 Output:
 
-- zero or more candidate properties;
+- one or two candidate properties for every eligible correct or incorrect QA;
+- a source-free `source_qa_slot` on each provider proposal, privately mapped to
+  exactly one source QA ID and its baseline correctness;
 - one readable non-binding `suggested_property_id` per candidate; the parser
   replaces it with a deterministic opaque proposal handle for all lineage;
 - source video ID;
 - source QA IDs;
-- concise failure evidence;
+- one natural-language `failure_analysis`, with no fixed failure taxonomy;
 - non-binding possible-codebook-coverage hints;
-- reusable property instruction.
+- reusable property instruction;
+- strict applicability with `when`, positive/negative observable cues, and
+  required modalities limited to `frames`, `transcript`, and
+  `caption_history`.
 
 Do not directly mutate the codebook.
 
 Treat proposer `covered_by_existing_property_ids` as hints and persist them
 internally as `coverage_hints`; never veto a candidate merely because this list
-is non-empty. Deterministic proposal rejection is limited to exact normalized
-text matches, active property-ID collisions, duplicate or malformed lineage,
-instance-specific leakage, and non-visual/external/background/historical
-knowledge instructions. Require explicit uncertainty or partial-coverage text
-when hints and rationale would otherwise contradict. Defer semantic coverage
+is non-empty. Pre-intervention rejection is structural only: malformed or
+missing fields, empty text, unresolved placeholders, exact duplicate proposals,
+invalid QA-slot lineage, or instructions requiring tools/inputs unavailable to
+the captioner. Do not reject correct-sample candidates, lexical overlap with QA
+text, active-property similarity, uncertain benefit, weak generality, or likely
+repetition. Defer all semantic suitability and coverage
 to Checkpoint 3D `coverage_assessment` and `covered_by_property_ids`, which feed
 the Checkpoint 3E add/revise/merge/router/no-op rules.
 
 Do not send source-video ID, question ID, segment ID, provider priority rank,
 tool-call ID, or payload-truncation metadata. Preserve these only in a private
 `input_identity.json` used for lineage and resume identity. Bound reasoning
-event count/characters, evidence count, caption characters, transformed image
-bytes, and total text characters before the provider call. `request.json`
+event count/characters, caption characters, transformed image bytes, and total
+text characters before the provider call. Compact payload evidence uses
+timestamp ranges: cited intervals retain fuller generated-description and
+non-duplicate transcript text, while inspected-only intervals use one-line
+250-character description and 120-character transcript summaries. Pack cited
+evidence first, then inspected-only evidence, beneath a 200,000-character
+evidence cap and the existing 250,000-character total envelope. The complete
+original union is retained privately with inclusion/omission decisions and
+hashes; `evidence_packing.json` records aggregate and per-QA counts. `request.json`
 stores the logical source-free multimodal input; `provider_request.json` stores
 the exact secret-free OpenAI request body, including data-URL image blocks.
-Attach source video and all three source QA IDs internally after strict output
-parsing rather than asking the model to repeat them.
+Attach the source video and the one actual source QA ID/baseline-correctness pair
+internally from `source_qa_slot` after strict output parsing rather than asking
+the model to repeat private IDs.
+
+The proposer now treats candidates as executable intervention hypotheses. Every
+eligible QA requires one or two candidates whether its baseline answer is correct
+or incorrect. Downstream intervention and the existing updater decide each
+candidate's fate. Zero remains valid only when no QA is eligible because of
+runtime failure, missing focused evidence, malformed input, or clearly unreliable
+annotation. The canonical proposal and opaque identity include applicability,
+the exact source QA, and baseline correctness;
+legacy failure fields are accepted only by artifact loader/constructor adapters
+and are never serialized by the new provider contract. Applicability and
+`failure_analysis` are retained in proposal, feedback, intervention, property-
+memory, and codebook-updater artifacts. `property_intervention_transitions_v2`
+retains the original proposal plus candidate QA outcomes and transitions;
+`property_compact_summary_v2` and `memory_codebook_updater_request_v2` carry the
+bounded provenance to the updater. Router interpretation remains out of scope.
+
+`multi_property_proposer_v10` adds `missing_qa_slot_retry_v1`. A structurally
+valid initial response that omits a required QA slot gets at most two follow-up
+requests containing only the still-missing slots. Existing candidates remain
+unchanged. Retry request/body/raw and per-row validation artifacts are
+immutable and reusable for exact resume. The combined output uses the same
+1–2-per-QA validation; retry exhaustion still fails closed. Intervention and
+updater acceptance semantics are unchanged.
 
 ### 3.4 Similarity retrieval
 
@@ -215,6 +265,7 @@ Implement property-conditioned retrieval for every candidate property:
 ```text
 exact normalized candidate property text + sampled source-video segment frames
 → SigLIP frame-level cosine similarity
+→ intersect with frozen baseline caption-view segment IDs
 → maximum frame pooling per segment
 → deterministic top-M ranked source-video segments
 → S_sim
@@ -235,6 +286,13 @@ Persist:
 - retrieval budget and model/version.
 - property-text hash, frame-sampling identity, visual-index identity, maximum
   frame-pooling rule, and deterministic ranking version.
+- baseline segment-universe hash/count and excluded visual-index segment IDs.
+
+The baseline passes `caption_view.segment_ids` as a structural allowlist. The
+retriever filters the visual index against it before top-M selection, so a tail
+frame binned into a segment without an incumbent caption cannot consume a
+retrieval slot or fail mixed-view construction. Caption strings remain
+prohibited retrieval inputs.
 
 ### 3.5 `prompt_routing/routed_caption_view.py`
 
@@ -499,16 +557,21 @@ parent memory snapshot from `state_dir/property_memory/current.json`, invokes
 the resulting bounded snapshot and compact intervention summaries directly to
 `MemoryConditionedLLMCodebookUpdater`. It persists the new memory lineage
 pointer separately from production policy pointers. Exact repeat returns the
-completed checkpoint without provider calls; changed/missing artifacts,
-incompatible schemas, a bank/memory-lineage mismatch, or partial output fail
-closed.
+completed checkpoint without provider calls. Changed/missing artifacts,
+incompatible schemas, a bank/memory-lineage mismatch, or partial output without
+the new matching input identity fails closed; a matching strict-retry partial
+output resumes its saved attempts.
 
 Files and interfaces changed:
 
 - `optimization/llm_codebook_updater.py`: strict request/response parsing,
   bounded request building, action-by-action deterministic validation,
   candidate bank application, ID mapping, memory promotion, artifact identity,
-  and exact resume.
+  and exact resume. The real provider now uses updater-specific strict JSON
+  Schema output (`openai_strict_component_update_v2`) and the updater preserves
+  up to three immutable parse attempts. `input_identity.json` permits an
+  interrupted attempt sequence to resume without repeating saved provider
+  calls; pre-identity partial directories fail closed.
 - `optimization/prompts/codebook_updater_v1.txt`: centralized tunable system
   prompt, version `memory_codebook_updater_prompt_v1`.
 - `optimization/final_iteration.py`: optional memory/updater stage injection and
@@ -522,13 +585,15 @@ Files and interfaces changed:
 
 Artifacts use these schemas:
 
-- request: `memory_codebook_updater_request_v1`;
+- request: `memory_codebook_updater_request_v2`;
 - response: `memory_codebook_updater_response_v1`;
 - validation: `memory_codebook_validation_report_v1`;
 - applied plan: `memory_codebook_applied_plan_v1`;
 - candidate codebook: `memory_candidate_codebook_v1`;
 - ID mapping: `property_id_mapping_v1`;
-- updater manifest: `memory_codebook_checkpoint_manifest_v1`;
+- updater manifest: `memory_codebook_checkpoint_manifest_v2`;
+- retry audit: `memory_codebook_updater_attempts_v1`;
+- partial-resume identity: `memory_codebook_updater_input_identity_v1`;
 - orchestration manifest: `memory_conditioned_codebook_iteration_v1`;
 - memory lineage pointer: `property_memory_lineage_pointer_v1`.
 
@@ -588,20 +653,51 @@ Files and interfaces changed:
 - `tests/test_checkpoint3_memory_router_updater.py`: mock-only checkpoint tests.
 - `optimization/bounded_smoke.py`, `scripts/run_phase4_bounded_smoke.py`, and
   `optimization/policies/openai_update.py`: explicit one-video real-smoke
-  opt-in, one-call OpenAI updater providers, atomic checkpoint chaining,
+  opt-in, strict-schema OpenAI updater providers with at most three parse
+  attempts, atomic checkpoint chaining,
   rendered-prompt consumption probe, confirmed-pointer guard, exact resume,
   and worker-cleanup audit. Legacy fixture callers remain deterministic.
 
 Schemas/versions are `memory_router_updater_request_v1`,
 `memory_router_updater_response_v1`, `memory_router_updater_plan_v1`,
 `memory_router_validation_report_v1`, `memory_router_applied_plan_v1`,
-`memory_router_updater_manifest_v1`, `structured_router_policy_v1`,
+`memory_router_updater_manifest_v2`, `memory_router_updater_attempts_v1`,
+`memory_router_updater_input_identity_v1`, `structured_router_policy_v1`,
 `rendered_router_prompt_v1`, `atomic_provisional_policy_pair_v1`, and
 `memory_conditioned_atomic_policy_pair_v1`; the system prompt is
 `memory_router_updater_prompt_v1`.
 
+The router updater execution policy is
+`no_routing_evidence_empty_plan_v1`. Previously, an iteration whose codebook
+plan contained only target-free candidate `no_op` decisions could lead the LLM
+to copy those decisions into router actions with `target_property_id: ""`; the
+strict parser correctly rejected the response and prevented the atomic pair.
+Now zero routing evidence deterministically produces an empty router plan
+without a provider call. `execution.json`, the updater manifest, the atomic
+pair, and the operational log record the execution mode and provider-call
+flag. Target validation is unchanged for every LLM-generated action.
+
 Intentionally deferred: confirmation of this provisional pair, promotion to a
 confirmed production pointer, and any regular production or real-model run.
+
+### 3.17.1 Strict updater envelope and bounded parse recovery
+
+Previously both production updater adapters requested only
+`response_format=json_object`. A response could therefore be valid JSON while
+omitting `schema_version`, or a router no-op could omit/nullable its required
+target. The first strict parser error terminated the iteration and only one
+top-level `raw_response.txt` remained.
+
+Now `optimization/policies/openai_update.py` supplies separate strict response
+schemas for the codebook and router planners. The unchanged canonical response
+schemas remain `memory_codebook_updater_response_v1` and
+`memory_router_updater_response_v1`; provider enforcement and execution
+semantics are versioned separately. Both updaters retain raw/result artifacts
+for attempts 1 through 3, write a response-attempt summary, and use an immutable
+input fingerprint to continue a partial attempt sequence. They never inject a
+missing version, repair model JSON locally, retry runtime/API failures, or
+reinterpret a completed legacy artifact. The codebook candidate, router
+validation, rendering, and atomic-pair semantics are unchanged.
 
 ### 3.18 Production memory-conditioned iteration launcher
 
@@ -724,6 +820,22 @@ identity records the isolation mapping, and cleanup records the child PID and
 release result. CPU embedding and compatible read-only visual-index caches are
 preserved.
 
+DVD search uses another CPU BGE embedder, independent of the isolated SigLIP
+worker. The production launcher now preloads it once under a lock before
+parallel evidence-video QA (`dvd_bge_parent_preload_v1`). This replaces unsafe
+concurrent lazy initialization without changing DVD retrieval or QA semantics.
+The policy version participates in resume identity, so an incomplete run made
+under the previous initialization behavior is not silently reinterpreted.
+
+`serialized_dvd_qa_execution_v1` additionally guards DVD's mutable global
+`VIDEO_FPS`, prompt reset, and instrumentation installation. Evidence videos
+may finish captioning concurrently, but their downstream DVD QA calls enter one
+process-local critical section. Database construction must persist the exact
+per-video effective FPS or the QA fails before tool execution. This prevents
+one video's frame inspection from addressing another video's frame indices and
+prevents nested/cross-wired instrumentation recorders. Captioning and
+intervention worker parallelism are unchanged.
+
 ### 3.22 Production iteration operational logging
 
 Before this correction, model/backend output reached stdout but the production
@@ -743,6 +855,64 @@ reports recaption/cache results and all candidate QA transitions;
 router prompt identity, and atomic pair completion. Resume is explicitly
 reported without changing semantic identity. The operational log is not added
 to immutable artifact hashes.
+
+### 3.23 Compact property-proposer evidence serialization
+
+Before this correction, `multi_property_proposer_v10` placed a structured
+caption/transcript object and representative image into the provider request
+for every cited or inspected interval. A QA that inspected hundreds of
+intervals could exceed the fixed 250,000-character text envelope before the
+proposal provider was called.
+
+`multi_property_proposer_v11` preserves the complete original evidence union
+only in private provenance and sends a deterministic compact view. Provider
+evidence is identified by `[start–end]` timestamp range, never stable segment ID.
+Explicitly cited intervals are ordered first and retain normalized fuller
+generated description and non-duplicate transcript. Inspected-only intervals
+follow as one-line summaries with 250-character description and 120-character
+transcript limits. Empty or substantially duplicate transcripts are omitted.
+No additional model is called.
+
+The evidence-text budget is at most 200,000 characters and is reduced when
+needed to reserve the remainder of the existing envelope for the fixed prompt,
+schema, QA context, and JSON structure. Packing stops deterministically at the
+budget. `input_identity.json` retains every original caption, split transcript,
+segment ID, timestamp, evidence role, representative-frame path/transform/hash,
+and inclusion or omission reason. `evidence_packing.json` records aggregate and
+per-QA included/omitted interval counts, and the same counts are logged.
+
+Versions are `multimodal_property_proposal_request_v10`,
+`multimodal_property_proposal_identity_v6`,
+`multi_property_proposal_artifact_v6`, and
+`compact_cited_then_inspected_evidence_v2`. Existing completed proposal
+artifacts remain immutable and require a fresh output/state directory;
+compatible caption caches remain reusable. Proposal parsing, candidate
+semantics, intervention, memory, updater, and router behavior are unchanged.
+
+### 3.24 Percent-escape recovery and valid-caption retrieval universe
+
+A completed real run exposed two coupled boundary errors. Qwen emitted an
+otherwise-valid fenced caption object containing the invalid JSON escape `\%`.
+All deterministic retries repeated it, leaving `parsed={}` and omitting that
+segment from `captions.json`. However, retrieval intersected the visual index
+with `caption_view.segment_ids`, which describes every scheduled source segment,
+not the subset with a valid incumbent caption. The invalid segment could
+therefore enter `S_sim` and fail later during mixed-view replacement.
+
+`caption_parse_normalization_v2_percent_escape` removes only an unescaped `\%`
+before strict JSON loading and records `replace_invalid_percent_escape`. Valid
+escaped backslashes and unrelated invalid escapes are unchanged. Raw model
+output remains immutable. `history_aware_caption_cache_v4` and
+`caption_parse_retry_v2_percent_escape` reuse earlier valid caches; an earlier
+invalid raw response is reparsed in the new versioned retry sidecar, without a
+model call when that narrow normalization is sufficient.
+
+`valid_baseline_caption_segment_intersection_v2` passes only source-ordered,
+non-empty actual `captions.json` entries to `property_retrieval_batch_v3` and
+`property_frame_retrieval_v3`. Failed caption segments remain in raw routing and
+cache artifacts but cannot be retrieved or selectively replaced. The valid
+caption-universe hash and count preserve exact resume and make older retrieval
+artifacts incompatible rather than silently reinterpreted.
 
 ## 4. Required tests
 

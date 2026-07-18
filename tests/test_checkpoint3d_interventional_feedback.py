@@ -42,9 +42,15 @@ def proposal(candidate_id, coverage_hints=()):
     return CandidatePropertyProposal(
         candidate_property_id=candidate_id,
         property_text=f"Track reusable fine-grained actions for {candidate_id}.",
+        applicability={
+            "when": "Use when frames show a fine-grained action transition.",
+            "positive_cues": ["Visible action state changes across frames."],
+            "negative_cues": ["No action transition is visible."],
+            "required_modalities": ["frames"],
+        },
         source_video_id="video-1", source_question_ids=("q1", "q2"),
-        motivating_failure_types=("missed_action",),
-        coverage_hints=tuple(coverage_hints), proposal_rationale="fixture",
+        coverage_hints=tuple(coverage_hints),
+        failure_analysis="Visible action completion was omitted from the description.",
         proposer_policy_version="fixture_v1")
 
 
@@ -279,6 +285,10 @@ def test_flip_only_feedback_intersection_bounds_aggregation_and_resume(tmp_path)
     assert [item["segment_id"] for item in positive["segments"]] == ["0_10", "10_20"]
     assert [item["segment_id"] for item in negative["segments"]] == ["10_20"]
     for request in provider.calls:
+        assert request["schema_version"] == "property_flip_feedback_request_v3"
+        assert request["candidate_property"]["applicability"][
+            "required_modalities"] == ["frames"]
+        assert "failure_analysis" in request["candidate_property"]
         assert all(len(segment["frames"]) == 1 for segment in request["segments"])
         assert all(len(segment["frozen_history"]) == 1
                    for segment in request["segments"])

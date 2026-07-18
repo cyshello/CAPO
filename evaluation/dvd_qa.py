@@ -16,9 +16,12 @@ caption prompts influence captions only, never the reasoning-side prompts.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
+import threading
 import time
+from contextlib import contextmanager
 
 from surrogate_rollout import config
 from surrogate_rollout.cache.caption_cache import captions_content_hash
@@ -30,14 +33,51 @@ for _p in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
         sys.path.insert(0, _p)
 
 _BACKEND_INSTALLED = False
+_DVD_EMBEDDER_PRELOAD_LOCK = threading.Lock()
+_DVD_EMBEDDER_PRELOADED = False
+DVD_EMBEDDER_PRELOAD_POLICY_VERSION = "dvd_bge_parent_preload_v1"
+_DVD_QA_EXECUTION_LOCK = threading.Lock()
+DVD_QA_CONCURRENCY_POLICY_VERSION = "serialized_dvd_qa_execution_v1"
+
+
+@contextmanager
+def serialized_dvd_qa_execution():
+    """Isolate DVD's mutable FPS, prompt, and instrumentation globals."""
+    with _DVD_QA_EXECUTION_LOCK:
+        yield
+
+
+def preload_dvd_embedder() -> None:
+    """Build DVD's shared BGE model once before parallel QA threads start.
+
+    DVD's lazy loader is not synchronized. Concurrent first-use from evidence
+    video threads can therefore observe a partially initialized
+    SentenceTransformer. Keep the synchronization at our execution boundary
+    without modifying the external DVD checkout.
+    """
+    global _DVD_EMBEDDER_PRELOADED
+    if _DVD_EMBEDDER_PRELOADED:
+        return
+    with _DVD_EMBEDDER_PRELOAD_LOCK:
+        if _DVD_EMBEDDER_PRELOADED:
+            return
+        import dvd_backend
+
+        embedder = dvd_backend._get_embedder()
+        if embedder is None:
+            raise RuntimeError("DVD BGE preload returned no embedder")
+        _DVD_EMBEDDER_PRELOADED = True
 
 
 def dvd_qa_execution_identity(max_iterations: int) -> dict[str, object]:
     return {
-        "policy_version": "dvd_qa_execution_v2",
+        "policy_version": "dvd_qa_execution_v3",
         "dvd_max_iterations": int(max_iterations),
         "clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
         "clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
+        "embedding_preload_policy_version":
+            DVD_EMBEDDER_PRELOAD_POLICY_VERSION,
+        "qa_concurrency_policy_version": DVD_QA_CONCURRENCY_POLICY_VERSION,
     }
 
 
@@ -68,6 +108,7 @@ def ensure_backend(
     use_openai_tools: bool = True,
     text_backend: str = "openai",
     preload_captioner: bool = False,
+    preload_embedder: bool = False,
 ) -> None:
     """Install the codex+Qwen+BGE backend once per process (idempotent).
 
@@ -98,6 +139,8 @@ def ensure_backend(
         from dvd_backend import get_captioner
 
         get_captioner()  # build the vLLM engine before any thread pools exist
+    if preload_embedder:
+        preload_dvd_embedder()
 
 
 def resolve_frames_dir(sample: dict, video_id: str) -> str:
@@ -179,8 +222,6 @@ def run_dvd_qa(
 
     os.makedirs(run_dir, exist_ok=True)
     video_id = sample.get("extra", {}).get("videoID") or sample["sample_id"]
-    reset_prompts()  # reasoning-side prompts stay DVD defaults in Phase 2
-
     # frames link must exist next to the captions dir (frame_inspect resolves
     # video_file_root = dirname(dirname(captions_path)))
     workdir = os.path.dirname(os.path.dirname(captions_path))
@@ -189,7 +230,7 @@ def run_dvd_qa(
         os.makedirs(workdir, exist_ok=True)
         os.symlink(resolve_frames_dir(sample, video_id), link)
 
-    dvd_config.VIDEO_FPS = effective_fps_for(sample, video_id)
+    effective_fps = effective_fps_for(sample, video_id)
     db_path = database_path or database_path_for(captions_path)
     question = format_question(sample)
 
@@ -198,23 +239,34 @@ def run_dvd_qa(
     clip_keys = [k for k in captions
                  if k not in ("subject_registry", "character_registry")]
 
-    recorder = instrumentation.install(
-        clip_search_top_k=config.DVD_CLIP_SEARCH_TOP_K)
-    t0 = time.time()
     messages: list[dict] = []
     errors: list[dict] = []
-    try:
-        agent = DVDCoreAgent(db_path, captions_path, max_iterations)
-        _constrain_clip_search_schema(agent, config.DVD_CLIP_SEARCH_TOP_K)
-        messages = agent.run(question)
-    except Exception as e:
-        import traceback
+    with serialized_dvd_qa_execution():
+        reset_prompts()  # reasoning prompts and VIDEO_FPS are DVD globals
+        dvd_config.VIDEO_FPS = effective_fps
+        recorder = instrumentation.install(
+            clip_search_top_k=config.DVD_CLIP_SEARCH_TOP_K)
+        t0 = time.time()
+        try:
+            agent = DVDCoreAgent(db_path, captions_path, max_iterations)
+            stored_fps = agent.video_db.get_additional_data().get("fps")
+            if not isinstance(stored_fps, (int, float)) or not math.isclose(
+                    float(stored_fps), effective_fps,
+                    rel_tol=1e-9, abs_tol=1e-12):
+                raise RuntimeError(
+                    "DVD database FPS identity mismatch: "
+                    f"expected={effective_fps!r}, stored={stored_fps!r}")
+            _constrain_clip_search_schema(agent, config.DVD_CLIP_SEARCH_TOP_K)
+            messages = agent.run(question)
+        except Exception as e:
+            import traceback
 
-        errors.append({"stage": "dvd_qa", "type": type(e).__name__,
-                       "error": str(e), "traceback": traceback.format_exc()})
-    finally:
-        latency = time.time() - t0
-        recorder.uninstall()
+            errors.append({"stage": "dvd_qa", "type": type(e).__name__,
+                           "error": str(e),
+                           "traceback": traceback.format_exc()})
+        finally:
+            latency = time.time() - t0
+            recorder.uninstall()
 
     try:
         refs = extract_references(messages, recorder.tool_events, clip_keys)

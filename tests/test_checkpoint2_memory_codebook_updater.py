@@ -70,6 +70,12 @@ def candidate_memory(candidate_id="cp-new", *, positive=True):
         "schema_version": "property_memory_v1", "candidate_property_id": candidate_id,
         "source_video_id": "v1",
         "property_text": "Track reusable object completion states.",
+        "applicability": {
+            "when": "Use when frames show a completion-state transition.",
+            "positive_cues": ["A visible object reaches a completed state."],
+            "negative_cues": [], "required_modalities": ["frames"],
+        },
+        "failure_analysis": "The generated description omitted completion.",
         "why_proposed": "Completion state was omitted.",
         "intended_reusable_behavior": "Track reusable object completion states.",
         "related_active_property_ids": [],
@@ -139,6 +145,25 @@ class MockProvider:
         return {"provider": "fixture", "model": self.model, "real_model": False}
 
 
+class SequenceProvider:
+    model = "fixture-codebook-model"
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def __call__(self, system_prompt, request):
+        self.calls.append((system_prompt, json.loads(request)))
+        value = self.responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def metadata(self):
+        return {"provider": "fixture-sequence", "model": self.model,
+                "real_model": False}
+
+
 def run_updater(tmp_path, actions, *, candidates=None, properties=None, output="updater"):
     provider = MockProvider(actions)
     updater = MemoryConditionedLLMCodebookUpdater(response_provider=provider)
@@ -169,6 +194,53 @@ def test_strict_updater_plan_parsing():
             "actions": [malformed]}), max_actions=2)
 
 
+def test_parse_failure_retries_and_preserves_attempts(tmp_path):
+    provider = SequenceProvider([
+        json.dumps({"actions": []}),
+        json.dumps({"schema_version": UPDATER_RESPONSE_SCHEMA_VERSION,
+                    "actions": []}),
+    ])
+    updater = MemoryConditionedLLMCodebookUpdater(response_provider=provider)
+    result = updater.run(
+        iteration_id="iteration-1", prompt_bank=bank(),
+        property_memory_snapshot_path=memory_snapshot(tmp_path),
+        intervention_summary_path=effects_path(tmp_path),
+        output_dir=str(tmp_path / "retry"))
+    attempts = json.loads(Path(
+        result["artifacts"]["response_attempts"]).read_text())
+    assert len(provider.calls) == 2
+    assert attempts["accepted_attempt_index"] == 2
+    assert [row["status"] for row in attempts["attempts"]] == [
+        "rejected", "accepted"]
+    assert "previous response failed strict parsing" in provider.calls[1][0]
+
+
+def test_partial_retry_resume_does_not_repeat_completed_provider_call(tmp_path):
+    output = tmp_path / "partial"
+    first = SequenceProvider([
+        json.dumps({"actions": []}), RuntimeError("temporary provider failure")])
+    updater = MemoryConditionedLLMCodebookUpdater(response_provider=first)
+    memory_path = memory_snapshot(tmp_path)
+    effects = effects_path(tmp_path)
+    with pytest.raises(RuntimeError, match="temporary provider failure"):
+        updater.run(
+            iteration_id="iteration-1", prompt_bank=bank(),
+            property_memory_snapshot_path=memory_path,
+            intervention_summary_path=effects, output_dir=str(output))
+    second = SequenceProvider([
+        json.dumps({"schema_version": UPDATER_RESPONSE_SCHEMA_VERSION,
+                    "actions": []})])
+    resumed = MemoryConditionedLLMCodebookUpdater(response_provider=second).run(
+        iteration_id="iteration-1", prompt_bank=bank(),
+        property_memory_snapshot_path=memory_path,
+        intervention_summary_path=effects, output_dir=str(output))
+    assert len(first.calls) == 2
+    assert len(second.calls) == 1
+    attempts = json.loads(Path(
+        resumed["artifacts"]["response_attempts"]).read_text())
+    assert attempts["accepted_attempt_index"] == 2
+
+
 def test_supported_add_and_promotion_after_validation(tmp_path):
     add = action(
         "add-1", "add", candidate_ids=["cp-new"],
@@ -180,6 +252,8 @@ def test_supported_add_and_promotion_after_validation(tmp_path):
         tmp_path, [add], candidates=[candidate_memory()])
     output = candidate_bank(result)
     assert output.entry("pe_memory_new").status == "active"
+    assert output.entry("pe_memory_new").applicability_traits[
+        "required_modalities"] == ("frames",)
     mapping = json.loads(Path(result["artifacts"]["property_id_mapping"]).read_text())
     assert mapping["candidate_promotions"] == {"cp-new": "pe_memory_new"}
     promoted = json.loads(Path(
@@ -189,8 +263,10 @@ def test_supported_add_and_promotion_after_validation(tmp_path):
     assert candidate["status"] == "promoted"
     assert provider.calls[0][1]["candidate_memories"][0][
         "candidate_property_id"] == "cp-new"
+    assert provider.calls[0][1]["candidate_memories"][0]["failure_analysis"] == (
+        "The generated description omitted completion.")
     assert provider.calls[0][1]["schema_version"] == \
-        "memory_codebook_updater_request_v1"
+        "memory_codebook_updater_request_v2"
 
 
 def test_unsupported_add_is_rejected_and_candidate_stays_separate(tmp_path):
@@ -317,6 +393,12 @@ def orchestration_raw_artifacts(tmp_path, *, with_candidate=True):
         "candidate_property_id": "cp-new",
         "property_text": "Track reusable object completion states.",
         "source_video_id": video, "source_question_ids": ["q1"],
+        "source_qa_baseline_correct": False,
+        "applicability": {
+            "when": "Visible evidence shows an object changing completion state.",
+            "positive_cues": ["A completion state is visually observable."],
+            "negative_cues": [], "required_modalities": ["frames"],
+        },
         "motivating_failure_types": ["missing_state"],
         "covered_by_existing_property_ids": [],
         "proposal_rationale": "Completion state was omitted.",
@@ -328,14 +410,32 @@ def orchestration_raw_artifacts(tmp_path, *, with_candidate=True):
         "video_id": video, "property_proposal_path": proposal_path})
     results = []
     if with_candidate:
+        original_proposal = proposals[0]
         transitions_path = write_json(tmp_path / "raw" / "transitions.json", {
             "candidate_property_id": "cp-new", "source_video_id": video,
+            "original_proposal": original_proposal,
+            "source_question_ids": ["q1"],
+            "source_qa_baseline_correct": False,
             "transition_counts": {"wrong_to_correct": 1, "correct_to_wrong": 0,
                                   "correct_to_correct": 2, "wrong_to_wrong": 0},
-            "qas": [{}, {}, {}]})
+            "qas": [
+                {"question_id": "q1", "baseline_prediction": "B",
+                 "candidate_prediction": "A", "baseline_correct": False,
+                 "candidate_correct": True, "transition": "wrong_to_correct",
+                 "errors": []},
+                {"question_id": "q2", "baseline_prediction": "A",
+                 "candidate_prediction": "A", "baseline_correct": True,
+                 "candidate_correct": True, "transition": "correct_to_correct",
+                 "errors": []},
+                {"question_id": "q3", "baseline_prediction": "A",
+                 "candidate_prediction": "A", "baseline_correct": True,
+                 "candidate_correct": True, "transition": "correct_to_correct",
+                 "errors": []},
+            ]})
         result_path = write_json(tmp_path / "raw" / "result.json", {
             "status": "completed", "candidate_property_id": "cp-new",
-            "source_video_id": video, "transitions_path": transitions_path})
+            "source_video_id": video, "original_proposal": original_proposal,
+            "transitions_path": transitions_path})
         results.append({"candidate_property_id": "cp-new",
                         "result_path": result_path})
     intervention_path = write_json(tmp_path / "raw" / "intervention.json", {
@@ -380,6 +480,12 @@ def test_orchestrator_automatically_feeds_memory_snapshot_to_updater(tmp_path):
     assert result["production_pointer_mutated"] is False
     assert provider.calls[0][1]["candidate_memories"][0][
         "candidate_property_id"] == "cp-new"
+    effect = provider.calls[0][1]["current_intervention_summaries"][0]
+    assert effect["original_proposal"]["property_text"] == (
+        "Track reusable object completion states.")
+    assert effect["source_question_ids"] == ["q1"]
+    assert effect["source_qa_baseline_correct"] is False
+    assert effect["qa_transitions"][0]["transition"] == "wrong_to_correct"
     resumed = runner.run_memory_conditioned_codebook_checkpoint(
         iteration_id="iteration-1", iteration_ordinal=1, prompt_bank=bank(),
         baseline_video_manifest_paths=(baseline_path,),

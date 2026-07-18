@@ -84,6 +84,15 @@ def _caption_text(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _valid_caption_segment_ids(
+    segment_ids: tuple[str, ...], captions: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return only source-ordered segments with an actual incumbent caption."""
+    return tuple(
+        segment_id for segment_id in segment_ids
+        if _caption_text(captions.get(segment_id)).strip())
+
+
 def _frame_references(clip_index: list[tuple[str, dict]]) -> dict[str, tuple[str, ...]]:
     output = {}
     for segment_id, info in clip_index:
@@ -459,6 +468,8 @@ class BaselinePhaseRunner:
 
             with open(caption_view.captions_path) as f:
                 captions = json.load(f)
+            valid_caption_segment_ids = _valid_caption_segment_ids(
+                tuple(caption_view.segment_ids), captions)
 
             emit_stage(
                 stage_logger, event="START", stage="baseline_qa",
@@ -588,6 +599,7 @@ class BaselinePhaseRunner:
                 try:
                     retrieval_result = self.property_retrieval_runner.run(
                         sample=dict(samples[0]), proposals=proposals,
+                        baseline_segment_ids=valid_caption_segment_ids,
                         output_dir=os.path.join(
                             output_dir, "property_retrieval", record.video_id))
                 except Exception as exc:

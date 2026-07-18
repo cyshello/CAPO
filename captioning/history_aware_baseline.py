@@ -53,7 +53,11 @@ PARALLEL_GROUP_SCHEDULER_VERSION = "history_block_gpu_scheduler_v1"
 LOCAL_QWEN_BACKEND_ID = "captioning.qwen25_vl.Qwen25VLCaptioner"
 CAPTION_OUTPUT_CONTRACT_VERSION = "caption_output_contract_v2"
 CAPTION_PARSE_SCHEMA_VERSION = "caption_parse_result_v2"
-CAPTION_CACHE_SCHEMA_VERSION = "history_aware_caption_cache_v2"
+CAPTION_PARSE_NORMALIZATION_VERSION = (
+    "caption_parse_normalization_v2_percent_escape")
+CAPTION_CACHE_SCHEMA_VERSION = "history_aware_caption_cache_v4"
+CAPTION_RETRY_POLICY_VERSION = "caption_parse_retry_v2_percent_escape"
+CAPTION_ATTEMPT_SCHEMA_VERSION = "caption_generation_attempt_v1"
 
 
 def build_caption_output_contract(subject_registry_mode: str) -> str:
@@ -175,6 +179,29 @@ def _parse_caption_output_with_metadata(
             lines = lines[:-1]
         text = "\n".join(lines).strip()
         normalizations.append("strip_markdown_fence")
+    normalized = []
+    percent_escape_replaced = False
+    index = 0
+    while index < len(text):
+        if text[index] != "\\":
+            normalized.append(text[index])
+            index += 1
+            continue
+        end = index
+        while end < len(text) and text[end] == "\\":
+            end += 1
+        slash_count = end - index
+        if end < len(text) and text[end] == "%" and slash_count % 2 == 1:
+            normalized.append("\\" * (slash_count - 1))
+            normalized.append("%")
+            percent_escape_replaced = True
+            index = end + 1
+            continue
+        normalized.append("\\" * slash_count)
+        index = end
+    if percent_escape_replaced:
+        text = "".join(normalized)
+        normalizations.append("replace_invalid_percent_escape")
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
@@ -282,6 +309,7 @@ def _parallel_history_worker(
     result_queue: Any,
     text_backend: str,
     use_openai_tools: bool,
+    routing_mode: str = "property_bank",
 ) -> None:
     """Own one GPU/model instance and serve caption tasks until shutdown."""
     try:
@@ -298,7 +326,8 @@ def _parallel_history_worker(
             text_backend=text_backend,
             use_openai_tools=use_openai_tools,
         )
-        builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen()
+        builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen(
+            routing_mode=routing_mode)
         while True:
             command = command_queue.get()
             request_id = command["request_id"]
@@ -372,6 +401,8 @@ def _parallel_history_worker(
                             "result_path": result.result_path,
                             "cache_hit": result.cache_hit,
                             "caption_seconds": result.caption_seconds,
+                            "model_call_count": result.model_call_count,
+                            "retry_count": result.retry_count,
                         },
                     }
                 elif command["type"] == "raw_vlm":
@@ -408,6 +439,8 @@ class HistoryAwareCaptionResult:
     result_path: str
     cache_hit: bool
     caption_seconds: float
+    model_call_count: int = 0
+    retry_count: int = 0
 
 
 class HistoryAwareSegmentCaptioner:
@@ -431,6 +464,10 @@ class HistoryAwareSegmentCaptioner:
             "decoding": as_json_dict(config.CAPTION_DECODING),
             "caption_output_contract_version": CAPTION_OUTPUT_CONTRACT_VERSION,
             "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "caption_parse_normalization_version":
+                CAPTION_PARSE_NORMALIZATION_VERSION,
+            "caption_retry_policy_version": CAPTION_RETRY_POLICY_VERSION,
+            "caption_parse_max_retries": config.CAPTION_PARSE_MAX_RETRIES,
             "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
             "real_model": True,
         }
@@ -483,6 +520,8 @@ class HistoryAwareSegmentCaptioner:
                 "caption_output_contract_hash":
                     sha256_text(CAPTION_OUTPUT_CONTRACT),
                 "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+                "caption_parse_normalization_version":
+                    CAPTION_PARSE_NORMALIZATION_VERSION,
                 "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
             })),
             caption_model_id=self.caption_model_id,
@@ -500,15 +539,43 @@ class HistoryAwareSegmentCaptioner:
             "legacy": False,
             "history_dependent": True,
         }, cache_manifest_path)
+        retry_result_path = os.path.join(
+            cache_dir, "parse_retries", CAPTION_RETRY_POLICY_VERSION,
+            "caption.json")
+        cached_invalid = None
         if os.path.exists(result_path):
             with open(result_path) as f:
                 cached = json.load(f)
             if cached.get("cache_key") != key_as_dict(key):
                 raise RuntimeError("history-aware cache file identity mismatch")
-            return HistoryAwareCaptionResult(
-                parsed=cached.get("parsed") or {}, cache_key=key_as_dict(key),
-                cache_dir=cache_dir, result_path=result_path,
-                cache_hit=True, caption_seconds=0.0)
+            if cached.get("parsed") or (
+                    cached.get("caption_retry_policy_version") ==
+                    CAPTION_RETRY_POLICY_VERSION and
+                    cached.get("caption_parse_normalization_version") ==
+                    CAPTION_PARSE_NORMALIZATION_VERSION):
+                return HistoryAwareCaptionResult(
+                    parsed=cached.get("parsed") or {}, cache_key=key_as_dict(key),
+                    cache_dir=cache_dir, result_path=result_path,
+                    cache_hit=True, caption_seconds=0.0,
+                    model_call_count=0,
+                    retry_count=int(cached.get("retry_count") or 0))
+            cached_invalid = cached
+            if os.path.exists(retry_result_path):
+                with open(retry_result_path) as f:
+                    retried = json.load(f)
+                if retried.get("cache_key") != key_as_dict(key) or \
+                        retried.get("caption_retry_policy_version") != \
+                        CAPTION_RETRY_POLICY_VERSION or \
+                        retried.get("caption_parse_normalization_version") != \
+                        CAPTION_PARSE_NORMALIZATION_VERSION:
+                    raise RuntimeError(
+                        "history-aware retry cache file identity mismatch")
+                return HistoryAwareCaptionResult(
+                    parsed=retried.get("parsed") or {},
+                    cache_key=key_as_dict(key), cache_dir=cache_dir,
+                    result_path=retry_result_path, cache_hit=True,
+                    caption_seconds=0.0, model_call_count=0,
+                    retry_count=int(retried.get("retry_count") or 0))
 
         start, end = _segment_times(segment_id)
         transcript = str(clip_info.get("transcript") or "No transcript.")
@@ -524,13 +591,53 @@ class HistoryAwareSegmentCaptioner:
         frames = clip_info.get("files") or clip_info.get("frames") or ()
         if isinstance(frames, (str, os.PathLike)):
             frames = (frames,)
-        t0 = time.monotonic()
-        raw = self.vlm.caption(
-            tuple(os.fspath(item) for item in frames), prompt,
-            max_tokens=int(config.CAPTION_DECODING["max_tokens"]),
-        )
-        elapsed = time.monotonic() - t0
-        parsed, parse_result = _parse_caption_output_with_metadata(raw)
+        frame_paths = tuple(os.fspath(item) for item in frames)
+        attempts = []
+        model_call_count = 0
+        elapsed = 0.0
+        parsed: dict[str, Any] = {}
+        raw = ""
+        parse_result: dict[str, Any] = {}
+        if cached_invalid is not None:
+            raw = str(cached_invalid.get("raw_output") or "")
+            parsed, parse_result = _parse_caption_output_with_metadata(raw)
+            attempts.append({
+                "schema_version": CAPTION_ATTEMPT_SCHEMA_VERSION,
+                "attempt_index": 1,
+                "source": "immutable_cached_initial_attempt",
+                "raw_output": raw,
+                "parse_result": parse_result,
+                "parsed_valid": bool(parsed),
+                "caption_seconds": 0.0,
+            })
+            call_indices = (
+                () if parsed else
+                range(1, config.CAPTION_PARSE_MAX_RETRIES + 1))
+        else:
+            call_indices = range(0, config.CAPTION_PARSE_MAX_RETRIES + 1)
+        for retry_index in call_indices:
+            t0 = time.monotonic()
+            raw = self.vlm.caption(
+                frame_paths, prompt,
+                max_tokens=int(config.CAPTION_DECODING["max_tokens"]),
+            )
+            attempt_seconds = time.monotonic() - t0
+            elapsed += attempt_seconds
+            model_call_count += 1
+            parsed, parse_result = _parse_caption_output_with_metadata(raw)
+            attempts.append({
+                "schema_version": CAPTION_ATTEMPT_SCHEMA_VERSION,
+                "attempt_index": len(attempts) + 1,
+                "source": "model_call",
+                "retry_index": retry_index,
+                "raw_output": raw,
+                "parse_result": parse_result,
+                "parsed_valid": bool(parsed),
+                "caption_seconds": attempt_seconds,
+            })
+            if parsed:
+                break
+        retry_count = max(0, len(attempts) - 1)
         if parsed:
             parsed["clip_description"] = (
                 str(parsed["clip_description"])
@@ -543,15 +650,29 @@ class HistoryAwareSegmentCaptioner:
             "rendered_prompt_hash": sha256_text(prompt),
             "caption_output_contract_version":
                 CAPTION_OUTPUT_CONTRACT_VERSION,
+            "caption_parse_normalization_version":
+                CAPTION_PARSE_NORMALIZATION_VERSION,
+            "caption_retry_policy_version": CAPTION_RETRY_POLICY_VERSION,
+            "caption_parse_max_retries": config.CAPTION_PARSE_MAX_RETRIES,
+            "attempt_count": len(attempts),
+            "retry_count": retry_count,
+            "retry_exhausted": (
+                not bool(parsed)
+                and retry_count >= config.CAPTION_PARSE_MAX_RETRIES),
+            "attempts": attempts,
             "parse_result": parse_result,
             "raw_output": raw,
             "parsed": parsed,
         }
-        _atomic_write_text(result_path, json.dumps(
+        persisted_result_path = (
+            retry_result_path if cached_invalid is not None else result_path)
+        _atomic_write_text(persisted_result_path, json.dumps(
             payload, sort_keys=True, ensure_ascii=False, indent=2) + "\n")
         return HistoryAwareCaptionResult(
             parsed=parsed, cache_key=key_as_dict(key), cache_dir=cache_dir,
-            result_path=result_path, cache_hit=False, caption_seconds=elapsed)
+            result_path=persisted_result_path, cache_hit=False,
+            caption_seconds=elapsed, model_call_count=model_call_count,
+            retry_count=retry_count)
 
 
 @dataclass(frozen=True)
@@ -584,8 +705,9 @@ class HistoryAwareBaselineCaptionViewBuilder:
         captions_writer: Callable[[dict, str], tuple[str, str]] = write_captions_json,
         parallel_gpus: tuple[str, ...] = (),
         parallel_executor: Callable[..., tuple[str, ...]] | None = None,
-        worker_text_backend: str = "codex",
-        worker_use_openai_tools: bool = False,
+        worker_text_backend: str = config.DVD_TEXT_BACKEND,
+        worker_use_openai_tools: bool = config.DVD_USE_OPENAI_TOOLS,
+        free_form_generator: Any | None = None,
     ) -> None:
         normalized_gpus = tuple(str(value).strip() for value in parallel_gpus)
         if any(not value for value in normalized_gpus) or \
@@ -593,6 +715,11 @@ class HistoryAwareBaselineCaptionViewBuilder:
             raise ValueError("parallel_gpus must contain unique non-empty GPU IDs")
         self.router = router
         self.segment_captioner = segment_captioner
+        # Opt-in free-form baseline (ablation): when set, the per-segment
+        # adaptive instruction is generated on the fly instead of routed from
+        # the prompt bank; everything downstream (scaffold, captioner, caches,
+        # DVD evaluation) is shared. None (default) = existing behavior.
+        self.free_form_generator = free_form_generator
         self.merge_fn = merge_fn or default_merge_fn
         self.captions_writer = captions_writer
         self.parallel_gpus = normalized_gpus
@@ -615,19 +742,33 @@ class HistoryAwareBaselineCaptionViewBuilder:
         self._parent_previous_captioner: Any | None = None
 
     @classmethod
-    def from_local_qwen(cls, *, parallel_gpus: tuple[str, ...] = ()):
+    def from_local_qwen(cls, *, parallel_gpus: tuple[str, ...] = (),
+                        routing_mode: str = "property_bank"):
         from surrogate_rollout.prompt_routing.policies.history_aware_vlm_router import (
             HistoryAwareVLMRouter,
             get_local_qwen_backend,
         )
 
+        if routing_mode not in ("property_bank", "free_form_generator"):
+            raise ValueError(
+                f"unknown routing_mode {routing_mode!r} "
+                "(supported: 'property_bank', 'free_form_generator')")
         vlm = (_LazyLocalQwenBackend() if parallel_gpus
                else get_local_qwen_backend())
+        free_form_generator = None
+        if routing_mode == "free_form_generator":
+            from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
+                VLMFreeFormInstructionGenerator,
+            )
+
+            free_form_generator = VLMFreeFormInstructionGenerator(
+                vlm, backend_id=LOCAL_QWEN_BACKEND_ID)
         builder = cls(
             router=HistoryAwareVLMRouter(vlm, backend_id=LOCAL_QWEN_BACKEND_ID),
             segment_captioner=HistoryAwareSegmentCaptioner(
                 vlm, backend_id=LOCAL_QWEN_BACKEND_ID),
             parallel_gpus=parallel_gpus,
+            free_form_generator=free_form_generator,
         )
         if parallel_gpus:
             builder.segment_captioner.remote_dispatcher = builder
@@ -743,7 +884,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 history_summary=history["serialized_history"],
                 metadata={"history_hash": history["history_hash"]},
             )
-            state_identity = sha256_text(dumps_canonical({
+            state_identity_payload = {
                 "context": context,
                 "prompt_bank": prompt_bank,
                 "router_policy": router_policy,
@@ -757,6 +898,8 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 "caption_output_contract_version":
                     CAPTION_OUTPUT_CONTRACT_VERSION,
                 "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+                "caption_parse_normalization_version":
+                    CAPTION_PARSE_NORMALIZATION_VERSION,
                 "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
                 "caption_run_identity_hash": caption_run_identity_hash,
                 "history_configuration": {
@@ -765,7 +908,14 @@ class HistoryAwareBaselineCaptionViewBuilder:
                     "max_history_captions": max_history_captions,
                     "boundary_rule": "floor_segment_start_div_block_seconds",
                 },
-            }))
+            }
+            if self.free_form_generator is not None:
+                # Key added ONLY in free-form mode so property-bank state
+                # identities (and therefore resume behavior) stay byte-stable.
+                state_identity_payload["free_form_generator_identity"] = dict(
+                    self.free_form_generator.configuration_identity)
+            state_identity = sha256_text(
+                dumps_canonical(state_identity_payload))
             state_path = os.path.join(
                 state_dir, segment_id.replace("/", "_") + ".json")
             state = None
@@ -789,13 +939,30 @@ class HistoryAwareBaselineCaptionViewBuilder:
                     "result_path": state["caption_result_path"],
                     "cache_hit": True,
                     "caption_seconds": 0.0,
+                    "model_call_count": 0,
+                    "retry_count": int(cached_payload.get("retry_count") or 0),
                 }
                 resumed_segments += 1
             else:
-                decision = self.router.route(context, prompt_bank, router_policy)
-                router_calls += 1
-                selected_entries = tuple(bank_by_id[value]
-                                         for value in decision.selected_prompt_ids)
+                if self.free_form_generator is not None:
+                    from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
+                        build_free_form_selection,
+                    )
+
+                    decision, selected_entries, exchange = (
+                        build_free_form_selection(
+                            generator=self.free_form_generator,
+                            context=context, clip_info=clip_info,
+                            prompt_bank=prompt_bank))
+                    router_calls += 1
+                else:
+                    decision = self.router.route(
+                        context, prompt_bank, router_policy)
+                    router_calls += 1
+                    selected_entries = tuple(
+                        bank_by_id[value]
+                        for value in decision.selected_prompt_ids)
+                    exchange = getattr(self.router, "last_exchange", None)
                 composed = scaffold.apply(
                     context=context,
                     selected_entries=selected_entries,
@@ -820,7 +987,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
                     intervention_identity_hash=caption_run_identity_hash,
                 )
                 parsed = dict(result.parsed)
-                caption_calls += int(not result.cache_hit)
+                caption_calls += result.model_call_count
                 cache_hits += int(result.cache_hit)
                 caption_result = {
                     "cache_key": result.cache_key,
@@ -828,8 +995,9 @@ class HistoryAwareBaselineCaptionViewBuilder:
                     "result_path": result.result_path,
                     "cache_hit": result.cache_hit,
                     "caption_seconds": result.caption_seconds,
+                    "model_call_count": result.model_call_count,
+                    "retry_count": result.retry_count,
                 }
-                exchange = getattr(self.router, "last_exchange", None)
                 state_payload = {
                     "schema_version": "history_aware_baseline_segment_v1",
                     "state_identity": state_identity,
@@ -1114,7 +1282,10 @@ class HistoryAwareBaselineCaptionViewBuilder:
             process = self._pool_context.Process(
                 target=_parallel_history_worker,
                 args=(gpu, command_queue, self._pool_result_queue,
-                      self.worker_text_backend, self.worker_use_openai_tools),
+                      self.worker_text_backend, self.worker_use_openai_tools,
+                      ("free_form_generator"
+                       if self.free_form_generator is not None
+                       else "property_bank")),
                 name=f"history-caption-gpu-{gpu}",
             )
             process.start()

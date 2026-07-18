@@ -20,6 +20,10 @@ if REPO_PARENT not in sys.path:
     sys.path.insert(0, REPO_PARENT)
 
 from surrogate_rollout import config
+from surrogate_rollout.evaluation.dvd_qa import (
+    DVD_EMBEDDER_PRELOAD_POLICY_VERSION,
+    DVD_QA_CONCURRENCY_POLICY_VERSION,
+)
 from surrogate_rollout.optimization.final_iteration import Checkpoint3EOrchestrator
 from surrogate_rollout.optimization.production_iteration import (
     MemoryConditionedProductionIterationRunner,
@@ -185,6 +189,8 @@ def _build_runtime(args, *, gpus, bank, router, components, split_hash):
     )
     from surrogate_rollout.optimization.policies.openai_update import (
         OpenAIJSONUpdateProvider,
+        codebook_updater_response_schema,
+        router_updater_response_schema,
     )
     from surrogate_rollout.optimization.policies.property_proposal import (
         MultiPropertyProposalPolicy, OpenAIPropertyProposalProvider,
@@ -214,12 +220,15 @@ def _build_runtime(args, *, gpus, bank, router, components, split_hash):
     primary_gpu = gpus[0]
     ensure_backend(
         primary_gpu, preload_captioner=False,
-        text_backend="codex", use_openai_tools=False)
+        preload_embedder=True,
+        text_backend=config.DVD_TEXT_BACKEND,
+        use_openai_tools=config.DVD_USE_OPENAI_TOOLS)
     provider = get_provider(config.BENCHMARK, split=config.BENCHMARK_SPLIT)
     sample_loader = provider.__getitem__
     prompts = get_prompts()
     history_builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen(
-        parallel_gpus=gpus)
+        parallel_gpus=gpus,
+        routing_mode=getattr(args, "routing_mode", "property_bank"))
     retrieval_embedder = (
         SiglipEmbedder(model_id=config.VISUAL_INDEX_MODEL_ID, device="cpu")
         if args.embedding_gpu is None else
@@ -258,9 +267,13 @@ def _build_runtime(args, *, gpus, bank, router, components, split_hash):
         response_provider=OpenAIStructuredFeedbackProvider(
             model=args.feedback_model))
     codebook_provider = OpenAIJSONUpdateProvider(
-        model=args.feedback_model, max_calls=1)
+        model=args.feedback_model, max_calls=3,
+        response_schema_name="phase4_codebook_update_plan",
+        response_schema=codebook_updater_response_schema(max_actions=32))
     router_provider = OpenAIJSONUpdateProvider(
-        model=args.feedback_model, max_calls=1)
+        model=args.feedback_model, max_calls=3,
+        response_schema_name="phase4_router_update_plan",
+        response_schema=router_updater_response_schema(max_actions=48))
     scaffold = scaffold_policy_from_json(components["scaffold_policy"])
     contract = scaffold_contract_from_json(components["scaffold_contract"])
     update_engine = Checkpoint3EOrchestrator.with_real_confirmation(
@@ -281,7 +294,8 @@ def _build_runtime(args, *, gpus, bank, router, components, split_hash):
             "gpu": primary_gpu,
             "dvd_max_iterations": args.dvd_max_iterations,
             "downstream_qa_configuration": {
-                "text_backend": "codex", "use_openai_tools": False},
+                "text_backend": config.DVD_TEXT_BACKEND,
+                "use_openai_tools": config.DVD_USE_OPENAI_TOOLS},
         },
         property_memory_runner=CompactPropertyMemoryRunner(),
         llm_codebook_updater=MemoryConditionedLLMCodebookUpdater(
@@ -356,6 +370,70 @@ def _write_cleanup(
         raise RuntimeError("production workers did not release every configured GPU")
 
 
+def _run_baseline_only(
+    *, selected, coverage_state, roles, bank, router, scaffold, contract,
+    phase4_config, output_dir, cache_dir, gpus, history_builder,
+    baseline_kwargs, routing_mode,
+) -> str:
+    """Caption + baseline QA only, no optimization-time stage.
+
+    Reuses BaselinePhaseRunner with a no-op proposer and no retrieval runner so
+    the free-form ablation's accuracy is measured without invoking any paid
+    optimizer LLM stage (proposal/retrieval/intervention/feedback/updaters).
+    Videos run sequentially, each using every worker GPU. Returns the summary
+    JSON path.
+    """
+    from surrogate_rollout.optimization.baseline_phase import BaselinePhaseRunner
+
+    output_dir = os.path.abspath(output_dir)
+    cache_dir = os.path.abspath(cache_dir)
+    runner = BaselinePhaseRunner(
+        proposal_policy=None,             # -> NoOpPropertyProposalPolicy
+        history_aware_builder=history_builder,
+        property_retrieval_runner=None)   # skip similarity retrieval
+    caption_cache_root = os.path.join(cache_dir, "captions")
+    cache_manifest_path = os.path.join(cache_dir, "caption_cache_manifest.jsonl")
+    per_video: dict[str, dict] = {}
+    for video_id in selected:
+        result = runner.run(
+            roles=roles, coverage_state=coverage_state,
+            prompt_bank=bank, router_policy=router,
+            scaffold_policy=scaffold, scaffold_contract=contract,
+            phase4_config=phase4_config,
+            output_dir=os.path.join(output_dir, "baseline_videos", video_id),
+            bounded_smoke_video_id=video_id,
+            caption_cache_root=caption_cache_root,
+            cache_manifest_path=cache_manifest_path,
+            worker_gpus=gpus,
+            **dict(baseline_kwargs))
+        manifest = _read_json(result.video_manifest_paths[0])
+        with open(manifest["baseline_qas_path"]) as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+        correct = sum(1 for row in rows if row.get("is_correct"))
+        per_video[video_id] = {
+            "correct": correct, "total": len(rows),
+            "baseline_qas_path": manifest["baseline_qas_path"],
+            "video_manifest_path": result.video_manifest_paths[0]}
+    total_correct = sum(item["correct"] for item in per_video.values())
+    total = sum(item["total"] for item in per_video.values())
+    summary = {
+        "schema_version": "free_form_baseline_eval_v1",
+        "routing_mode": routing_mode,
+        "benchmark": config.BENCHMARK,
+        "split": config.BENCHMARK_SPLIT,
+        "selected_video_ids": list(selected),
+        "per_video": per_video,
+        "correct": total_correct, "total": total,
+        "accuracy": (total_correct / total) if total else None,
+        "optimizer_executed": False,
+    }
+    summary_path = os.path.join(output_dir, "baseline_only_eval.json")
+    with open(summary_path, "w") as handle:
+        json.dump(summary, handle, sort_keys=True, indent=2)
+        handle.write("\n")
+    return summary_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iteration-id", required=True)
@@ -376,12 +454,31 @@ def main() -> None:
     parser.add_argument("--feedback-model", default=config.FEEDBACK_MODEL)
     parser.add_argument("--dvd-max-iterations", type=int, default=10)
     parser.add_argument(
+        "--routing-mode", default="property_bank",
+        choices=("property_bank", "free_form_generator"),
+        help="Experimental ablation only: 'free_form_generator' replaces the "
+             "property router+bank instruction with an on-the-fly generated "
+             "instruction. Default is the existing property_bank behavior. "
+             "Use a separate --output-dir/--state-dir/--cache-dir for "
+             "free-form runs.")
+    parser.add_argument(
         "--max-proposals-per-video", type=int,
         default=config.MAX_PROPERTY_PROPOSALS_PER_VIDEO)
     parser.add_argument(
         "--property-retrieval-top-k", type=int,
         default=config.PROPERTY_RETRIEVAL_TOP_K)
+    parser.add_argument(
+        "--baseline-only", action="store_true",
+        help="Caption + baseline QA only: measure accuracy without running any "
+             "optimization-time stage (property proposal, retrieval, "
+             "intervention, feedback, codebook/router updaters). Uses a no-op "
+             "proposer and no retrieval runner, so no paid optimizer LLM calls "
+             "are made. Writes baseline_only_eval.json with per-video and "
+             "overall accuracy. Intended for the free-form ablation vs "
+             "property-bank captioning comparison.")
     args = parser.parse_args()
+    if args.baseline_only and args.dry_run_plan:
+        raise SystemExit("--baseline-only cannot be combined with --dry-run-plan")
 
     gpus = tuple(item.strip() for item in args.gpus.split(",") if item.strip())
     inventory = _gpu_inventory()
@@ -456,6 +553,10 @@ def main() -> None:
         "property_retrieval_top_k": args.property_retrieval_top_k,
         "dvd_clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
         "dvd_clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
+        "dvd_embedding_preload_policy_version":
+            DVD_EMBEDDER_PRELOAD_POLICY_VERSION,
+        "dvd_qa_concurrency_policy_version":
+            DVD_QA_CONCURRENCY_POLICY_VERSION,
         "codebook_updater_prompt_version": "memory_codebook_updater_prompt_v1",
         "router_updater_prompt_version": "memory_router_updater_prompt_v1",
         "structured_router_policy_version": "structured_router_policy_v1",
@@ -500,31 +601,42 @@ def main() -> None:
                 "gpu": gpus[0],
                 "dvd_max_iterations": args.dvd_max_iterations,
             }
-        result = runner.run(
-            iteration_id=args.iteration_id, roles=roles,
-            coverage_state=selection_state,
-            next_coverage_state=next_coverage,
-            selected_video_ids=selected,
-            selection_seed=args.selection_seed,
-            split_manifest_path=args.split_manifest,
-            split_manifest_hash=split_hash,
-            parent_policy_pair_hash=parent_pair_hash,
-            prompt_bank=bank, router_policy=router,
-            scaffold_policy=scaffold, scaffold_contract=contract,
-            phase4_config=phase4_config,
-            output_dir=args.output_dir, state_dir=args.state_dir,
-            cache_dir=args.cache_dir, gpus=gpus,
-            max_parallel_videos=max_parallel,
-            execution_identity=execution_identity,
-            baseline_kwargs=baseline_kwargs,
-            intervention_kwargs=intervention_kwargs,
-            dry_run_plan=args.dry_run_plan)
-        if runtime is not None:
-            calls = {
-                "codebook": runtime["codebook_provider"].call_count,
-                "router": runtime["router_provider"].call_count,
-            }
-        print(result.manifest_path, flush=True)
+        if args.baseline_only:
+            summary_path = _run_baseline_only(
+                selected=selected, coverage_state=selection_state, roles=roles,
+                bank=bank, router=router, scaffold=scaffold, contract=contract,
+                phase4_config=phase4_config, output_dir=args.output_dir,
+                cache_dir=args.cache_dir, gpus=gpus,
+                history_builder=history_builder,
+                baseline_kwargs=baseline_kwargs,
+                routing_mode=getattr(args, "routing_mode", "property_bank"))
+            print(summary_path, flush=True)
+        else:
+            result = runner.run(
+                iteration_id=args.iteration_id, roles=roles,
+                coverage_state=selection_state,
+                next_coverage_state=next_coverage,
+                selected_video_ids=selected,
+                selection_seed=args.selection_seed,
+                split_manifest_path=args.split_manifest,
+                split_manifest_hash=split_hash,
+                parent_policy_pair_hash=parent_pair_hash,
+                prompt_bank=bank, router_policy=router,
+                scaffold_policy=scaffold, scaffold_contract=contract,
+                phase4_config=phase4_config,
+                output_dir=args.output_dir, state_dir=args.state_dir,
+                cache_dir=args.cache_dir, gpus=gpus,
+                max_parallel_videos=max_parallel,
+                execution_identity=execution_identity,
+                baseline_kwargs=baseline_kwargs,
+                intervention_kwargs=intervention_kwargs,
+                dry_run_plan=args.dry_run_plan)
+            if runtime is not None:
+                calls = {
+                    "codebook": runtime["codebook_provider"].call_count,
+                    "router": runtime["router_provider"].call_count,
+                }
+            print(result.manifest_path, flush=True)
     finally:
         if not args.dry_run_plan:
             embedding_model_closed = args.embedding_gpu is None

@@ -24,7 +24,7 @@ from surrogate_rollout.prompt_routing.schemas import (
 from surrogate_rollout.schemas import sha256_json
 
 
-COMPACT_SUMMARY_SCHEMA_VERSION = "property_compact_summary_v1"
+COMPACT_SUMMARY_SCHEMA_VERSION = "property_compact_summary_v2"
 PROPERTY_MEMORY_SCHEMA_VERSION = "property_memory_v1"
 PROPERTY_MEMORY_MANIFEST_SCHEMA_VERSION = "property_memory_manifest_v1"
 SELECTION_POLICY_VERSION = "property_memory_selection_v1"
@@ -628,21 +628,43 @@ class CompactPropertyMemoryRunner:
                 if not transitions_path:
                     raise PropertyMemoryError("completed intervention lacks transitions")
                 transitions = _read_json(transitions_path)
+                original_proposal = (
+                    transitions.get("original_proposal")
+                    or result.get("original_proposal") or {})
                 raw_counts = transitions.get("transition_counts") or {}
                 counts = {label: int(raw_counts.get(label, 0)) for label in TRANSITIONS}
                 if sum(counts.values()) != len(transitions.get("qas") or ()):
                     raise PropertyMemoryError("intervention transition counts conflict with QAs")
                 effect = _effect_from_counts(counts)
+                qa_transitions = tuple({
+                    "question_id": str(row.get("question_id") or ""),
+                    "baseline_prediction": row.get("baseline_prediction"),
+                    "candidate_prediction": row.get("candidate_prediction"),
+                    "baseline_correct": bool(row.get("baseline_correct")),
+                    "candidate_correct": bool(row.get("candidate_correct")),
+                    "transition": str(row.get("transition") or ""),
+                    "runtime_valid": not bool(row.get("errors")),
+                } for row in transitions.get("qas") or ())
                 identity = {
                     "schema_version": COMPACT_SUMMARY_SCHEMA_VERSION,
                     "kind": "intervention_effect", "iteration_id": iteration_id,
                     "candidate_property_id": str(result["candidate_property_id"]),
                     "video_id": str(result["source_video_id"]),
                     "effect": effect, "transition_counts": counts,
+                    "original_proposal_hash": (
+                        sha256_json(original_proposal) if original_proposal else None),
                 }
                 summaries.append({
                     **identity, "summary_id": "effect_" + sha256_json(identity)[:24],
                     "one_sentence_summary": _effect_summary(effect, counts),
+                    "original_proposal": original_proposal,
+                    "source_question_ids": tuple(
+                        transitions.get("source_question_ids")
+                        or original_proposal.get("source_question_ids") or ()),
+                    "source_qa_baseline_correct": transitions.get(
+                        "source_qa_baseline_correct",
+                        original_proposal.get("source_qa_baseline_correct")),
+                    "qa_transitions": qa_transitions,
                     "artifact_refs": (
                         _artifact_ref(manifest_path, "intervention_manifest"),
                         _artifact_ref(result_path, "intervention_result"),
@@ -759,6 +781,10 @@ class CompactPropertyMemoryRunner:
                 "example_id": _example_id(effect), "effect": effect["effect"],
                 "video_id": effect["video_id"],
                 "transition_counts": effect["transition_counts"],
+                "source_question_ids": effect.get("source_question_ids") or (),
+                "source_qa_baseline_correct": effect.get(
+                    "source_qa_baseline_correct"),
+                "qa_transitions": effect.get("qa_transitions") or (),
                 "summary": effect["one_sentence_summary"],
                 "artifact_refs": effect["artifact_refs"],
                 "iteration_id": iteration_id, "iteration_ordinal": iteration_ordinal,
@@ -769,8 +795,21 @@ class CompactPropertyMemoryRunner:
                 "schema_version": PROPERTY_MEMORY_SCHEMA_VERSION,
                 "candidate_property_id": key[1], "source_video_id": key[0],
                 "property_text": proposal.get("property_text") or key[1],
-                "why_proposed": proposal.get("proposal_rationale") or
-                    "Proposal rationale is available only in the referenced raw artifact.",
+                "applicability": proposal.get("applicability") or
+                    existing.get("applicability"),
+                "failure_analysis": proposal.get("failure_analysis") or
+                    proposal.get("proposal_rationale") or
+                    existing.get("failure_analysis"),
+                "source_question_ids": tuple(
+                    proposal.get("source_question_ids")
+                    or existing.get("source_question_ids") or ()),
+                "source_qa_baseline_correct": proposal.get(
+                    "source_qa_baseline_correct",
+                    existing.get("source_qa_baseline_correct")),
+                "why_proposed": proposal.get("failure_analysis") or
+                    proposal.get("proposal_rationale") or
+                    existing.get("why_proposed") or
+                    "Proposal analysis is available only in the referenced raw artifact.",
                 "intended_reusable_behavior": proposal.get("property_text") or key[1],
                 "related_active_property_ids": tuple(
                     proposal.get("coverage_hints") or
@@ -808,6 +847,10 @@ class CompactPropertyMemoryRunner:
                 targets = (str(result_id),)
                 candidate = candidates[candidate_key]
                 memories[str(result_id)]["why_created"] = candidate["why_proposed"]
+                memories[str(result_id)]["applicability"] = candidate.get(
+                    "applicability")
+                memories[str(result_id)]["failure_analysis"] = candidate.get(
+                    "failure_analysis")
                 memories[str(result_id)]["origin"] = {
                     "kind": "promoted_candidate", "created_by": "checkpoint3e",
                     "candidate_property_id": key[1], "source_video_id": key[0],

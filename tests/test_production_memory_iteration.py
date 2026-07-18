@@ -1,4 +1,7 @@
 import json
+import inspect
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -144,6 +147,36 @@ def test_gpu_inventory_and_concurrency_validation():
         launcher._validate_gpu_configuration(
             gpus=("4",), inventory={"3": 100, "4": 0},
             max_parallel_videos=1, require_free=True, embedding_gpu="3")
+
+
+def test_dvd_bge_preload_is_thread_safe_and_runs_once(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from surrogate_rollout.evaluation import dvd_qa
+
+    calls = []
+
+    def load():
+        calls.append("load")
+        time.sleep(0.01)
+        return object()
+
+    monkeypatch.setattr(dvd_qa, "_DVD_EMBEDDER_PRELOADED", False)
+    monkeypatch.setitem(
+        sys.modules, "dvd_backend", SimpleNamespace(_get_embedder=load))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = tuple(pool.map(
+            lambda _index: dvd_qa.preload_dvd_embedder(), range(16)))
+
+    assert results == (None,) * 16
+    assert calls == ["load"]
+    assert dvd_qa._DVD_EMBEDDER_PRELOADED is True
+
+
+def test_production_runtime_requests_parent_bge_preload():
+    import scripts.run_phase4_memory_iteration as launcher
+
+    source = inspect.getsource(launcher._build_runtime)
+    assert "preload_embedder=True" in source
 
 
 def _write(path: Path, value) -> str:

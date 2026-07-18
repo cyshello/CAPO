@@ -8,16 +8,93 @@ from typing import Any, Mapping, Protocol, Sequence
 from surrogate_rollout.prompt_routing.schemas import PromptBankSnapshot
 
 
+ALLOWED_PROPERTY_MODALITIES = frozenset({
+    "frames", "transcript", "caption_history",
+})
+
+
+def _normalized_string(value: Any, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    normalized = " ".join(value.split()).strip()
+    if not normalized:
+        raise ValueError(f"{field} must be non-empty")
+    return normalized
+
+
+@dataclass(frozen=True)
+class PropertyApplicability:
+    """Observable input conditions under which a caption property applies."""
+
+    when: str
+    positive_cues: tuple[str, ...]
+    negative_cues: tuple[str, ...]
+    required_modalities: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "when", _normalized_string(self.when, field="applicability.when"))
+        for name in ("positive_cues", "negative_cues"):
+            values = tuple(
+                _normalized_string(item, field=f"applicability.{name}")
+                for item in getattr(self, name))
+            if name == "positive_cues" and not values:
+                raise ValueError("applicability.positive_cues must be non-empty")
+            if len(values) != len({item.casefold() for item in values}):
+                raise ValueError(f"applicability.{name} must not contain duplicates")
+            object.__setattr__(self, name, values)
+        modalities = tuple(
+            _normalized_string(item, field="applicability.required_modalities")
+            for item in self.required_modalities)
+        if not modalities:
+            raise ValueError("applicability.required_modalities must be non-empty")
+        if len(modalities) != len({item.casefold() for item in modalities}):
+            raise ValueError(
+                "applicability.required_modalities must not contain duplicates")
+        unsupported = set(modalities) - ALLOWED_PROPERTY_MODALITIES
+        if unsupported:
+            raise ValueError(
+                f"unsupported applicability modalities: {sorted(unsupported)}")
+        object.__setattr__(self, "required_modalities", modalities)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "PropertyApplicability":
+        fields = {"when", "positive_cues", "negative_cues", "required_modalities"}
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError(
+                f"applicability must contain exactly {sorted(fields)}")
+        for name in ("positive_cues", "negative_cues", "required_modalities"):
+            if not isinstance(value[name], (list, tuple)):
+                raise ValueError(f"applicability.{name} must be an array")
+        return cls(
+            when=value["when"],
+            positive_cues=tuple(value["positive_cues"]),
+            negative_cues=tuple(value["negative_cues"]),
+            required_modalities=tuple(value["required_modalities"]),
+        )
+
+
+def legacy_property_applicability() -> PropertyApplicability:
+    """Explicit compatibility value for artifacts predating applicability."""
+    return PropertyApplicability(
+        when="Apply when available captioning input supports this legacy instruction.",
+        positive_cues=("Available captioning input supports the instruction.",),
+        negative_cues=(),
+        required_modalities=("frames",),
+    )
+
+
 @dataclass(frozen=True, init=False)
 class CandidatePropertyProposal:
     candidate_property_id: str
     suggested_property_id: str
     property_text: str
+    applicability: PropertyApplicability
     source_video_id: str
     source_question_ids: tuple[str, ...]
-    motivating_failure_types: tuple[str, ...]
+    source_qa_baseline_correct: bool | None
     coverage_hints: tuple[str, ...]
-    proposal_rationale: str
+    failure_analysis: str
     proposer_policy_version: str
 
     def __init__(
@@ -26,13 +103,16 @@ class CandidatePropertyProposal:
         candidate_property_id: str | None = None,
         suggested_property_id: str | None = None,
         property_text: str | None = None,
+        applicability: PropertyApplicability | Mapping[str, Any] | None = None,
         source_video_id: str,
         source_question_ids: tuple[str, ...] | None = None,
+        source_qa_baseline_correct: bool | None = None,
         motivating_failure_types: tuple[str, ...] | None = None,
         coverage_hints: tuple[str, ...] | None = None,
         possible_coverage_by_existing_property_ids: (
             tuple[str, ...] | None) = None,
         covered_by_existing_property_ids: tuple[str, ...] | None = None,
+        failure_analysis: str | None = None,
         proposal_rationale: str | None = None,
         proposer_policy_version: str,
         # Checkpoint 2 compatibility aliases.
@@ -59,34 +139,35 @@ class CandidatePropertyProposal:
             "suggested_property_id": (
                 suggested_property_id or candidate_property_id or property_id or ""),
             "property_text": property_text or instruction or "",
+            "applicability": (
+                applicability if isinstance(applicability, PropertyApplicability)
+                else PropertyApplicability.from_mapping(applicability)
+                if applicability is not None else legacy_property_applicability()),
             "source_video_id": source_video_id,
             "source_question_ids": tuple(source_question_ids or source_qa_ids or ()),
-            "motivating_failure_types": tuple(
-                motivating_failure_types
-                or ((failure_evidence,) if failure_evidence else ())),
+            "source_qa_baseline_correct": source_qa_baseline_correct,
             "coverage_hints": normalized_hints,
-            "proposal_rationale": proposal_rationale or failure_evidence or "",
+            "failure_analysis": (
+                failure_analysis or proposal_rationale or failure_evidence
+                or "; ".join(motivating_failure_types or ())),
             "proposer_policy_version": proposer_policy_version,
         }
         for name, value in values.items():
             object.__setattr__(self, name, value)
         for name in ("candidate_property_id", "suggested_property_id",
-                     "property_text", "source_video_id", "proposal_rationale",
+                     "property_text", "source_video_id", "failure_analysis",
                      "proposer_policy_version"):
             if not getattr(self, name):
                 raise ValueError(f"CandidatePropertyProposal.{name} must be non-empty")
         if not self.source_question_ids or len(self.source_question_ids) != len(
                 set(self.source_question_ids)):
             raise ValueError("proposal source question IDs must be non-empty and unique")
-        if not self.motivating_failure_types:
-            raise ValueError("proposal motivating failure types must be non-empty")
-        if len(self.motivating_failure_types) != len(set(
-                self.motivating_failure_types)) or any(
-                not isinstance(item, str) or not item
-                for item in self.motivating_failure_types):
-            raise ValueError("motivating failure types must be unique strings")
         if len(self.coverage_hints) != len(set(self.coverage_hints)):
             raise ValueError("proposal coverage hints must be unique")
+        if self.source_qa_baseline_correct is not None and not isinstance(
+                self.source_qa_baseline_correct, bool):
+            raise ValueError(
+                "proposal source QA baseline correctness must be bool or null")
 
     @property
     def property_id(self) -> str:
@@ -101,10 +182,6 @@ class CandidatePropertyProposal:
         return self.source_question_ids
 
     @property
-    def failure_evidence(self) -> str:
-        return self.proposal_rationale
-
-    @property
     def coverage_assessment(self) -> str:
         return "deferred_to_intervention"
 
@@ -116,6 +193,38 @@ class CandidatePropertyProposal:
     def covered_by_existing_property_ids(self) -> tuple[str, ...]:
         """Legacy read alias; these IDs are non-binding proposal hints."""
         return self.coverage_hints
+
+
+def candidate_property_proposal_from_json(
+    value: Mapping[str, Any],
+) -> CandidatePropertyProposal:
+    """Load canonical proposals and explicitly migrate legacy artifacts."""
+    applicability = value.get("applicability")
+    return CandidatePropertyProposal(
+        candidate_property_id=str(
+            value.get("candidate_property_id") or value.get("property_id") or ""),
+        suggested_property_id=str(
+            value.get("suggested_property_id")
+            or value.get("candidate_property_id")
+            or value.get("property_id") or ""),
+        property_text=str(value.get("property_text") or value.get("instruction") or ""),
+        applicability=(
+            PropertyApplicability.from_mapping(applicability)
+            if applicability is not None else legacy_property_applicability()),
+        source_video_id=str(value.get("source_video_id") or ""),
+        source_question_ids=tuple(
+            value.get("source_question_ids") or value.get("source_qa_ids") or ()),
+        source_qa_baseline_correct=value.get("source_qa_baseline_correct"),
+        coverage_hints=tuple(
+            value.get("coverage_hints")
+            or value.get("possible_coverage_by_existing_property_ids")
+            or value.get("covered_by_existing_property_ids") or ()),
+        failure_analysis=str(
+            value.get("failure_analysis") or value.get("proposal_rationale")
+            or value.get("failure_evidence")
+            or "; ".join(value.get("motivating_failure_types") or ())),
+        proposer_policy_version=str(value.get("proposer_policy_version") or "legacy"),
+    )
 
 
 @dataclass(frozen=True)

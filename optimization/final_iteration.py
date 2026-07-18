@@ -13,7 +13,10 @@ from surrogate_rollout.optimization.iteration_state import (
     ConfirmedCheckpointState,
     ProvisionalIterationState,
 )
-from surrogate_rollout.optimization.property_proposal import CandidatePropertyProposal
+from surrogate_rollout.optimization.property_proposal import (
+    CandidatePropertyProposal,
+    candidate_property_proposal_from_json,
+)
 from surrogate_rollout.optimization.stage_logging import StageLogger, emit_stage
 from surrogate_rollout.optimization.train_roles import (
     EvidenceCoverageState,
@@ -224,19 +227,7 @@ def _next_version(kind: str, current: str, content: Any) -> str:
 
 
 def _proposal_from_json(value: Mapping[str, Any]) -> CandidatePropertyProposal:
-    return CandidatePropertyProposal(
-        candidate_property_id=value["candidate_property_id"],
-        property_text=value["property_text"],
-        source_video_id=value["source_video_id"],
-        source_question_ids=tuple(value["source_question_ids"]),
-        motivating_failure_types=tuple(value["motivating_failure_types"]),
-        coverage_hints=tuple(
-            value.get("coverage_hints")
-            or value.get("possible_coverage_by_existing_property_ids")
-            or value.get("covered_by_existing_property_ids") or ()),
-        proposal_rationale=value["proposal_rationale"],
-        proposer_policy_version=value["proposer_policy_version"],
-    )
+    return candidate_property_proposal_from_json(value)
 
 
 def _coverage_from_json(value: Mapping[str, Any]) -> EvidenceCoverageState:
@@ -1640,6 +1631,8 @@ class Checkpoint3EOrchestrator:
                 "router_applied_plan": router_result["artifacts"]["applied_plan"],
                 "router_validation_report": router_result["artifacts"][
                     "validation_report"],
+                "router_updater_execution": router_result["artifacts"][
+                    "execution"],
                 "codebook_updater_manifest": updater_manifest_path,
                 "router_updater_manifest": os.path.join(
                     output_dir, "llm_router_updater", "manifest.json"),
@@ -1667,6 +1660,10 @@ class Checkpoint3EOrchestrator:
                 "old_to_new_property_ids": mapping[
                     "old_to_new_property_ids"],
                 "candidate_promotions": mapping["candidate_promotions"],
+                "router_updater_execution_mode": router_result.get(
+                    "execution_mode"),
+                "router_updater_provider_called": router_result.get(
+                    "provider_called"),
                 "artifacts": pair_artifacts,
                 "artifact_hashes": {name: _file_hash(path)
                                     for name, path in pair_artifacts.items()},
@@ -1686,6 +1683,10 @@ class Checkpoint3EOrchestrator:
                 "candidate_bank_version": candidate_bank.bank_version,
                 "candidate_router_version": candidate_router.router_version,
                 "rendered_router_prompt_hash": rendered["prompt_sha256"],
+                "router_updater_execution_mode": router_result.get(
+                    "execution_mode"),
+                "router_updater_provider_called": router_result.get(
+                    "provider_called"),
                 "confirmed_production_pointer_mutated": False,
                 "confirmation_run": False, "resumed": False,
             }
@@ -1720,7 +1721,11 @@ class Checkpoint3EOrchestrator:
                 rendered_router_prompt_hash=rendered["prompt_sha256"],
                 atomic_policy_pair=pair_path,
                 candidate_bank_version=candidate_bank.bank_version,
-                candidate_router_version=candidate_router.router_version)
+                candidate_router_version=candidate_router.router_version,
+                router_updater_execution_mode=router_result.get(
+                    "execution_mode"),
+                router_updater_provider_called=router_result.get(
+                    "provider_called"))
             return _read_json(manifest_path)
         except Exception as exc:
             emit_stage(

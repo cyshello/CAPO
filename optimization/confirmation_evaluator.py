@@ -12,6 +12,7 @@ from surrogate_rollout import config
 from surrogate_rollout.captioning.candidate_captions import build_clip_index
 from surrogate_rollout.captioning.history_aware_baseline import (
     CAPTION_OUTPUT_CONTRACT_VERSION,
+    CAPTION_PARSE_NORMALIZATION_VERSION,
     CAPTION_PARSE_SCHEMA_VERSION,
     DEFAULT_HISTORY_BLOCK_SECONDS,
     DEFAULT_MAX_HISTORY_CAPTIONS,
@@ -242,6 +243,8 @@ class HistoryAwareDVDConfirmationEvaluator:
             "caption_output_contract_version":
                 CAPTION_OUTPUT_CONTRACT_VERSION,
             "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "caption_parse_normalization_version":
+                CAPTION_PARSE_NORMALIZATION_VERSION,
             "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
             "frame_sampling": self._frame_sampling,
             "history": {

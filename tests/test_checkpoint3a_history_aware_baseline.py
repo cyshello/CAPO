@@ -1,13 +1,17 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from surrogate_rollout.captioning.history_aware_baseline import (
+    CAPTION_CACHE_SCHEMA_VERSION,
     CAPTION_OUTPUT_CONTRACT,
     CAPTION_OUTPUT_CONTRACT_VERSION,
+    CAPTION_PARSE_NORMALIZATION_VERSION,
     CAPTION_PARSE_SCHEMA_VERSION,
+    CAPTION_RETRY_POLICY_VERSION,
     HistoryAwareBaselineCaptionViewBuilder,
     HistoryAwareSegmentCaptioner,
     _parse_caption_output_with_metadata,
@@ -82,6 +86,25 @@ def test_caption_parser_safely_unwraps_one_object_array():
     assert parsed["subject_registry"] == {}
     assert result["original_top_level_type"] == "list"
     assert "unwrap_singleton_object_array" in result["normalizations"]
+
+
+def test_caption_parser_normalizes_only_invalid_percent_escape():
+    parsed, result = _parse_caption_output_with_metadata(
+        r'{"clip_description":"A percentage symbol (\%) is visible."}')
+    assert parsed["clip_description"] == "A percentage symbol (%) is visible."
+    assert result["status"] == "valid"
+    assert "replace_invalid_percent_escape" in result["normalizations"]
+
+    escaped, escaped_result = _parse_caption_output_with_metadata(
+        r'{"clip_description":"A literal backslash (\\%) is visible."}')
+    assert escaped["clip_description"] == r"A literal backslash (\%) is visible."
+    assert "replace_invalid_percent_escape" not in \
+        escaped_result["normalizations"]
+
+    invalid, invalid_result = _parse_caption_output_with_metadata(
+        r'{"clip_description":"An unrelated invalid escape \q remains."}')
+    assert invalid == {}
+    assert invalid_result["error"] == "invalid_json"
 
 
 @pytest.mark.parametrize("value,error", [
@@ -327,7 +350,7 @@ def test_sequential_history_is_shared_persisted_cached_and_resumable(tmp_path):
         Path(routing_manifest["caption_cache_keys_path"])
         .read_text().splitlines()[0]
     )["result_path"]).read_text())
-    assert first_cache["schema_version"] == "history_aware_caption_cache_v2"
+    assert first_cache["schema_version"] == CAPTION_CACHE_SCHEMA_VERSION
     assert first_cache["caption_output_contract_version"] == \
         CAPTION_OUTPUT_CONTRACT_VERSION
     assert first_cache["parse_result"]["schema_version"] == \
@@ -337,6 +360,9 @@ def test_sequential_history_is_shared_persisted_cached_and_resumable(tmp_path):
         CAPTION_OUTPUT_CONTRACT_VERSION
     assert identity["caption_parse_schema_version"] == \
         CAPTION_PARSE_SCHEMA_VERSION
+    assert identity["caption_parse_normalization_version"] == \
+        CAPTION_PARSE_NORMALIZATION_VERSION
+    assert identity["caption_parse_max_retries"] == 5
     assert identity["subject_registry_mode"] == "empty"
 
     before = len(vlm.calls)
@@ -501,6 +527,185 @@ def test_segment_captioner_can_reuse_persistent_remote_worker():
 
     assert result == "remote-result"
     assert remote.calls[0]["segment_id"] == "0_10"
+
+
+def _caption_once(tmp_path, vlm, cache_root):
+    video = tmp_path / "video.mp4"
+    frame = tmp_path / "frame.jpg"
+    video.write_bytes(b"video")
+    frame.write_bytes(b"frame")
+    # Keep the provider identity stable across resume assertions even when the
+    # test swaps in a guard object that must never be called.
+    captioner = HistoryAwareSegmentCaptioner(
+        vlm, backend_id="test.caption.retry.backend")
+    result = captioner.caption(
+        sample={
+            "video_path": str(video),
+            "extra": {"videoID": "video-1", "subtitle_path": None},
+        },
+        video_id="video-1", segment_id="0_10",
+        clip_info={"files": [str(frame)], "transcript": "spoken words"},
+        composed_prompt=SimpleNamespace(
+            prompt_text=("TRANSCRIPT_PLACEHOLDER CLIP_START_TIME "
+                         "CLIP_END_TIME"),
+            prompt_hash="prompt-hash", bank_version="bank-v1",
+            router_version="router-v1", scaffold_version="scaffold-v1",
+            contract_version="contract-v1"),
+        history_snapshot=build_history_snapshot(
+            segment_id="0_10", block_seconds=300, preceding=[],
+            max_history_captions=30),
+        merge_prompt="merge", cache_root=str(cache_root),
+        cache_manifest_path=str(tmp_path / "manifest.jsonl"))
+    return result, captioner
+
+
+def test_caption_parse_failure_retries_until_valid(tmp_path):
+    class RetryVLM:
+        def __init__(self):
+            self.calls = 0
+
+        def caption(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return '{"clip_description": "unterminated'
+            return json.dumps({
+                "clip_description": "valid retry", "subject_registry": {}})
+
+    vlm = RetryVLM()
+    result, _ = _caption_once(tmp_path, vlm, tmp_path / "cache")
+    assert vlm.calls == 2
+    assert result.model_call_count == 2
+    assert result.retry_count == 1
+    assert result.parsed["clip_description"].startswith("valid retry")
+    artifact = json.loads(Path(result.result_path).read_text())
+    assert artifact["attempt_count"] == 2
+    assert artifact["retry_count"] == 1
+    assert artifact["retry_exhausted"] is False
+    assert [row["parse_result"]["status"] for row in artifact["attempts"]] == [
+        "invalid", "valid"]
+
+
+def test_caption_parse_failure_stops_after_five_retries(tmp_path):
+    class InvalidVLM:
+        def __init__(self):
+            self.calls = 0
+
+        def caption(self, *_args, **_kwargs):
+            self.calls += 1
+            return '{"clip_description": "unterminated'
+
+    vlm = InvalidVLM()
+    result, _ = _caption_once(tmp_path, vlm, tmp_path / "cache")
+    assert vlm.calls == 6  # initial attempt plus five retries
+    assert result.model_call_count == 6
+    assert result.retry_count == 5
+    assert result.parsed == {}
+    artifact = json.loads(Path(result.result_path).read_text())
+    assert artifact["attempt_count"] == 6
+    assert artifact["retry_exhausted"] is True
+    assert all(row["parse_result"]["error"] == "invalid_json"
+               for row in artifact["attempts"])
+
+    class ForbiddenVLM:
+        def caption(self, *_args, **_kwargs):
+            raise AssertionError("exhausted retry artifact must resume exactly")
+
+    resumed, _ = _caption_once(tmp_path, ForbiddenVLM(), tmp_path / "cache")
+    assert resumed.cache_hit is True
+    assert resumed.model_call_count == 0
+    assert resumed.retry_count == 5
+    assert resumed.parsed == {}
+
+
+def test_legacy_invalid_cache_is_immutable_and_retried_in_sidecar(tmp_path):
+    class MutableVLM:
+        def __init__(self, output):
+            self.output = output
+            self.calls = 0
+
+        def caption(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.output
+
+    invalid_vlm = MutableVLM('{"clip_description": "unterminated')
+    first, _ = _caption_once(tmp_path, invalid_vlm, tmp_path / "cache")
+    base_path = Path(first.result_path)
+    legacy = json.loads(base_path.read_text())
+    legacy["schema_version"] = "history_aware_caption_cache_v2"
+    for field in (
+            "caption_retry_policy_version", "caption_parse_max_retries",
+            "attempt_count", "retry_count", "retry_exhausted", "attempts"):
+        legacy.pop(field, None)
+    base_path.write_text(json.dumps(legacy, sort_keys=True))
+    immutable_legacy_text = base_path.read_text()
+
+    valid_vlm = MutableVLM(json.dumps({
+        "clip_description": "recovered", "subject_registry": {}}))
+    retried, _ = _caption_once(tmp_path, valid_vlm, tmp_path / "cache")
+    assert valid_vlm.calls == 1
+    assert retried.retry_count == 1
+    assert retried.result_path != str(base_path)
+    assert f"/parse_retries/{CAPTION_RETRY_POLICY_VERSION}/" in \
+        retried.result_path
+    assert base_path.read_text() == immutable_legacy_text
+    retry_artifact = json.loads(Path(retried.result_path).read_text())
+    assert retry_artifact["attempts"][0]["source"] == \
+        "immutable_cached_initial_attempt"
+
+    no_call_vlm = MutableVLM("must not be called")
+    resumed, _ = _caption_once(tmp_path, no_call_vlm, tmp_path / "cache")
+    assert no_call_vlm.calls == 0
+    assert resumed.cache_hit is True
+    assert resumed.result_path == retried.result_path
+
+
+def test_cached_percent_escape_is_reparsed_in_new_sidecar_without_model_call(
+        tmp_path):
+    class VLM:
+        def __init__(self, output):
+            self.output = output
+            self.calls = 0
+
+        def caption(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.output
+
+    first, _ = _caption_once(
+        tmp_path, VLM('{"clip_description":"unterminated'), tmp_path / "cache")
+    base_path = Path(first.result_path)
+    legacy = json.loads(base_path.read_text())
+    percent_raw = r'{"clip_description":"A percentage symbol (\%) is visible."}'
+    legacy.update({
+        "caption_retry_policy_version": "caption_parse_retry_v1",
+        "raw_output": percent_raw,
+        "parsed": {},
+        "parse_result": {
+            "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "status": "invalid", "error": "invalid_json",
+            "normalizations": [],
+        },
+    })
+    legacy.pop("caption_parse_normalization_version", None)
+    base_path.write_text(json.dumps(legacy, sort_keys=True))
+    immutable_legacy = base_path.read_text()
+
+    forbidden = VLM("must not be called")
+    recovered, _ = _caption_once(tmp_path, forbidden, tmp_path / "cache")
+
+    assert forbidden.calls == 0
+    assert recovered.model_call_count == 0
+    assert recovered.parsed["clip_description"].startswith(
+        "A percentage symbol (%) is visible.")
+    assert recovered.result_path != str(base_path)
+    assert f"/parse_retries/{CAPTION_RETRY_POLICY_VERSION}/" in \
+        recovered.result_path
+    assert base_path.read_text() == immutable_legacy
+    sidecar = json.loads(Path(recovered.result_path).read_text())
+    assert sidecar["caption_parse_normalization_version"] == \
+        CAPTION_PARSE_NORMALIZATION_VERSION
+    assert sidecar["attempts"][0]["source"] == \
+        "immutable_cached_initial_attempt"
+    assert sidecar["attempts"][0]["parsed_valid"] is True
 
 
 def test_dvd_raw_frame_inspection_uses_pool_proxy_and_standalone_is_preserved():

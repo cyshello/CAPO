@@ -25,7 +25,10 @@ from surrogate_rollout.schemas import sha256_json, sha256_text
 
 RETRIEVAL_METHOD = "siglip_text_frame_max_pool"
 POOLING_RULE = "maximum_frame_cosine_v1"
-RANKING_VERSION = "score_desc_start_asc_segment_id_asc_v1"
+RANKING_VERSION = "score_desc_start_asc_segment_id_asc_v2"
+SEGMENT_UNIVERSE_POLICY = "valid_baseline_caption_segment_intersection_v2"
+RETRIEVAL_ARTIFACT_SCHEMA_VERSION = "property_frame_retrieval_v3"
+RETRIEVAL_BATCH_SCHEMA_VERSION = "property_retrieval_batch_v3"
 
 
 class PropertyRetrievalError(RuntimeError):
@@ -86,6 +89,7 @@ def retrieval_identity(
     index: VisualIndex,
     *,
     top_k: int,
+    baseline_segment_ids: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     text = normalize_property_text(proposal.property_text)
     if not text:
@@ -98,6 +102,7 @@ def retrieval_identity(
     if any("history" in str(key).casefold() for key in index.key):
         raise PropertyRetrievalError(
             "visual-index identity must not contain history fields")
+    eligible = _validated_baseline_segment_ids(baseline_segment_ids, index)
     return {
         "candidate_property_id": proposal.candidate_property_id,
         "source_video_id": proposal.source_video_id,
@@ -108,7 +113,32 @@ def retrieval_identity(
         "pooling_rule": POOLING_RULE,
         "retrieval_top_k": top_k,
         "deterministic_ranking_version": RANKING_VERSION,
+        "segment_universe_policy": SEGMENT_UNIVERSE_POLICY,
+        "baseline_segment_ids_hash": sha256_json(eligible),
+        "baseline_segment_count": len(eligible),
     }
+
+
+def _validated_baseline_segment_ids(
+    baseline_segment_ids: tuple[str, ...] | None,
+    index: VisualIndex,
+) -> tuple[str, ...]:
+    if baseline_segment_ids is None:
+        # Compatibility for direct callers outside the Phase 4 baseline path.
+        values = tuple(dict.fromkeys(index.clip_ids))
+    else:
+        values = tuple(baseline_segment_ids)
+    if not values:
+        raise PropertyRetrievalError("baseline caption segment universe is empty")
+    if len(values) != len(set(values)):
+        raise PropertyRetrievalError(
+            "baseline caption segment universe contains duplicate IDs")
+    for segment_id in values:
+        _segment_interval(segment_id)
+    if not set(values) & set(index.clip_ids):
+        raise PropertyRetrievalError(
+            "visual index has no segments in the baseline caption universe")
+    return values
 
 
 class PropertyFrameRetriever:
@@ -132,6 +162,7 @@ class PropertyFrameRetriever:
         proposal: CandidatePropertyProposal,
         visual_index: VisualIndex,
         output_dir: str,
+        baseline_segment_ids: tuple[str, ...] | None = None,
     ) -> PropertyRetrievalResult:
         if visual_index is None:
             raise PropertyRetrievalError("compatible visual index is required")
@@ -153,7 +184,12 @@ class PropertyFrameRetriever:
             _segment_interval(segment_id)
 
         text = normalize_property_text(proposal.property_text)
-        identity = retrieval_identity(proposal, visual_index, top_k=self.top_k)
+        eligible_ids = _validated_baseline_segment_ids(
+            baseline_segment_ids, visual_index)
+        eligible_set = set(eligible_ids)
+        identity = retrieval_identity(
+            proposal, visual_index, top_k=self.top_k,
+            baseline_segment_ids=eligible_ids)
         fingerprint = sha256_json(identity)
         output_dir = os.path.abspath(output_dir)
         artifact_path = os.path.join(output_dir, "retrieval.json")
@@ -164,7 +200,8 @@ class PropertyFrameRetriever:
                     artifact.get("input_fingerprint") != fingerprint:
                 raise PropertyRetrievalConflictError(
                     "retrieval artifact exists for different frozen inputs")
-            self._validate_saved_artifact(artifact, visual_index)
+            self._validate_saved_artifact(
+                artifact, visual_index, baseline_segment_ids=eligible_ids)
             return PropertyRetrievalResult(
                 artifact_path=artifact_path, artifact=artifact,
                 retrieval_identity=identity, resumed=True)
@@ -193,6 +230,8 @@ class PropertyFrameRetriever:
             score = float(score)
             if not math.isfinite(timestamp) or not math.isfinite(score):
                 raise PropertyRetrievalError("frame timestamp or score is non-finite")
+            if segment_id not in eligible_set:
+                continue
             grouped.setdefault(segment_id, []).append({
                 "frame_id": frame_name,
                 "timestamp_sec": timestamp,
@@ -227,19 +266,28 @@ class PropertyFrameRetriever:
                 "rank": rank, **item,
                 "selected": item["segment_id"] in selected_ids,
             })
+        excluded_ids = tuple(sorted(
+            set(visual_index.clip_ids) - eligible_set,
+            key=lambda item: (*_segment_interval(item), item)))
         artifact = {
-            "schema_version": "property_frame_retrieval_v1",
+            "schema_version": RETRIEVAL_ARTIFACT_SCHEMA_VERSION,
             "candidate_property_id": proposal.candidate_property_id,
             "source_video_id": proposal.source_video_id,
             "property_text": text,
             "retrieval_method": RETRIEVAL_METHOD,
             "top_k": self.top_k,
+            "segment_universe_policy": SEGMENT_UNIVERSE_POLICY,
+            "baseline_segment_ids_hash": sha256_json(eligible_ids),
+            "baseline_segment_count": len(eligible_ids),
+            "eligible_index_segment_count": len(ranked),
+            "excluded_visual_index_segment_ids": list(excluded_ids),
             "ranked_segments": ranked_output,
             "s_sim": list(selected_ids),
             "retrieval_identity": identity,
             "input_fingerprint": fingerprint,
         }
-        self._validate_saved_artifact(artifact, visual_index)
+        self._validate_saved_artifact(
+            artifact, visual_index, baseline_segment_ids=eligible_ids)
         os.makedirs(output_dir, exist_ok=True)
         _atomic_write_text(artifact_path, json.dumps(
             artifact, sort_keys=True, ensure_ascii=False, indent=2) + "\n")
@@ -266,14 +314,29 @@ class PropertyFrameRetriever:
 
     @staticmethod
     def _validate_saved_artifact(artifact: dict[str, Any],
-                                 index: VisualIndex) -> None:
+                                 index: VisualIndex, *,
+                                 baseline_segment_ids: tuple[str, ...]) -> None:
+        if artifact.get("schema_version") != RETRIEVAL_ARTIFACT_SCHEMA_VERSION:
+            raise PropertyRetrievalError("incompatible retrieval artifact schema")
         if artifact.get("source_video_id") != index.video_id:
             raise PropertyRetrievalError("retrieval artifact source-video mismatch")
+        eligible = _validated_baseline_segment_ids(baseline_segment_ids, index)
+        eligible_set = set(eligible)
+        expected_ids = set(index.clip_ids) & eligible_set
+        excluded_ids = set(index.clip_ids) - eligible_set
+        if artifact.get("segment_universe_policy") != SEGMENT_UNIVERSE_POLICY or \
+                artifact.get("baseline_segment_ids_hash") != sha256_json(eligible) or \
+                int(artifact.get("baseline_segment_count", -1)) != len(eligible):
+            raise PropertyRetrievalError(
+                "retrieval artifact baseline segment universe mismatch")
+        if set(artifact.get("excluded_visual_index_segment_ids") or ()) != excluded_ids:
+            raise PropertyRetrievalError(
+                "retrieval artifact excluded segment set is inconsistent")
         ranked = artifact.get("ranked_segments")
         if not isinstance(ranked, list):
             raise PropertyRetrievalError("retrieval artifact has no ranked segments")
         ids = [item.get("segment_id") for item in ranked]
-        if len(ids) != len(set(ids)) or set(ids) != set(index.clip_ids):
+        if len(ids) != len(set(ids)) or set(ids) != expected_ids:
             raise PropertyRetrievalError(
                 "retrieval artifact segment set is duplicated or inconsistent")
         expected = sorted(ranked, key=lambda item: (
@@ -300,7 +363,7 @@ class PropertyFrameRetriever:
 class PropertyRetrievalBatchRunner:
     """Evaluate every accepted property from one source video independently."""
 
-    policy_version = "property_retrieval_batch_v1"
+    policy_version = "property_retrieval_batch_v3"
 
     def __init__(self, *, retriever: PropertyFrameRetriever,
                  visual_index_loader: Any | None = None) -> None:
@@ -315,6 +378,7 @@ class PropertyRetrievalBatchRunner:
             "retrieval_method": RETRIEVAL_METHOD,
             "pooling_rule": POOLING_RULE,
             "ranking_version": RANKING_VERSION,
+            "segment_universe_policy": SEGMENT_UNIVERSE_POLICY,
         }
 
     def _load_visual_index(self, sample: dict, video_id: str) -> VisualIndex:
@@ -330,7 +394,9 @@ class PropertyRetrievalBatchRunner:
 
     def run(self, *, sample: dict,
             proposals: tuple[CandidatePropertyProposal, ...],
-            output_dir: str) -> PropertyRetrievalBatchResult:
+            output_dir: str,
+            baseline_segment_ids: tuple[str, ...] | None = None,
+            ) -> PropertyRetrievalBatchResult:
         video_id = str(sample.get("extra", {}).get("videoID")
                        or sample.get("sample_id") or "")
         if not video_id:
@@ -353,8 +419,13 @@ class PropertyRetrievalBatchRunner:
         }
         index = (self.visual_index_loader(sample, video_id)
                  if proposals else None)
+        eligible_ids = (_validated_baseline_segment_ids(
+            baseline_segment_ids, index) if index is not None else ())
         batch_input["visual_index_identity"] = (
             visual_index_identity(index) if index is not None else None)
+        batch_input["segment_universe_policy"] = SEGMENT_UNIVERSE_POLICY
+        batch_input["baseline_segment_ids_hash"] = (
+            sha256_json(eligible_ids) if index is not None else None)
         batch_fingerprint = sha256_json(batch_input)
         if os.path.exists(manifest_path):
             with open(manifest_path) as f:
@@ -368,7 +439,8 @@ class PropertyRetrievalBatchRunner:
                     "completed retrieval batch is missing property artifacts")
             resumed_results = tuple(self.retriever.retrieve(
                 proposal=item, visual_index=index,
-                output_dir=os.path.join(output_dir, item.candidate_property_id))
+                output_dir=os.path.join(output_dir, item.candidate_property_id),
+                baseline_segment_ids=eligible_ids)
                 for item in proposals) if index is not None else ()
             actual_paths = tuple(item.artifact_path for item in resumed_results)
             if actual_paths != paths:
@@ -383,14 +455,19 @@ class PropertyRetrievalBatchRunner:
         else:
             results = tuple(self.retriever.retrieve(
                 proposal=item, visual_index=index,
-                output_dir=os.path.join(output_dir, item.candidate_property_id))
+                output_dir=os.path.join(output_dir, item.candidate_property_id),
+                baseline_segment_ids=eligible_ids)
                 for item in proposals)
         paths = tuple(item.artifact_path for item in results)
         os.makedirs(output_dir, exist_ok=True)
         _atomic_write_text(manifest_path, json.dumps({
-            "schema_version": "property_retrieval_batch_v1",
+            "schema_version": RETRIEVAL_BATCH_SCHEMA_VERSION,
             "status": "completed", "video_id": video_id,
             "batch_fingerprint": batch_fingerprint,
+            "segment_universe_policy": SEGMENT_UNIVERSE_POLICY,
+            "baseline_segment_ids_hash": (
+                sha256_json(eligible_ids) if index is not None else None),
+            "baseline_segment_count": len(eligible_ids),
             "visual_index_identity": (
                 batch_input["visual_index_identity"]),
             "retrieval_artifact_paths": paths,

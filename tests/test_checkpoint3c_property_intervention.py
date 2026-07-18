@@ -62,6 +62,7 @@ def proposal(candidate_id, text):
     return CandidatePropertyProposal(
         candidate_property_id=candidate_id, property_text=text,
         source_video_id="video-1", source_question_ids=("q1",),
+        source_qa_baseline_correct=False,
         motivating_failure_types=("fixture_failure",),
         covered_by_existing_property_ids=(), proposal_rationale="fixture",
         proposer_policy_version="fixture_v1")
@@ -361,6 +362,13 @@ def test_independent_selected_only_interventions_history_mixed_view_and_resume(t
     }
 
     transitions_a = json.loads(Path(result.results[0].transitions_path).read_text())
+    assert transitions_a["schema_version"] == "property_intervention_transitions_v2"
+    assert transitions_a["original_proposal"]["property_text"] == a.property_text
+    assert transitions_a["source_question_ids"] == ["q1"]
+    assert transitions_a["source_qa_baseline_correct"] is False
+    assert all("baseline_prediction" in row and "candidate_prediction" in row
+               and "baseline_correct" in row and "candidate_correct" in row
+               and "transition" in row for row in transitions_a["qas"])
     assert transitions_a["transition_counts"] == {
         "correct_to_correct": 0, "correct_to_wrong": 1,
         "wrong_to_correct": 1, "wrong_to_wrong": 1}

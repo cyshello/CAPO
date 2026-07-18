@@ -111,6 +111,29 @@ legacy cache artifacts are never reinterpreted under the new parser. Larger
 caption models may populate `subject_registry` without changing downstream
 interfaces; descriptions remain the only required per-segment semantic field.
 
+Caption parsing uses `caption_parse_retry_v2_percent_escape`. Before strict JSON
+loading, `caption_parse_normalization_v2_percent_escape` removes only an
+unescaped invalid `\%` sequence; valid JSON escapes and every other invalid
+escape remain unchanged. The raw response is never modified, and the applied
+normalization is recorded as `replace_invalid_percent_escape`. A model call whose raw response
+parses as invalid is followed by at most five retries with identical frames,
+transcript, composed property instruction, frozen history, decoding, and
+output contract. Thus one segment has at most six generation calls: the
+initial attempt plus five retries. Runtime/backend exceptions still propagate
+immediately. Every attempt retains its raw output, parse classification,
+elapsed time, and attempt index in `history_aware_caption_cache_v4`. The first
+valid parse ends the loop; five exhausted retries leave `parsed={}` and the
+existing baseline/intervention fail-closed behavior applies.
+
+Compatible valid v2/v3 caption caches remain reusable because the narrow
+normalization does not change already-valid output. An immutable earlier
+invalid cache is not overwritten: its raw response is reparsed beneath
+`parse_retries/caption_parse_retry_v2_percent_escape/caption.json`, with the
+cached invalid response retained as attempt one. If `\%` was the only defect,
+this recovery performs no model call. The retry/normalization policies are part
+of captioner configuration and run/intervention identity, and model-call
+telemetry counts every actual retry.
+
 History is restricted to configured temporal blocks. Different blocks may be
 processed independently, while segments within one block use preceding
 captions as local history.
@@ -228,7 +251,7 @@ successfully. Only three successfully parsed QA results may enter proposal.
 ### 3.3 Propose multiple properties per video
 
 Analyze the baseline QA results and relevant visual/caption evidence to propose
-zero or more candidate properties for each video:
+exploratory candidate properties for each video:
 
 \[
 \mathcal C_i
@@ -236,8 +259,16 @@ zero or more candidate properties for each video:
 \{p_{i,1},\ldots,p_{i,B_i}\}.
 \]
 
-A video may generate multiple candidates because different QAs may expose
-different captioning failures.
+A video may generate multiple candidates because every eligible QA contributes
+one or two executable intervention candidates, regardless of baseline
+correctness. Incorrect-QA candidates may recover missing or poorly represented
+evidence. Correct-QA candidates may preserve useful evidence or improve clarity,
+temporal order, robustness, concision, relevance, and suppression of speculative
+or repetitive content. The provider identifies each candidate with a source-free
+`qa_slot`; private lineage maps it back to exactly one source question and its
+baseline correctness. These candidates are hypotheses only; retrieval,
+intervention, feedback, and the existing updater still decide whether to add,
+revise, merge, preserve, or reject them.
 
 Each candidate must record its lineage:
 
@@ -245,10 +276,13 @@ Each candidate must record its lineage:
   codebook name;
 - the model's readable `suggested_property_id` as a non-binding hint;
 - source video ID;
-- source QA IDs;
-- concise failure evidence;
-- current-codebook coverage assessment;
-- proposed property instruction.
+- exactly one source QA ID and its baseline correctness for new proposals;
+- natural-language `failure_analysis` provenance;
+- non-binding current-codebook coverage hints;
+- proposed property instruction;
+- an atomic applicability contract containing non-empty `when`, one or more
+  observable `positive_cues`, optional `negative_cues`, and one or more
+  `required_modalities` from `frames`, `transcript`, and `caption_history`.
 
 Candidates are not added to the codebook yet.
 
@@ -256,21 +290,46 @@ Property-proposal model input preserves all three QA outcomes but contains no
 source-video ID, question ID, segment ID, provider priority rank, tool-call ID,
 or payload-truncation metadata. For each QA it contains the question and answer
 choices, ground truth and baseline prediction, at most three bounded sanitized
-reasoning events, and at most three actual used-segment evidence items. Each
-evidence item pairs one deterministic representative frame with its incumbent
-baseline caption; segment lineage remains in a private artifact and is not sent
-to the model. Focused cited/inspected/returned segments take priority, with a
-deterministic representative sample from consumed segments only when needed.
+reasoning events, and the complete time-ordered union of
+`explicitly_cited_segments` and `frame_inspected_segments` as private source
+provenance. The provider payload identifies intervals by `[start–end]` timestamp
+ranges and never by stable segment ID. Explicitly cited intervals are packed
+first with fuller normalized `generated_description` and non-duplicate
+`transcript`; inspected-only intervals follow as deterministic single-line
+`[start–end] description | tx: transcript` summaries, with description and
+transcript bounded to 250 and 120 characters. Empty or substantially duplicate
+transcripts are omitted. Within each class ordering is deterministic by QA and
+timestamp.
+
+The evidence text budget is capped at 200,000 characters and further reduced
+to leave room beneath the existing 250,000-character envelope for the task,
+schema, QA context, and JSON structure. Once the budget is exhausted, remaining
+intervals are omitted from the provider payload only. Their complete original
+caption, generated-description/transcript split, stable segment ID, timestamp,
+evidence role, representative-frame lineage, hashes, inclusion decision, and
+omission reason remain immutable in `input_identity.json`; aggregate and per-QA
+included/omitted counts are also written to `evidence_packing.json` and logged.
+`returned_segments`, general consumed/used segments, and count-based fallback
+sampling do not enter proposer evidence.
+
+The captioner's available evidence contract is current frames, current
+transcript, and preceding caption history. A property may request preservation,
+integration, or expression of information present in those modalities, but may
+not require unavailable tools or inputs. `failure_analysis` is provenance and
+is never injected as a caption or routing condition.
 
 The current codebook and a source-free output schema complete the multimodal
 request. Provider-reported `covered_by_existing_property_ids` are non-binding
 hints only and are stored internally as `coverage_hints`. A non-empty hint list
-does not reject a proposal. Proposal parsing rejects only deterministic exact
-text or active-ID collisions, malformed or duplicate lineage, instance-specific
-leakage, and instructions requiring non-visual, external, background, or
-historical knowledge. Contradictory coverage claims require an explicit partial
-coverage or uncertainty explanation. Source video and all three source QA IDs
-are reattached internally after parsing. The text portion and every transformed
+does not reject a proposal. Pre-intervention parsing rejects only structurally
+unusable output: invalid or missing schema fields, empty instructions, unresolved
+placeholders, exact duplicates for the same QA, invalid source slots, or an
+instruction requiring tools/inputs unavailable to the captioner. It does not
+veto correct-sample candidates, lexical QA overlap, active-property similarity,
+uncertain benefit, weak generality, or possible repetition. Applicability retains
+its strict closed structural schema. `failure_analysis` replaces fixed
+failure-type taxonomies. The private source QA ID and baseline correctness are
+reattached after parsing. The text portion and every transformed
 image are independently bounded and identity-bound. `request.json` records the
 logical model input, `provider_request.json` records the exact secret-free API
 body, and `input_identity.json` records private source/segment/frame lineage
@@ -288,12 +347,43 @@ property-source-video pair remains independently evaluable.
 The proposer returns `suggested_property_id`, but orchestration never uses that
 name as proposal identity. After parsing, it derives
 `candidate_<sha256-prefix>` from the private source-video/baseline lineage and
-normalized property text under `opaque_candidate_proposal_id_v1`. This handle
+normalized property text, canonical applicability, source QA, and baseline
+correctness under `opaque_candidate_proposal_id_v3`. This handle
 is stable for exact resume and differs across source videos. The updater still
 chooses the final active property ID and may add, revise, or merge candidates.
 Legacy raw artifacts with colliding readable IDs are deterministically migrated
 to opaque temporary handles in compact memory while preserving the original ID
 as audit lineage and a non-binding suggestion.
+
+The request records a deterministic per-QA proposal requirement. Every eligible
+correct or incorrect QA requires one or two intervention candidates. Existing
+coverage and uncertain downstream value are recorded for later review rather
+than used to suppress a candidate. Strict zero proposal is allowed only when no
+QA is eligible because of runtime failure, missing focused evidence, malformed
+input, or clearly unreliable annotation. Falling below the required per-QA
+candidate count fails the proposal stage rather than silently completing.
+
+`missing_qa_slot_retry_v1` makes this boundary robust to a partial provider
+response. After the initial response, orchestration identifies only eligible
+`source_qa_slot` values with zero candidates and issues at most two bounded
+follow-up requests containing only those QA rows and their original evidence.
+Already completed slots and accepted proposal text are never regenerated. Each
+retry request, exact provider body, raw response, and row decision is preserved
+under `missing_slot_retries/`. Successful rows are combined without rewriting
+their instructions. If a required slot remains absent after two retries, the
+same cardinality failure remains fail-closed. Exact resume reuses completed
+initial and retry calls.
+
+The tested canonical property is not generalized or rewritten before selective
+re-captioning. `work_item.json`, `transitions.json`, and `result.json` retain the
+original proposal, source QA lineage, baseline correctness, candidate QA outputs,
+and all four correctness transitions. `property_compact_summary_v2` carries this
+bounded provenance into candidate memory and `memory_codebook_updater_request_v2`.
+Only the updater may promote a tested candidate into the active codebook.
+Applicability and `failure_analysis` persist through proposal
+artifacts and resume, feedback requests, candidate memory, the bounded codebook-
+updater request, candidate codebook provenance, and identity hashes. Router-rule
+interpretation of applicability is intentionally deferred.
 
 ### 3.4 Property-conditioned segment retrieval
 
@@ -312,15 +402,29 @@ E_{\mathrm{visual}}(x_{i,t,f})
 \right].
 \]
 
-The exact normalized candidate property text is the only text query. SigLIP
-scores every sampled frame in every valid source-video segment; maximum frame
-pooling produces the segment score. Select the top `M` by descending score,
-ascending segment start, then stable segment ID. Retrieval must not use frozen
-history, captions, questions, answer choices, answers, correctness, reasoning
-traces, or used-segment references.
+The exact normalized candidate property text is the only text query. Before
+ranking, intersect the visual-index segment IDs with the stable segment-ID
+universe materialized by the frozen baseline caption view. This structural
+allowlist uses no caption content: it prevents sampled tail frames or another
+index-boundary artifact from creating an `S_sim` segment that cannot replace
+an incumbent caption. SigLIP scores sampled frames in the surviving segments;
+maximum frame pooling produces the segment score. Select the top `M` only
+after this intersection, by descending score, ascending segment start, then
+stable segment ID. Retrieval must not use frozen history, caption content,
+questions, answer choices, answers, correctness, reasoning traces, or
+used-segment references.
+
+`valid_baseline_caption_segment_intersection_v2` defines the retrieval universe
+from the actual non-empty keys in the frozen `captions.json`, not from all
+segments merely scheduled for captioning. A source segment whose caption parse
+failed therefore cannot enter `S_sim` or a mixed-view replacement. The
+allowlist preserves source order and its hash/count remain retrieval identity.
 
 `property_retrieval_top_k` defaults to 5. Persist every frame score and every
-ranked valid segment, not only the selected segment IDs.
+ranked eligible segment, not only the selected segment IDs. Also persist the
+baseline segment-universe hash/count and the visual-index segment IDs excluded
+by the intersection. The universe policy and hash participate in retrieval and
+resume identity.
 
 The production launcher may place the shared SigLIP embedder on an explicit
 dedicated GPU. When `--embedding-gpu` is provided, it must be a valid free
@@ -333,6 +437,24 @@ and release state are persisted. The embedding execution mode is resume
 identity but not visual-index semantic identity, so a complete
 model/sampling/source-compatible frame index remains reusable across CPU/GPU
 execution. Requests are serialized through the child connection.
+
+DVD caption-database and query search use a separate CPU BGE model;
+`--embedding-gpu` continues to control only property-retrieval SigLIP. The
+production launcher synchronously preloads the shared DVD BGE instance in the
+parent under a process-local lock before any parallel video-QA wave. This
+prevents concurrent first-use from constructing a partial SentenceTransformer.
+`dvd_bge_parent_preload_v1` participates in execution and resume identity, and
+a preload failure stops the run before the parallel wave.
+
+DVD itself also exposes process-global mutable prompt overrides,
+`VIDEO_FPS`, and instrumentation function bindings. Parallel evidence-video
+threads therefore do not execute DVD QA tool loops concurrently. Under
+`serialized_dvd_qa_execution_v1`, each QA exclusively performs prompt reset,
+per-video effective-FPS assignment, database/agent construction, instrumented
+tool execution, and instrumentation removal. The generated database FPS is
+checked against the effective FPS before the agent runs. Captioning and
+property intervention remain GPU-parallel; only downstream DVD QA is serial.
+This policy is part of run, cache, and resume identity.
 
 ### 3.4.1 Post-intervention execution boundary
 
@@ -706,7 +828,7 @@ the candidate codebook and ID mapping before any atomic pair commit.
 The centralized system prompt is
 `optimization/prompts/codebook_updater_v1.txt`, version
 `memory_codebook_updater_prompt_v1`. Its request schema is
-`memory_codebook_updater_request_v1` and contains only the current codebook,
+`memory_codebook_updater_request_v2` and contains only the current codebook,
 bounded active-property memories, bounded candidate memories, current compact
 intervention summaries, recent no-op/rejection summaries, and audit artifact
 references. It never contains raw frames, unbounded captions, or full reasoning
@@ -717,6 +839,16 @@ The strict `memory_codebook_updater_response_v1` response contains zero or more
 names target property/candidate IDs, optional proposed ID/text, concise
 reasoning, supporting memory-example/evidence IDs, behaviors to preserve, and
 confidence. The LLM never edits a snapshot directly.
+
+The real provider uses `openai_strict_component_update_v2`: an updater-specific
+strict JSON Schema constrains the complete response envelope and every action,
+rather than merely requesting a syntactically valid JSON object. The codebook
+updater preserves each raw response beneath `attempts/attempt_NNN/` and retries
+only strict parse/envelope failures, at most three total attempts. Runtime/API
+failures are not converted into plans. `input_identity.json` makes an
+interrupted retry exactly resumable: an already persisted raw attempt is parsed
+again but never sent to the provider again. Older incomplete directories that
+predate this identity fail closed and are not reinterpreted.
 
 Deterministic validation rejects actions independently when they cite unknown
 properties, candidates, examples, or evidence; add without a completed positive
@@ -789,6 +921,25 @@ polarity-inconsistent examples, unsupported mutations, downstream QA leakage,
 conflicting guidance writes, stale mappings, or prompt/protocol changes.
 Codebook merges remap old guidance and aliases to one canonical ID;
 retirements remove obsolete guidance before LLM actions.
+
+The router provider uses the corresponding updater-specific strict JSON Schema
+and the same three-attempt parse-retry boundary. A missing or null
+`target_property_id`, missing response version, extra field, or malformed action
+is therefore rejected before deterministic semantic validation. Every raw
+attempt and parse error is immutable and exact resume skips already completed
+provider calls. The deterministic no-routing-evidence branch still performs no
+provider call and records attempt index zero.
+
+`memory_conditioned_llm_router_updater_v3_strict_retry` has a deterministic no-evidence
+boundary. When the bounded property memory and promoted-candidate mapping
+produce zero routing-evidence rows, no router mutation can be validated. The
+stage therefore does not call the LLM provider and materializes the strict
+empty response `{"actions": []}` under
+`no_routing_evidence_empty_plan_v1`. It still validates the empty plan,
+applies deterministic ID remapping, renders and hashes the actual router
+prompt, and participates in the atomic provisional pair. A non-empty routing
+evidence set follows the existing LLM path, and empty or stale target IDs
+remain parser/validator errors rather than being normalized.
 
 Persistence is two-phase. Router request/response/validation/rendering
 artifacts may exist without a committed pair, but a codebook is not made active

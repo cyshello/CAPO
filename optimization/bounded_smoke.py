@@ -16,7 +16,10 @@ from surrogate_rollout.optimization.final_iteration import (
 from surrogate_rollout.optimization.baseline_phase import (
     qa_execution_failure_reasons,
 )
-from surrogate_rollout.optimization.property_proposal import CandidatePropertyProposal
+from surrogate_rollout.optimization.property_proposal import (
+    CandidatePropertyProposal,
+    candidate_property_proposal_from_json,
+)
 from surrogate_rollout.optimization.startup_models import (
     build_startup_model_manifest,
     log_startup_models,
@@ -145,19 +148,7 @@ def _archive_invalid_qa_attempt(output_dir: str, video_id: str) -> str:
 
 
 def _proposal_from_json(value: Mapping[str, Any]) -> CandidatePropertyProposal:
-    return CandidatePropertyProposal(
-        candidate_property_id=value["candidate_property_id"],
-        property_text=value["property_text"],
-        source_video_id=value["source_video_id"],
-        source_question_ids=tuple(value["source_question_ids"]),
-        motivating_failure_types=tuple(value["motivating_failure_types"]),
-        coverage_hints=tuple(
-            value.get("coverage_hints")
-            or value.get("possible_coverage_by_existing_property_ids")
-            or value.get("covered_by_existing_property_ids") or ()),
-        proposal_rationale=value["proposal_rationale"],
-        proposer_policy_version=value["proposer_policy_version"],
-    )
+    return candidate_property_proposal_from_json(value)
 
 
 def _stage_identity(value: Any) -> Mapping[str, Any]:

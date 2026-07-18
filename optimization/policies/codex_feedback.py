@@ -93,12 +93,13 @@ Frozen request:
 
 
 def _openai_chat(prompt: str, *, model: str, api_key: str,
-                 timeout: int = 600) -> str:
+                 timeout: int = 600,
+                 response_format: dict | None = None) -> str:
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "response_format": {"type": "json_object"},
+        "response_format": response_format or {"type": "json_object"},
     }).encode()
     request = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions", data=body,

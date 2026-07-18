@@ -2,6 +2,9 @@
 signature preservation, and behavior transparency."""
 
 import inspect
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated
 
 import pytest
@@ -14,6 +17,7 @@ from surrogate_rollout.instrumentation import (
 from surrogate_rollout.evaluation.dvd_qa import (
     _constrain_clip_search_schema,
     dvd_qa_execution_identity,
+    serialized_dvd_qa_execution,
 )
 
 
@@ -90,6 +94,31 @@ def test_clip_search_schema_and_execution_identity_are_fixed_to_16():
     assert identity["clip_search_top_k"] == 16
     assert identity["clip_search_policy_version"] == \
         "fixed_clip_search_top_k_v1"
+    assert identity["embedding_preload_policy_version"] == \
+        "dvd_bge_parent_preload_v1"
+    assert identity["qa_concurrency_policy_version"] == \
+        "serialized_dvd_qa_execution_v1"
+
+
+def test_dvd_qa_global_state_guard_serializes_parallel_callers():
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def enter(_index):
+        nonlocal active, maximum_active
+        with serialized_dvd_qa_execution():
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.005)
+            with state_lock:
+                active -= 1
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        tuple(pool.map(enter, range(16)))
+
+    assert maximum_active == 1
 
 
 def test_query_method_restored_after_call():

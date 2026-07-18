@@ -9,9 +9,6 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
 
-from surrogate_rollout.optimization.policies.property_proposal import (
-    _non_visual_knowledge_reason,
-)
 from surrogate_rollout.prompt_routing.persistence import (
     _atomic_write_text,
     prompt_bank_from_json,
@@ -27,13 +24,15 @@ from surrogate_rollout.schemas import sha256_json, sha256_text
 
 
 SYSTEM_PROMPT_VERSION = "memory_codebook_updater_prompt_v1"
-UPDATER_REQUEST_SCHEMA_VERSION = "memory_codebook_updater_request_v1"
+UPDATER_REQUEST_SCHEMA_VERSION = "memory_codebook_updater_request_v2"
 UPDATER_RESPONSE_SCHEMA_VERSION = "memory_codebook_updater_response_v1"
 VALIDATION_REPORT_SCHEMA_VERSION = "memory_codebook_validation_report_v1"
 APPLIED_PLAN_SCHEMA_VERSION = "memory_codebook_applied_plan_v1"
 CANDIDATE_CODEBOOK_SCHEMA_VERSION = "memory_candidate_codebook_v1"
 ID_MAPPING_SCHEMA_VERSION = "property_id_mapping_v1"
-CHECKPOINT_MANIFEST_SCHEMA_VERSION = "memory_codebook_checkpoint_manifest_v1"
+CHECKPOINT_MANIFEST_SCHEMA_VERSION = "memory_codebook_checkpoint_manifest_v2"
+UPDATER_INPUT_IDENTITY_SCHEMA_VERSION = "memory_codebook_updater_input_identity_v1"
+UPDATER_ATTEMPTS_SCHEMA_VERSION = "memory_codebook_updater_attempts_v1"
 ACTION_NAMES = ("add", "revise", "merge", "preserve", "retire", "no_op")
 ACTION_FIELDS = frozenset({
     "action_id", "action", "target_property_ids", "candidate_ids",
@@ -64,6 +63,7 @@ class CodebookUpdaterBounds:
     max_reasoning_chars: int = 600
     max_behavior_chars: int = 300
     min_retire_support_groups: int = 2
+    max_parse_attempts: int = 3
 
     def __post_init__(self) -> None:
         for name, value in as_json_dict(self).items():
@@ -140,7 +140,24 @@ def _text_rejection(text: str) -> str | None:
         r"\bcorrect answer\b", r"\banswer (?:is|option)\b",
         r"\boption\s+[a-z0-9]\b", r"\b\d{1,2}:\d{2}(?::\d{2})?\b",
         r"\b\d+_\d+\b", r"\bvideo[-_ ]?id\b", r"\bquestion[-_ ]?id\b",
+)
+
+
+def _non_visual_knowledge_reason(text: str) -> str | None:
+    """Updater-only semantic guard; proposal generation intentionally defers it."""
+    lowered = text.casefold()
+    direct = (
+        r"\bnon[- ]visual (?:knowledge|information|context|facts?)\b",
+        r"\bexternal (?:knowledge|information|context|facts?|sources?)\b",
+        r"\bbackground (?:knowledge|information|context|facts?|research)\b",
+        r"\bhistorical (?:knowledge|context|background|facts?|research)\b",
+        r"\b(?:world|domain|prior) knowledge\b",
+        r"\bbeyond (?:what is|the content) (?:visible|shown|depicted)\b",
+        r"\boutside (?:the|of the) (?:frames?|video|visual evidence)\b",
     )
+    if any(re.search(pattern, lowered) for pattern in direct):
+        return "requires non-visual or external/background/historical knowledge"
+    return None
     if any(re.search(pattern, lowered) for pattern in forbidden):
         return "property text contains instance-specific lineage or answer language"
     if re.search(r"\b(?:describe|capture|record|track|transcribe)\s+(?:the|a|an)\s+"
@@ -207,7 +224,7 @@ def parse_updater_plan(raw: str, *, max_actions: int) -> tuple[dict[str, Any], .
 
 
 class MemoryConditionedLLMCodebookUpdater:
-    policy_version = "memory_conditioned_llm_codebook_updater_v1"
+    policy_version = "memory_conditioned_llm_codebook_updater_v3_strict_retry"
 
     def __init__(
         self, *, response_provider: Callable[[str, str], str],
@@ -266,17 +283,28 @@ class MemoryConditionedLLMCodebookUpdater:
                     "completed updater artifact uses incompatible semantics")
             self._validate_resume(existing)
             return {**existing, "resumed": True}
+        identity_path = os.path.join(output_dir, "input_identity.json")
         if os.path.isdir(output_dir) and os.listdir(output_dir):
-            raise LLMCodebookUpdaterConflictError(
-                "incomplete updater directory cannot be resumed")
+            if not os.path.exists(identity_path):
+                raise LLMCodebookUpdaterConflictError(
+                    "incomplete updater directory predates strict retry semantics")
+            existing_identity = _read_json(identity_path)
+            if existing_identity.get("schema_version") != \
+                    UPDATER_INPUT_IDENTITY_SCHEMA_VERSION or \
+                    existing_identity.get("input_fingerprint") != fingerprint:
+                raise LLMCodebookUpdaterConflictError(
+                    "incomplete updater input identity mismatch")
+        identity_path = _write_immutable(identity_path, {
+            "schema_version": UPDATER_INPUT_IDENTITY_SCHEMA_VERSION,
+            "input_fingerprint": fingerprint,
+            "identity": identity,
+        })
         prompt_copy = _write_text_immutable(
             os.path.join(output_dir, "system_prompt.txt"), self.system_prompt)
         request_path = _write_immutable(os.path.join(output_dir, "request.json"), request)
-        raw = self.response_provider(self.system_prompt, dumps_canonical(request))
-        if not isinstance(raw, str):
-            raise LLMCodebookUpdaterError("updater provider must return text")
+        raw, actions, attempts_path = self._load_or_generate_plan(
+            output_dir=output_dir, request=request)
         raw_path = _write_text_immutable(os.path.join(output_dir, "raw_response.txt"), raw)
-        actions = parse_updater_plan(raw, max_actions=self.bounds.max_actions)
         parsed_path = _write_immutable(os.path.join(output_dir, "parsed_plan.json"), {
             "schema_version": UPDATER_RESPONSE_SCHEMA_VERSION, "actions": actions})
         validated, rejected = self._validate_actions(
@@ -315,7 +343,9 @@ class MemoryConditionedLLMCodebookUpdater:
             os.path.join(output_dir, "promoted_property_memory.json"),
             self._promote_memory(memory, candidate_bank, promotions, validated))
         artifacts = {
+            "input_identity": identity_path,
             "system_prompt": prompt_copy, "request": request_path,
+            "response_attempts": attempts_path,
             "raw_response": raw_path, "parsed_plan": parsed_path,
             "validation_report": validation_path, "rejected_actions": rejected_path,
             "applied_plan": applied_path, "candidate_codebook": bank_path,
@@ -334,6 +364,72 @@ class MemoryConditionedLLMCodebookUpdater:
         }
         _write_immutable(manifest_path, manifest)
         return _read_json(manifest_path)
+
+    def _load_or_generate_plan(
+        self, *, output_dir: str, request: Mapping[str, Any],
+    ) -> tuple[str, tuple[dict[str, Any], ...], str]:
+        attempts = []
+        previous_error = None
+        request_text = dumps_canonical(request)
+        last_error: LLMCodebookUpdaterParseError | None = None
+        for attempt_index in range(1, self.bounds.max_parse_attempts + 1):
+            attempt_dir = os.path.join(
+                output_dir, "attempts", f"attempt_{attempt_index:03d}")
+            raw_path = os.path.join(attempt_dir, "raw_response.txt")
+            if os.path.exists(raw_path):
+                with open(raw_path) as handle:
+                    raw = handle.read()
+            else:
+                repair = "" if previous_error is None else (
+                    "\n\nThe previous response failed strict parsing: " +
+                    previous_error +
+                    "\nReturn a complete object matching the required schema exactly.")
+                raw = self.response_provider(
+                    self.system_prompt + repair, request_text)
+                if not isinstance(raw, str):
+                    raise LLMCodebookUpdaterError(
+                        "updater provider must return text")
+                _write_text_immutable(raw_path, raw)
+            try:
+                actions = parse_updater_plan(
+                    raw, max_actions=self.bounds.max_actions)
+            except LLMCodebookUpdaterParseError as exc:
+                last_error = exc
+                previous_error = str(exc)
+                status = "rejected"
+                error = {"type": type(exc).__name__, "message": str(exc)}
+            else:
+                status, error = "accepted", None
+            result_path = _write_immutable(
+                os.path.join(attempt_dir, "result.json"), {
+                    "schema_version": UPDATER_ATTEMPTS_SCHEMA_VERSION,
+                    "attempt_index": attempt_index,
+                    "status": status,
+                    "raw_source": "provider_response",
+                    "raw_response_sha256": sha256_text(raw),
+                    "parse_error": error,
+                })
+            attempts.append({
+                "attempt_index": attempt_index, "status": status,
+                "raw_response_path": os.path.abspath(raw_path),
+                "result_path": result_path,
+            })
+            if status == "accepted":
+                attempts_path = _write_immutable(
+                    os.path.join(output_dir, "response_attempts.json"), {
+                        "schema_version": UPDATER_ATTEMPTS_SCHEMA_VERSION,
+                        "max_parse_attempts": self.bounds.max_parse_attempts,
+                        "accepted_attempt_index": attempt_index,
+                        "attempts": attempts,
+                    })
+                return raw, actions, attempts_path
+        assert last_error is not None
+        _write_immutable(os.path.join(output_dir, "response_attempts.json"), {
+            "schema_version": UPDATER_ATTEMPTS_SCHEMA_VERSION,
+            "max_parse_attempts": self.bounds.max_parse_attempts,
+            "accepted_attempt_index": None, "attempts": attempts,
+        })
+        raise last_error
 
     def _build_request(
         self, *, iteration_id: str, prompt_bank: PromptBankSnapshot,
@@ -358,6 +454,7 @@ class MemoryConditionedLLMCodebookUpdater:
                 "property_id": entry.prompt_id, "property_text": entry.prompt_text,
                 "name": entry.name, "description": entry.description,
                 "status": entry.status,
+                "applicability_traits": as_json_dict(entry.applicability_traits),
             } for entry in prompt_bank.entries),
             "active_property_memories": properties,
             "candidate_memories": candidates,
@@ -532,6 +629,8 @@ class MemoryConditionedLLMCodebookUpdater:
         mapping: dict[str, str | None] = {
             entry.prompt_id: entry.prompt_id for entry in prompt_bank.entries}
         promotions = {}
+        candidates = {item["candidate_property_id"]: item
+                      for item in memory.get("candidates") or ()}
         summaries = {name: [] for name in (
             "added", "revised", "merged", "preserved", "retired", "no_op")}
         summary_field = {
@@ -548,15 +647,19 @@ class MemoryConditionedLLMCodebookUpdater:
             proposed_text = action["proposed_property_text"]
             if name == "add":
                 property_id = action["proposed_property_id"]
+                candidate = candidates[action["candidate_ids"][0]]
                 entries.append(PromptEntry(
                     prompt_id=property_id, prompt_text=proposed_text,
                     prompt_hash=sha256_text(proposed_text),
                     name="Memory-conditioned reusable property",
                     description="Validated from bounded property memory.",
                     tags=("learned", "memory_conditioned"), created_by=self.policy_version,
+                    applicability_traits=candidate.get("applicability") or {},
                     provenance={"iteration_id": iteration_id,
                                 "action_id": action["action_id"],
-                                "candidate_ids": action["candidate_ids"]}))
+                                "candidate_ids": action["candidate_ids"],
+                                "proposal_failure_analysis": candidate.get(
+                                    "failure_analysis")}))
                 promotions[action["candidate_ids"][0]] = property_id
             elif name == "revise":
                 target = action["target_property_ids"][0]
@@ -648,6 +751,8 @@ class MemoryConditionedLLMCodebookUpdater:
                 by_property[property_id] = {
                     "schema_version": "property_memory_v1", "property_id": property_id,
                     "property_text": entry.prompt_text,
+                    "applicability": candidate.get("applicability"),
+                    "failure_analysis": candidate.get("failure_analysis"),
                     "why_created": candidate.get("why_proposed"),
                     "intended_behavior": entry.prompt_text,
                     "origin": {"kind": "promoted_candidate",

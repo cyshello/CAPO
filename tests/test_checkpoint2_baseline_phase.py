@@ -6,6 +6,7 @@ import pytest
 
 from surrogate_rollout.optimization.baseline_phase import (
     BaselinePhaseRunner,
+    _valid_caption_segment_ids,
     qa_execution_failure_reasons,
 )
 from surrogate_rollout.optimization.property_proposal import (
@@ -23,6 +24,19 @@ from surrogate_rollout.schemas import DVDRunResult, ReferenceSets
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_retrieval_universe_uses_only_source_ordered_valid_caption_keys():
+    assert _valid_caption_segment_ids(
+        ("0_10", "10_20", "20_30", "30_40"),
+        {
+            "0_10": {"caption": "valid"},
+            "10_20": {"caption": ""},
+            "20_30": {},
+            "30_40": {"caption": "also valid"},
+            "subject_registry": {},
+        },
+    ) == ("0_10", "30_40")
 
 
 class FakeCaptionViewBuilder:
@@ -75,9 +89,10 @@ class FixturePropertyRetrievalRunner:
     def __init__(self):
         self.calls = []
 
-    def run(self, *, sample, proposals, output_dir):
+    def run(self, *, sample, proposals, output_dir, baseline_segment_ids):
         video_id = sample["extra"]["videoID"]
-        self.calls.append((video_id, tuple(item.property_id for item in proposals)))
+        self.calls.append((video_id, tuple(item.property_id for item in proposals),
+                           tuple(baseline_segment_ids)))
         directory = Path(output_dir)
         directory.mkdir(parents=True, exist_ok=True)
         paths = []
@@ -175,6 +190,8 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
     assert len(qa_calls) == 9
     assert proposer.calls == list(result.selected_video_ids)
     assert [len(item[1]) for item in retrieval_runner.calls] == [0, 1, 2]
+    assert all(item[2] == ("0_10", "10_20")
+               for item in retrieval_runner.calls)
     assert len(result.property_retrieval_paths) == 3
     stage_pairs = {(item["event"], item["stage"]) for item in stage_events}
     assert stage_pairs >= {

@@ -123,6 +123,19 @@ class Provider:
         return {"provider": "fixture", "model": self.model, "real_model": False}
 
 
+class SequenceProvider(Provider):
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = list(responses)
+
+    def __call__(self, system_prompt, request):
+        self.calls.append((system_prompt, json.loads(request)))
+        value = self.responses.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
 def updater_inputs(tmp_path, *, candidate_bank=None, mapping=None, memory_value=None):
     bank, router = components()
     candidate_bank = candidate_bank or bank
@@ -175,6 +188,66 @@ def test_strict_router_plan_parsing():
         parse_router_updater_plan(json.dumps({
             "schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
             "actions": [malformed]}), max_actions=2)
+    empty_target = action("empty-target", "no_op", target="")
+    with pytest.raises(LLMRouterUpdaterParseError, match="target_property_id"):
+        parse_router_updater_plan(json.dumps({
+            "schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
+            "actions": [empty_target]}), max_actions=2)
+
+
+def test_router_parse_failure_retries_and_preserves_attempts(tmp_path):
+    inputs = updater_inputs(tmp_path / "inputs")
+    invalid = action("bad", "no_op")
+    invalid["target_property_id"] = None
+    provider = SequenceProvider([
+        json.dumps({"schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
+                    "actions": [invalid]}),
+        json.dumps({"schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
+                    "actions": [action("ok", "no_op")]}),
+    ])
+    result = MemoryConditionedLLMRouterUpdater(response_provider=provider).run(
+        iteration_id="iteration-1", parent_router_policy=inputs[1],
+        candidate_codebook_path=inputs[2], property_id_mapping_path=inputs[3],
+        property_memory_snapshot_path=inputs[4],
+        codebook_applied_plan_path=inputs[5],
+        codebook_validation_report_path=inputs[6],
+        output_dir=str(tmp_path / "router_updater"))
+    attempts = loaded(result, "response_attempts")
+    assert len(provider.calls) == 2
+    assert attempts["accepted_attempt_index"] == 2
+    assert [row["status"] for row in attempts["attempts"]] == [
+        "rejected", "accepted"]
+
+
+def test_router_partial_retry_resume_skips_saved_attempt(tmp_path):
+    inputs = updater_inputs(tmp_path / "inputs")
+    output = tmp_path / "router_updater"
+    first = SequenceProvider([
+        json.dumps({"actions": []}), RuntimeError("temporary provider failure")])
+    with pytest.raises(RuntimeError, match="temporary provider failure"):
+        MemoryConditionedLLMRouterUpdater(response_provider=first).run(
+            iteration_id="iteration-1", parent_router_policy=inputs[1],
+            candidate_codebook_path=inputs[2],
+            property_id_mapping_path=inputs[3],
+            property_memory_snapshot_path=inputs[4],
+            codebook_applied_plan_path=inputs[5],
+            codebook_validation_report_path=inputs[6],
+            output_dir=str(output))
+    second = SequenceProvider([json.dumps({
+        "schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
+        "actions": [action("ok", "no_op")],
+    })])
+    result = MemoryConditionedLLMRouterUpdater(response_provider=second).run(
+        iteration_id="iteration-1", parent_router_policy=inputs[1],
+        candidate_codebook_path=inputs[2],
+        property_id_mapping_path=inputs[3],
+        property_memory_snapshot_path=inputs[4],
+        codebook_applied_plan_path=inputs[5],
+        codebook_validation_report_path=inputs[6],
+        output_dir=str(output))
+    assert len(first.calls) == 2
+    assert len(second.calls) == 1
+    assert loaded(result, "response_attempts")["accepted_attempt_index"] == 2
 
 
 def test_updater_receives_candidate_codebook_mapping_and_bounded_evidence(tmp_path):
@@ -342,9 +415,9 @@ class UnusedStage:
     configuration_identity = {"fixture": "unused"}
 
 
-def codebook_checkpoint(tmp_path):
+def codebook_checkpoint(tmp_path, *, memory_value=None):
     bank, router, wrapper, mapping_path, memory_path, plan, validation = \
-        updater_inputs(tmp_path / "cp2")
+        updater_inputs(tmp_path / "cp2", memory_value=memory_value)
     updater_artifacts = {
         "candidate_codebook": wrapper, "property_id_mapping": mapping_path,
         "promoted_property_memory": memory_path, "applied_plan": plan,
@@ -408,6 +481,35 @@ def test_atomic_provisional_pair_creation_and_exact_resume(tmp_path):
     assert resumed["resumed"] is True and len(provider.calls) == 1
 
 
+def test_no_routing_evidence_still_commits_atomic_pair_without_provider(tmp_path):
+    seed_bank, _ = components()
+    empty_memory = memory(seed_bank)
+    for row in empty_memory["properties"]:
+        row["routing_examples"] = {"positive": [], "negative": []}
+    bank, router, checkpoint = codebook_checkpoint(
+        tmp_path, memory_value=empty_memory)
+    provider = Provider(error=AssertionError("provider must not be called"))
+    runner = orchestrator(provider)
+    result = runner.run_memory_conditioned_router_checkpoint(
+        iteration_id="iteration-1", parent_router_policy=router,
+        codebook_checkpoint_manifest_path=checkpoint,
+        output_dir=str(tmp_path / "atomic"), state_dir=str(tmp_path / "state"))
+    pair = loaded(result, "atomic_policy_pair")
+    assert pair["status"] == "committed"
+    assert pair["candidate_policy_pair"]["bank_version"] == bank.bank_version
+    router_manifest = json.loads(Path(
+        result["artifacts"]["router_updater_manifest"]).read_text())
+    assert router_manifest["execution_mode"] == "deterministic_empty_plan"
+    assert router_manifest["provider_called"] is False
+    assert provider.calls == []
+    resumed = runner.run_memory_conditioned_router_checkpoint(
+        iteration_id="iteration-1", parent_router_policy=router,
+        codebook_checkpoint_manifest_path=checkpoint,
+        output_dir=str(tmp_path / "atomic"), state_dir=str(tmp_path / "state"))
+    assert resumed["resumed"] is True
+    assert provider.calls == []
+
+
 def test_router_failure_prevents_codebook_only_pair_commit(tmp_path):
     _, router, checkpoint = codebook_checkpoint(tmp_path)
     runner = orchestrator(Provider(error=RuntimeError("fixture failure")))
@@ -441,3 +543,39 @@ def test_incompatible_memory_schema_and_zero_action_noop(tmp_path):
     result, provider, _ = run_updater(tmp_path / "zero", [])
     assert result["accepted_action_count"] == 0
     assert provider.calls and loaded(result, "structured_router_policy")["properties"]
+
+
+def test_no_routing_evidence_uses_deterministic_empty_plan(tmp_path):
+    bank, _ = components()
+    empty_memory = memory(bank)
+    for row in empty_memory["properties"]:
+        row["routing_examples"] = {"positive": [], "negative": []}
+    provider = Provider(error=AssertionError("provider must not be called"))
+    inputs = updater_inputs(
+        tmp_path / "inputs", memory_value=empty_memory)
+    updater = MemoryConditionedLLMRouterUpdater(response_provider=provider)
+    result = updater.run(
+        iteration_id="iteration-1", parent_router_policy=inputs[1],
+        candidate_codebook_path=inputs[2], property_id_mapping_path=inputs[3],
+        property_memory_snapshot_path=inputs[4],
+        codebook_applied_plan_path=inputs[5],
+        codebook_validation_report_path=inputs[6],
+        output_dir=str(tmp_path / "router_updater"))
+    assert provider.calls == []
+    assert result["provider_called"] is False
+    assert result["execution_mode"] == "deterministic_empty_plan"
+    assert result["deterministic_reason"] == "no_routing_evidence"
+    assert loaded(result, "parsed_plan")["actions"] == []
+    assert loaded(result, "applied_plan")["actions"] == []
+    execution = loaded(result, "execution")
+    assert execution["provider_called"] is False
+    assert execution["routing_evidence_count"] == 0
+    resumed = updater.run(
+        iteration_id="iteration-1", parent_router_policy=inputs[1],
+        candidate_codebook_path=inputs[2], property_id_mapping_path=inputs[3],
+        property_memory_snapshot_path=inputs[4],
+        codebook_applied_plan_path=inputs[5],
+        codebook_validation_report_path=inputs[6],
+        output_dir=str(tmp_path / "router_updater"))
+    assert resumed["resumed"] is True
+    assert provider.calls == []

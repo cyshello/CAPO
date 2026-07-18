@@ -45,7 +45,11 @@ ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION = "memory_router_updater_response_v1"
 ROUTER_UPDATER_PLAN_SCHEMA_VERSION = "memory_router_updater_plan_v1"
 ROUTER_VALIDATION_SCHEMA_VERSION = "memory_router_validation_report_v1"
 ROUTER_APPLIED_PLAN_SCHEMA_VERSION = "memory_router_applied_plan_v1"
-ROUTER_UPDATER_MANIFEST_SCHEMA_VERSION = "memory_router_updater_manifest_v1"
+ROUTER_UPDATER_MANIFEST_SCHEMA_VERSION = "memory_router_updater_manifest_v2"
+ROUTER_EXECUTION_SCHEMA_VERSION = "memory_router_updater_execution_v2"
+ROUTER_EXECUTION_POLICY_VERSION = "no_routing_evidence_empty_plan_v1"
+ROUTER_INPUT_IDENTITY_SCHEMA_VERSION = "memory_router_updater_input_identity_v1"
+ROUTER_ATTEMPTS_SCHEMA_VERSION = "memory_router_updater_attempts_v1"
 ACTION_TYPES = (
     "set_selection_guidance", "set_avoidance_guidance",
     "add_positive_example", "add_negative_example", "preserve", "no_op",
@@ -77,6 +81,7 @@ class RouterUpdaterBounds:
     max_actions: int = 48
     max_guidance_chars: int = 500
     max_example_chars: int = 300
+    max_parse_attempts: int = 3
 
     def __post_init__(self) -> None:
         if any(not isinstance(value, int) or value < 1
@@ -200,7 +205,7 @@ def _leaks_downstream_data(value: str) -> bool:
 
 
 class MemoryConditionedLLMRouterUpdater:
-    policy_version = "memory_conditioned_llm_router_updater_v1"
+    policy_version = "memory_conditioned_llm_router_updater_v3_strict_retry"
 
     def __init__(
         self, *, response_provider: Callable[[str, str], str],
@@ -224,6 +229,7 @@ class MemoryConditionedLLMRouterUpdater:
             "renderer_version": ROUTER_PROMPT_RENDERER_VERSION,
             "system_prompt_version": SYSTEM_PROMPT_VERSION,
             "system_prompt_sha256": sha256_text(self.system_prompt),
+            "execution_policy_version": ROUTER_EXECUTION_POLICY_VERSION,
             "bounds": as_json_dict(self.bounds),
             "provider": _provider_identity(response_provider),
         }
@@ -333,9 +339,22 @@ class MemoryConditionedLLMRouterUpdater:
                     "completed router updater uses incompatible semantics")
             self._validate_resume(manifest, candidate_bank)
             return {**manifest, "resumed": True}
+        identity_path = os.path.join(output_dir, "input_identity.json")
         if os.path.isdir(output_dir) and os.listdir(output_dir):
-            raise LLMRouterUpdaterConflictError(
-                "incomplete router-updater directory cannot be resumed")
+            if not os.path.exists(identity_path):
+                raise LLMRouterUpdaterConflictError(
+                    "incomplete router-updater directory predates strict retry semantics")
+            existing_identity = _read_json(identity_path)
+            if existing_identity.get("schema_version") != \
+                    ROUTER_INPUT_IDENTITY_SCHEMA_VERSION or \
+                    existing_identity.get("input_fingerprint") != fingerprint:
+                raise LLMRouterUpdaterConflictError(
+                    "incomplete router-updater input identity mismatch")
+        identity_path = _write_immutable(identity_path, {
+            "schema_version": ROUTER_INPUT_IDENTITY_SCHEMA_VERSION,
+            "input_fingerprint": fingerprint,
+            "identity": identity,
+        })
 
         parent_path = _write_immutable(
             os.path.join(output_dir, "parent_structured_router_policy.json"),
@@ -343,11 +362,40 @@ class MemoryConditionedLLMRouterUpdater:
         prompt_path = _write_text_immutable(
             os.path.join(output_dir, "system_prompt.txt"), self.system_prompt)
         request_path = _write_immutable(os.path.join(output_dir, "request.json"), request)
-        raw = self.response_provider(self.system_prompt, dumps_canonical(request))
-        if not isinstance(raw, str):
-            raise LLMRouterUpdaterError("router updater provider must return text")
+        if evidence:
+            execution_mode = "llm_provider"
+            provider_called = True
+            deterministic_reason = None
+            raw, actions, attempts_path = self._load_or_generate_plan(
+                output_dir=output_dir, request=request)
+        else:
+            execution_mode = "deterministic_empty_plan"
+            provider_called = False
+            deterministic_reason = "no_routing_evidence"
+            raw = dumps_canonical({
+                "schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
+                "actions": (),
+            })
+            actions = parse_router_updater_plan(
+                raw, max_actions=self.bounds.max_actions)
+            attempts_path = _write_immutable(
+                os.path.join(output_dir, "response_attempts.json"), {
+                    "schema_version": ROUTER_ATTEMPTS_SCHEMA_VERSION,
+                    "max_parse_attempts": self.bounds.max_parse_attempts,
+                    "accepted_attempt_index": 0,
+                    "attempts": [],
+                    "deterministic_reason": deterministic_reason,
+                })
+        execution_path = _write_immutable(
+            os.path.join(output_dir, "execution.json"), {
+                "schema_version": ROUTER_EXECUTION_SCHEMA_VERSION,
+                "execution_policy_version": ROUTER_EXECUTION_POLICY_VERSION,
+                "mode": execution_mode,
+                "provider_called": provider_called,
+                "routing_evidence_count": len(evidence),
+                "deterministic_reason": deterministic_reason,
+            })
         raw_path = _write_text_immutable(os.path.join(output_dir, "raw_response.txt"), raw)
-        actions = parse_router_updater_plan(raw, max_actions=self.bounds.max_actions)
         parsed_path = _write_immutable(os.path.join(output_dir, "parsed_plan.json"), {
             "schema_version": ROUTER_UPDATER_PLAN_SCHEMA_VERSION,
             "response_schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
@@ -360,6 +408,7 @@ class MemoryConditionedLLMRouterUpdater:
                 "schema_version": ROUTER_VALIDATION_SCHEMA_VERSION,
                 "accepted_action_ids": tuple(item["action_id"] for item in accepted),
                 "rejected_actions": rejected,
+                "execution_mode": execution_mode,
                 "fixed_protocol_unchanged": True})
         rejected_path = _write_immutable(
             os.path.join(output_dir, "rejected_actions.json"), {
@@ -402,7 +451,10 @@ class MemoryConditionedLLMRouterUpdater:
             os.path.join(output_dir, "candidate_router_policy.json"), candidate_router)
         artifacts = {
             "parent_structured_router_policy": parent_path,
+            "input_identity": identity_path,
             "system_prompt": prompt_path, "request": request_path,
+            "response_attempts": attempts_path,
+            "execution": execution_path,
             "raw_response": raw_path, "parsed_plan": parsed_path,
             "validation_report": validation_path,
             "rejected_actions": rejected_path, "applied_plan": applied_path,
@@ -419,6 +471,9 @@ class MemoryConditionedLLMRouterUpdater:
             "structured_policy_version": STRUCTURED_ROUTER_POLICY_SCHEMA_VERSION,
             "rendered_prompt_hash": rendered["prompt_sha256"],
             "candidate_router_version": candidate_router.router_version,
+            "execution_mode": execution_mode,
+            "provider_called": provider_called,
+            "deterministic_reason": deterministic_reason,
             "artifacts": artifacts,
             "artifact_hashes": {name: _file_hash(path)
                                 for name, path in artifacts.items()},
@@ -427,6 +482,71 @@ class MemoryConditionedLLMRouterUpdater:
         }
         _write_immutable(manifest_path, manifest)
         return _read_json(manifest_path)
+
+    def _load_or_generate_plan(
+        self, *, output_dir: str, request: Mapping[str, Any],
+    ) -> tuple[str, tuple[dict[str, Any], ...], str]:
+        attempts = []
+        previous_error = None
+        request_text = dumps_canonical(request)
+        last_error: LLMRouterUpdaterParseError | None = None
+        for attempt_index in range(1, self.bounds.max_parse_attempts + 1):
+            attempt_dir = os.path.join(
+                output_dir, "attempts", f"attempt_{attempt_index:03d}")
+            raw_path = os.path.join(attempt_dir, "raw_response.txt")
+            if os.path.exists(raw_path):
+                with open(raw_path) as handle:
+                    raw = handle.read()
+            else:
+                repair = "" if previous_error is None else (
+                    "\n\nThe previous response failed strict parsing: " +
+                    previous_error +
+                    "\nReturn a complete object matching the required schema exactly.")
+                raw = self.response_provider(
+                    self.system_prompt + repair, request_text)
+                if not isinstance(raw, str):
+                    raise LLMRouterUpdaterError(
+                        "router updater provider must return text")
+                _write_text_immutable(raw_path, raw)
+            try:
+                actions = parse_router_updater_plan(
+                    raw, max_actions=self.bounds.max_actions)
+            except LLMRouterUpdaterParseError as exc:
+                last_error = exc
+                previous_error = str(exc)
+                status = "rejected"
+                error = {"type": type(exc).__name__, "message": str(exc)}
+            else:
+                status, error = "accepted", None
+            result_path = _write_immutable(
+                os.path.join(attempt_dir, "result.json"), {
+                    "schema_version": ROUTER_ATTEMPTS_SCHEMA_VERSION,
+                    "attempt_index": attempt_index, "status": status,
+                    "raw_source": "provider_response",
+                    "raw_response_sha256": sha256_text(raw),
+                    "parse_error": error,
+                })
+            attempts.append({
+                "attempt_index": attempt_index, "status": status,
+                "raw_response_path": os.path.abspath(raw_path),
+                "result_path": result_path,
+            })
+            if status == "accepted":
+                attempts_path = _write_immutable(
+                    os.path.join(output_dir, "response_attempts.json"), {
+                        "schema_version": ROUTER_ATTEMPTS_SCHEMA_VERSION,
+                        "max_parse_attempts": self.bounds.max_parse_attempts,
+                        "accepted_attempt_index": attempt_index,
+                        "attempts": attempts,
+                    })
+                return raw, actions, attempts_path
+        assert last_error is not None
+        _write_immutable(os.path.join(output_dir, "response_attempts.json"), {
+            "schema_version": ROUTER_ATTEMPTS_SCHEMA_VERSION,
+            "max_parse_attempts": self.bounds.max_parse_attempts,
+            "accepted_attempt_index": None, "attempts": attempts,
+        })
+        raise last_error
 
     @staticmethod
     def _routing_evidence(

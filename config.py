@@ -24,18 +24,28 @@ CAPTION_CACHE_ROOT = os.environ.get(
 )
 CACHE_MANIFEST_PATH = os.path.join(CAPTION_CACHE_ROOT, "cache_manifest.jsonl")
 
-SPLIT_MANIFEST_PATH = os.path.join(HARNESS_ROOT, "split_manifest.json")
-
 # ----------------------------- dataset ------------------------------------ #
-BENCHMARK = "videomme"
-BENCHMARK_SPLIT = "long"
+# Benchmark selection is env-overridable (SR_BENCHMARK / SR_BENCHMARK_SPLIT)
+# so alternative datasets (e.g. lvbench) can run without editing defaults.
+# Defaults stay videomme/long — existing runs and manifests are unaffected.
+BENCHMARK = os.environ.get("SR_BENCHMARK", "videomme")
+BENCHMARK_SPLIT = os.environ.get(
+    "SR_BENCHMARK_SPLIT", "long" if BENCHMARK == "videomme" else "test")
 SPLIT_SEED = 0
-VIDEOS_PER_SPLIT = 10  # x 3 QAs per video = 30 QAs per split
+VIDEOS_PER_SPLIT = 10  # x 3 QAs per video = 30 QAs per split (videomme)
+
+# The videomme manifest keeps its historical filename; other benchmarks get
+# their own file so they can never clobber the videomme split.
+SPLIT_MANIFEST_PATH = os.environ.get("SR_SPLIT_MANIFEST_PATH", os.path.join(
+    HARNESS_ROOT,
+    "split_manifest.json" if BENCHMARK == "videomme"
+    else f"split_manifest_{BENCHMARK}.json"))
 
 # Videos already captioned/inspected by earlier prompt_sensitivity experiments.
 # Pinned to train; must never enter validation or test (CLAUDE.md §5).
 # (fFjv93ACGo8 also has a workspace cache but belongs to videomme-short — it is
 # outside the long-split pool entirely, so it cannot leak into any split.)
+# videomme-specific: other benchmarks have no legacy caches, so no pins.
 PREVIOUSLY_CACHED_VIDEOS = (
     "0RxMZBLeqRI",
     "7D-gxaie6UI",
@@ -45,13 +55,20 @@ PREVIOUSLY_CACHED_VIDEOS = (
     "w0Wmc8C0Eq0",
     "wCkQ138sg6M",
     "xKiRmesHWIA",
-)
+) if BENCHMARK == "videomme" else ()
 
 # ------------------------------ models ------------------------------------ #
 CAPTION_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 ORCHESTRATOR_TOOL_MODEL = "gpt-4o-mini"
 TEXT_FALLBACK_MODEL = "gpt-5.5"  # codex CLI
 FEEDBACK_MODEL = os.environ.get("SR_FEEDBACK_MODEL", "gpt-4o")
+
+# DVD text-reasoning / tool-calling backend. "openai" routes through the
+# OpenAI API; "codex" uses the codex CLI. Default is the API path so runs do
+# not depend on codex CLI account quota. Override with SR_DVD_TEXT_BACKEND=codex.
+DVD_TEXT_BACKEND = os.environ.get("SR_DVD_TEXT_BACKEND", "openai")
+DVD_USE_OPENAI_TOOLS = os.environ.get(
+    "SR_DVD_USE_OPENAI_TOOLS", "1") not in ("0", "false", "False", "")
 EMBEDDING_MODEL_ID = "BAAI/bge-small-en-v1.5"
 
 # Decoding configuration used for clip captioning (mirrors dvd_captioning +
@@ -68,6 +85,7 @@ CAPTION_SUBJECT_REGISTRY_MODE = os.environ.get(
 if CAPTION_SUBJECT_REGISTRY_MODE not in {"empty", "optional"}:
     raise ValueError(
         "SR_CAPTION_SUBJECT_REGISTRY_MODE must be 'empty' or 'optional'")
+CAPTION_PARSE_MAX_RETRIES = 5
 
 # --------------------------- DVD run settings ------------------------------ #
 SAMPLE_FPS = 1.0
@@ -143,10 +161,11 @@ MAX_RETRIEVAL_QUERIES = 8
 
 # Phase 4 property proposal and frame-only retrieval.
 MAX_PROPERTY_PROPOSALS_PER_VIDEO = 4
-PROPERTY_PROPOSAL_MAX_PAYLOAD_CHARS = 40000
+PROPERTY_PROPOSAL_MAX_PAYLOAD_CHARS = 250000
 PROPERTY_PROPOSAL_MAX_TRACE_EVENTS_PER_QA = 20
 PROPERTY_PROPOSAL_MAX_CAPTIONS = 30
 PROPERTY_PROPOSAL_MAX_TEXT_CHARS = 240
+PROPERTY_PROPOSAL_MISSING_SLOT_MAX_RETRIES = 2
 PROPERTY_RETRIEVAL_TOP_K = 5
 
 # Downstream DVD caption-database retrieval.  The model-facing tool still

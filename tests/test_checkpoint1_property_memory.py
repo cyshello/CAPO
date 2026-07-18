@@ -100,9 +100,13 @@ def proposal(candidate_id, video_id, text="Track object completion states."):
     return {
         "candidate_property_id": candidate_id, "property_text": text,
         "source_video_id": video_id, "source_question_ids": ["q1"],
-        "motivating_failure_types": ["missing_state"],
+        "applicability": {
+            "when": "Use when frames show an incomplete-to-complete state change.",
+            "positive_cues": ["An object visibly reaches a completed state."],
+            "negative_cues": [], "required_modalities": ["frames"],
+        },
         "covered_by_existing_property_ids": ["pe_default"],
-        "proposal_rationale": "Reusable state completion was omitted.",
+        "failure_analysis": "Reusable state completion was omitted.",
         "proposer_policy_version": "fixture_v1",
     }
 
@@ -111,20 +115,34 @@ def intervention_fixture(tmp_path, video_id, candidates):
     results = []
     root = tmp_path / f"interventions-{video_id}"
     for candidate_id, counts in candidates:
+        original_proposal = proposal(candidate_id, video_id)
         qas = []
         for label, count in counts.items():
-            qas.extend({"question_id": f"{candidate_id}-{label}-{index}",
-                        "transition": label} for index in range(count))
+            baseline_correct = label.startswith("correct_to")
+            candidate_correct = label.endswith("to_correct")
+            qas.extend({
+                "question_id": f"{candidate_id}-{label}-{index}",
+                "baseline_prediction": "A" if baseline_correct else "B",
+                "candidate_prediction": "A" if candidate_correct else "B",
+                "baseline_correct": baseline_correct,
+                "candidate_correct": candidate_correct,
+                "transition": label,
+                "errors": [],
+            } for index in range(count))
         transitions_path = write_json(
             root / candidate_id / "transitions.json", {
                 "candidate_property_id": candidate_id,
                 "source_video_id": video_id,
+                "original_proposal": original_proposal,
+                "source_question_ids": ["q1"],
+                "source_qa_baseline_correct": False,
                 "transition_counts": counts, "qas": qas,
             })
         result_path = write_json(root / candidate_id / "result.json", {
-            "schema_version": "property_intervention_result_v1",
+            "schema_version": "property_intervention_result_v2",
             "status": "completed", "candidate_property_id": candidate_id,
-            "source_video_id": video_id, "transitions_path": transitions_path,
+            "source_video_id": video_id, "original_proposal": original_proposal,
+            "transitions_path": transitions_path,
             "transition_counts": counts,
         })
         results.append({"candidate_property_id": candidate_id,
@@ -190,10 +208,24 @@ def test_intervention_effects_and_candidate_memory_stay_separate(tmp_path):
         "cp-pos": "positive", "cp-neg": "negative",
         "cp-mix": "mixed", "cp-none": "no_effect",
     }
+    positive = next(item for item in effects
+                    if item["candidate_property_id"] == "cp-pos")
+    assert positive["schema_version"] == "property_compact_summary_v2"
+    assert positive["original_proposal"]["property_text"] == (
+        "Track object completion states.")
+    assert positive["source_question_ids"] == ["q1"]
+    assert positive["source_qa_baseline_correct"] is False
+    assert all("candidate_prediction" in row and "transition" in row
+               for row in positive["qa_transitions"])
     snapshot = load_snapshot(result)
     assert {item["candidate_property_id"] for item in snapshot["candidates"]} == {
         "cp-pos", "cp-neg", "cp-mix", "cp-none"}
     assert all(item["status"] == "candidate" for item in snapshot["candidates"])
+    assert all(item["applicability"]["required_modalities"] == ["frames"]
+               for item in snapshot["candidates"])
+    assert all(item["failure_analysis"] ==
+               "Reusable state completion was omitted."
+               for item in snapshot["candidates"])
     assert all(item["property_id"] not in {"cp-pos", "cp-neg", "cp-mix", "cp-none"}
                for item in snapshot["properties"])
 

@@ -12,6 +12,7 @@ from surrogate_rollout import config
 from surrogate_rollout.captioning.candidate_captions import build_clip_index
 from surrogate_rollout.captioning.history_aware_baseline import (
     CAPTION_OUTPUT_CONTRACT_VERSION,
+    CAPTION_PARSE_NORMALIZATION_VERSION,
     CAPTION_PARSE_SCHEMA_VERSION,
 )
 from surrogate_rollout.evaluation.dvd_qa import (
@@ -42,6 +43,9 @@ TRANSITION_LABELS = (
     "wrong_to_correct", "correct_to_wrong",
     "correct_to_correct", "wrong_to_wrong",
 )
+INTERVENTION_POLICY_VERSION = "property_selective_intervention_v2"
+INTERVENTION_RESULT_SCHEMA_VERSION = "property_intervention_result_v2"
+INTERVENTION_TRANSITIONS_SCHEMA_VERSION = "property_intervention_transitions_v2"
 
 
 class PropertyInterventionError(RuntimeError):
@@ -143,7 +147,7 @@ def _safe_id(value: str) -> str:
 
 
 class PropertyInterventionBatchRunner:
-    policy_version = "property_selective_intervention_v1"
+    policy_version = INTERVENTION_POLICY_VERSION
 
     def __init__(
         self,
@@ -377,6 +381,7 @@ class PropertyInterventionBatchRunner:
             "iteration_id": work_item.iteration_id,
             "source_video_id": work_item.source_video_id,
             "candidate_property_id": proposal.candidate_property_id,
+            "proposal_hash": sha256_json(as_json_dict(proposal)),
             "property_text_hash": work_item.property_text_hash,
             "parent_baseline_identity": parent_baseline_identity,
             "retrieval_identity": retrieval.get("input_fingerprint")
@@ -427,7 +432,9 @@ class PropertyInterventionBatchRunner:
 
         os.makedirs(work_item.output_dir, exist_ok=True)
         _write_json(os.path.join(work_item.output_dir, "work_item.json"), {
-            "work_item": work_item, "input_fingerprint": fingerprint,
+            "work_item": work_item,
+            "original_proposal": proposal,
+            "input_fingerprint": fingerprint,
             "identity": work_identity,
         })
         if composition_error:
@@ -504,6 +511,9 @@ class PropertyInterventionBatchRunner:
                     "cache_dir": result.cache_dir,
                     "cache_hit": result.cache_hit,
                     "caption_seconds": result.caption_seconds,
+                    "model_call_count": int(getattr(
+                        result, "model_call_count", int(not result.cache_hit))),
+                    "retry_count": int(getattr(result, "retry_count", 0)),
                 })
         except Exception as exc:
             emit_stage(
@@ -526,7 +536,8 @@ class PropertyInterventionBatchRunner:
             candidate_property_id=proposal.candidate_property_id,
             recaptioned_segments=tuple(parsed),
             cache_hits=sum(bool(item["cache_hit"]) for item in cache_rows),
-            model_calls=sum(not bool(item["cache_hit"]) for item in cache_rows))
+            model_calls=sum(item["model_call_count"] for item in cache_rows),
+            retry_count=sum(item["retry_count"] for item in cache_rows))
 
         try:
             registries = self._baseline_registries(
@@ -647,16 +658,23 @@ class PropertyInterventionBatchRunner:
             } for item in transition_rows))
         transitions_path = _write_json(os.path.join(
             work_item.output_dir, "transitions.json"), {
+            "schema_version": INTERVENTION_TRANSITIONS_SCHEMA_VERSION,
             "candidate_property_id": proposal.candidate_property_id,
             "source_video_id": work_item.source_video_id,
+            "original_proposal": proposal,
+            "source_question_ids": proposal.source_question_ids,
+            "source_qa_baseline_correct": proposal.source_qa_baseline_correct,
             "transition_counts": transition_counts,
             "qas": transition_rows,
         })
         result_payload = {
-            "schema_version": "property_intervention_result_v1",
+            "schema_version": INTERVENTION_RESULT_SCHEMA_VERSION,
             "status": "completed", "input_fingerprint": fingerprint,
             "candidate_property_id": proposal.candidate_property_id,
             "source_video_id": work_item.source_video_id,
+            "original_proposal": proposal,
+            "source_question_ids": proposal.source_question_ids,
+            "source_qa_baseline_correct": proposal.source_qa_baseline_correct,
             "parent_baseline_identity": parent_baseline_identity,
             "retrieval_identity": work_identity["retrieval_identity"],
             "mixed_captions_path": mixed.captions_path,
@@ -676,7 +694,7 @@ class PropertyInterventionBatchRunner:
                          fingerprint: str, failure_type: str,
                          reason: str) -> PropertyInterventionResult:
         path = _write_json(os.path.join(work_item.output_dir, "result.json"), {
-            "schema_version": "property_intervention_result_v1",
+            "schema_version": INTERVENTION_RESULT_SCHEMA_VERSION,
             "status": "failed", "input_fingerprint": fingerprint,
             "candidate_property_id": work_item.candidate_property_id,
             "source_video_id": work_item.source_video_id,
@@ -711,6 +729,8 @@ class PropertyInterventionBatchRunner:
             "caption_output_contract_version":
                 CAPTION_OUTPUT_CONTRACT_VERSION,
             "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "caption_parse_normalization_version":
+                CAPTION_PARSE_NORMALIZATION_VERSION,
             "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
         }
 

@@ -41,6 +41,8 @@ from surrogate_rollout.optimization.policies.property_proposal import (
 )
 from surrogate_rollout.optimization.policies.openai_update import (
     OpenAIJSONUpdateProvider,
+    codebook_updater_response_schema,
+    router_updater_response_schema,
 )
 from surrogate_rollout.optimization.property_memory import (
     CompactPropertyMemoryRunner,
@@ -219,9 +221,13 @@ def main() -> None:
         downstream_qa_configuration={
             "text_backend": "codex", "use_openai_tools": False})
     codebook_update_provider = OpenAIJSONUpdateProvider(
-        model=args.feedback_model, max_calls=1)
+        model=args.feedback_model, max_calls=3,
+        response_schema_name="phase4_codebook_update_plan",
+        response_schema=codebook_updater_response_schema(max_actions=32))
     router_update_provider = OpenAIJSONUpdateProvider(
-        model=args.feedback_model, max_calls=1)
+        model=args.feedback_model, max_calls=3,
+        response_schema_name="phase4_router_update_plan",
+        response_schema=router_updater_response_schema(max_actions=48))
     update_engine = Checkpoint3EOrchestrator(
         baseline_runner=baseline_runner,
         intervention_runner=intervention_runner,

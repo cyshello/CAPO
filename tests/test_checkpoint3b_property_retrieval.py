@@ -76,6 +76,60 @@ def test_max_frame_pooling_and_top_k_when_video_is_smaller_than_budget(tmp_path)
     assert len(result.artifact["ranked_segments"]) == 3
 
 
+def test_filters_to_baseline_caption_universe_before_top_k(tmp_path):
+    visual = index(np.array([
+        [1.00, 0.00], [0.99, 0.01],  # 0_10: eligible rank 1
+        [0.98, 0.02], [0.97, 0.03],  # 10_20: eligible rank 2
+        [1.00, 0.00], [1.00, 0.00],  # 20_30: excluded despite top score
+    ], dtype=np.float32))
+    result = PropertyFrameRetriever(embedder=Embedder(), top_k=2).retrieve(
+        proposal=candidate("cp_appearance", "Track object appearance."),
+        visual_index=visual, output_dir=str(tmp_path / "filtered"),
+        baseline_segment_ids=("0_10", "10_20"))
+    assert result.s_sim == ("0_10", "10_20")
+    assert [row["segment_id"] for row in result.artifact["ranked_segments"]] == [
+        "0_10", "10_20"]
+    assert result.artifact["excluded_visual_index_segment_ids"] == ["20_30"]
+    assert result.artifact["eligible_index_segment_count"] == 2
+
+
+def test_baseline_segment_universe_changes_retrieval_identity_and_resume(tmp_path):
+    embedder = Embedder()
+    proposal = candidate("cp_appearance", "Track object appearance.")
+    retriever = PropertyFrameRetriever(embedder=embedder, top_k=1)
+    first = retriever.retrieve(
+        proposal=proposal, visual_index=index(),
+        output_dir=str(tmp_path / "same"),
+        baseline_segment_ids=("0_10", "10_20"))
+    resumed = retriever.retrieve(
+        proposal=proposal, visual_index=index(),
+        output_dir=str(tmp_path / "same"),
+        baseline_segment_ids=("0_10", "10_20"))
+    assert resumed.resumed
+    assert first.retrieval_identity["baseline_segment_ids_hash"] == \
+        resumed.retrieval_identity["baseline_segment_ids_hash"]
+    with pytest.raises(PropertyRetrievalConflictError):
+        retriever.retrieve(
+            proposal=proposal, visual_index=index(),
+            output_dir=str(tmp_path / "same"),
+            baseline_segment_ids=("0_10", "20_30"))
+
+
+def test_invalid_baseline_segment_universe_fails_closed(tmp_path):
+    retriever = PropertyFrameRetriever(embedder=Embedder(), top_k=1)
+    proposal = candidate("cp_appearance", "Track object appearance.")
+    with pytest.raises(PropertyRetrievalError, match="duplicate"):
+        retriever.retrieve(
+            proposal=proposal, visual_index=index(),
+            output_dir=str(tmp_path / "duplicate"),
+            baseline_segment_ids=("0_10", "0_10"))
+    with pytest.raises(PropertyRetrievalError, match="no segments"):
+        retriever.retrieve(
+            proposal=proposal, visual_index=index(),
+            output_dir=str(tmp_path / "disjoint"),
+            baseline_segment_ids=("90_100",))
+
+
 def test_deterministic_score_ties_use_start_then_stable_segment_id(tmp_path):
     tied = index(np.tile(np.array([[1.0, 0.0]], dtype=np.float32), (6, 1)))
     tied.clip_ids = ["0_5", "0_5", "0_10", "0_10", "20_30", "20_30"]
@@ -164,12 +218,18 @@ def test_batch_runner_persists_each_property_and_zero_batch_skips_index(tmp_path
         candidate("cp_completion", "Track action completion."),
     )
     result = runner.run(
-        sample=sample, proposals=proposals, output_dir=str(tmp_path / "batch"))
+        sample=sample, proposals=proposals, output_dir=str(tmp_path / "batch"),
+        baseline_segment_ids=("0_10", "20_30"))
     assert len(result.retrieval_artifact_paths) == 2
     assert [json.loads(Path(path).read_text())["s_sim"] for path in
             result.retrieval_artifact_paths] == [["0_10"], ["20_30"]]
+    batch_manifest = json.loads(Path(result.manifest_path).read_text())
+    assert batch_manifest["segment_universe_policy"] == \
+        "valid_baseline_caption_segment_intersection_v2"
+    assert batch_manifest["baseline_segment_count"] == 2
     resumed = runner.run(
-        sample=sample, proposals=proposals, output_dir=str(tmp_path / "batch"))
+        sample=sample, proposals=proposals, output_dir=str(tmp_path / "batch"),
+        baseline_segment_ids=("0_10", "20_30"))
     assert resumed.resumed
     assert len(embedder.calls) == 2
 
