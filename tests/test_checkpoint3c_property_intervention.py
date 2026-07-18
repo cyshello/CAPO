@@ -319,13 +319,19 @@ def test_independent_selected_only_interventions_history_mixed_view_and_resume(t
         caption_cache_root=str(tmp_path / "candidate_cache"),
         caption_cache_manifest_path=str(tmp_path / "cache_manifest.jsonl"))
     bank, router, scaffold, contract = components()
+    stage_events = []
+
+    def stage_logger(**event):
+        stage_events.append(event)
+
     result = runner.run(
         iteration_id="iteration-1", baseline_video_manifest_path=baseline_path,
         proposals=(a, b), retrieval_artifact_paths=retrievals,
         sample_loader=sample_loader, prompt_bank=bank, router_policy=router,
         scaffold_policy=scaffold, scaffold_contract=contract,
         base_prompt_template=BASE_PROMPT, merge_prompt="merge",
-        output_dir=str(tmp_path / "interventions"))
+        output_dir=str(tmp_path / "interventions"),
+        stage_logger=stage_logger)
 
     assert [item.status for item in result.results] == ["completed", "completed"]
     assert [(call["candidate_id"], call["segment_id"]) for call in captioner.calls] == [
@@ -348,6 +354,11 @@ def test_independent_selected_only_interventions_history_mixed_view_and_resume(t
     assert registry_sources == ["cp_a", "cp_a", "baseline"]
     assert len(qa.calls) == 6
     assert len(registry_merge_calls) == 2
+    assert {(item["event"], item["stage"]) for item in stage_events} >= {
+        ("START", "intervention_recaption"),
+        ("END", "intervention_recaption"),
+        ("START", "candidate_qa"), ("END", "candidate_qa"),
+    }
 
     transitions_a = json.loads(Path(result.results[0].transitions_path).read_text())
     assert transitions_a["transition_counts"] == {
@@ -366,11 +377,15 @@ def test_independent_selected_only_interventions_history_mixed_view_and_resume(t
         sample_loader=sample_loader, prompt_bank=bank, router_policy=router,
         scaffold_policy=scaffold, scaffold_contract=contract,
         base_prompt_template=BASE_PROMPT, merge_prompt="merge",
-        output_dir=str(tmp_path / "interventions"))
+        output_dir=str(tmp_path / "interventions"),
+        stage_logger=stage_logger)
     assert all(item.resumed for item in resumed.results)
     assert len(captioner.calls) == caption_calls
     assert len(qa.calls) == qa_calls
     assert len(registry_merge_calls) == 2
+    assert any(item["event"] == "RESUME" and
+               item["stage"] == "intervention_recaption"
+               for item in stage_events)
 
 
 def test_changed_property_or_parent_baseline_fails_closed(tmp_path):

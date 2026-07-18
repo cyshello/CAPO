@@ -14,6 +14,7 @@ from surrogate_rollout.optimization.iteration_state import (
     ProvisionalIterationState,
 )
 from surrogate_rollout.optimization.property_proposal import CandidatePropertyProposal
+from surrogate_rollout.optimization.stage_logging import StageLogger, emit_stage
 from surrogate_rollout.optimization.train_roles import (
     EvidenceCoverageState,
     TrainRoleAssignment,
@@ -1283,6 +1284,7 @@ class Checkpoint3EOrchestrator:
         intervention_manifest_paths: tuple[str, ...],
         feedback_manifest_paths: tuple[str, ...],
         output_dir: str, state_dir: str,
+        stage_logger: StageLogger | None = None,
     ) -> Mapping[str, Any]:
         """Run the post-feedback memory/codebook checkpoint without router commit.
 
@@ -1350,6 +1352,14 @@ class Checkpoint3EOrchestrator:
                         pointer.get("snapshot_path", "")):
                 raise FinalIterationConflictError(
                     "property-memory lineage pointer conflicts with completed checkpoint")
+            emit_stage(
+                stage_logger, event="RESUME", stage="memory_update",
+                message="property_memory_v1 update artifact 재사용",
+                snapshot_path=artifacts["property_memory_snapshot"])
+            emit_stage(
+                stage_logger, event="RESUME", stage="codebook_update",
+                message="LLM codebook update artifact 재사용",
+                updater_manifest=artifacts["llm_codebook_updater_manifest"])
             return {**manifest, "resumed": True}
         if os.path.isdir(output_dir) and os.listdir(output_dir):
             raise FinalIterationConflictError(
@@ -1369,20 +1379,61 @@ class Checkpoint3EOrchestrator:
                 raise FinalIterationConflictError(
                     "property-memory parent path/hash mismatch")
 
-        memory_result = self.property_memory_runner.run(
-            iteration_id=iteration_id, iteration_ordinal=iteration_ordinal,
-            prompt_bank=prompt_bank,
-            baseline_video_manifest_paths=baseline_video_manifest_paths,
-            intervention_manifest_paths=intervention_manifest_paths,
-            feedback_manifest_paths=feedback_manifest_paths,
-            output_dir=os.path.join(output_dir, "compact_property_memory"),
+        emit_stage(
+            stage_logger, event="START", stage="memory_update",
+            message="property_memory_v1 update 시작",
+            iteration_id=iteration_id,
             parent_memory_path=parent_memory_path)
+        try:
+            memory_result = self.property_memory_runner.run(
+                iteration_id=iteration_id, iteration_ordinal=iteration_ordinal,
+                prompt_bank=prompt_bank,
+                baseline_video_manifest_paths=baseline_video_manifest_paths,
+                intervention_manifest_paths=intervention_manifest_paths,
+                feedback_manifest_paths=feedback_manifest_paths,
+                output_dir=os.path.join(output_dir, "compact_property_memory"),
+                parent_memory_path=parent_memory_path)
+        except Exception as exc:
+            emit_stage(
+                stage_logger, event="ERROR", stage="memory_update",
+                message="property_memory_v1 update 실패",
+                error_type=type(exc).__name__, error=str(exc))
+            raise
         memory_path = memory_result["property_memory_snapshot_path"]
-        updater_result = self.llm_codebook_updater.run(
-            iteration_id=iteration_id, prompt_bank=prompt_bank,
-            property_memory_snapshot_path=memory_path,
-            intervention_summary_path=memory_result["effect_summary_path"],
-            output_dir=os.path.join(output_dir, "llm_codebook_updater"))
+        memory_snapshot = _read_json(memory_path)
+        emit_stage(
+            stage_logger, event="END", stage="memory_update",
+            message="property_memory_v1 update 끝",
+            snapshot_path=memory_path,
+            active_property_count=len(memory_snapshot.get("properties") or ()),
+            candidate_memory_count=len(memory_snapshot.get("candidates") or ()))
+        emit_stage(
+            stage_logger, event="START", stage="codebook_update",
+            message="LLM codebook update 시작",
+            iteration_id=iteration_id, memory_snapshot_path=memory_path)
+        try:
+            updater_result = self.llm_codebook_updater.run(
+                iteration_id=iteration_id, prompt_bank=prompt_bank,
+                property_memory_snapshot_path=memory_path,
+                intervention_summary_path=memory_result["effect_summary_path"],
+                output_dir=os.path.join(output_dir, "llm_codebook_updater"))
+        except Exception as exc:
+            emit_stage(
+                stage_logger, event="ERROR", stage="codebook_update",
+                message="LLM codebook update 실패",
+                error_type=type(exc).__name__, error=str(exc))
+            raise
+        applied_codebook_plan = _read_json(
+            updater_result["artifacts"]["applied_plan"])
+        codebook_validation = _read_json(
+            updater_result["artifacts"]["validation_report"])
+        emit_stage(
+            stage_logger, event="END", stage="codebook_update",
+            message="LLM codebook update 끝",
+            applied_actions=applied_codebook_plan.get("actions") or (),
+            rejected_action_count=len(
+                codebook_validation.get("rejected_actions") or ()),
+            candidate_codebook=updater_result["artifacts"]["candidate_codebook"])
         updater_manifest_path = os.path.join(
             output_dir, "llm_codebook_updater", "manifest.json")
         artifacts = {
@@ -1433,6 +1484,7 @@ class Checkpoint3EOrchestrator:
         parent_router_policy: RouterPolicySnapshot,
         codebook_checkpoint_manifest_path: str,
         output_dir: str, state_dir: str,
+        stage_logger: StageLogger | None = None,
     ) -> Mapping[str, Any]:
         """Finish the memory-conditioned update as one provisional policy pair.
 
@@ -1520,6 +1572,12 @@ class Checkpoint3EOrchestrator:
                 validate_rendered_prompt_configuration,
             )
             validate_rendered_prompt_configuration(candidate_router, candidate_bank)
+            emit_stage(
+                stage_logger, event="RESUME", stage="router_update",
+                message="LLM router update 및 atomic pair artifact 재사용",
+                rendered_router_prompt_hash=manifest.get(
+                    "rendered_router_prompt_hash"),
+                atomic_policy_pair=artifacts.get("atomic_policy_pair"))
             return {**manifest, "resumed": True}
         if os.path.exists(failure_target) or (
                 os.path.isdir(output_dir) and os.listdir(output_dir)):
@@ -1527,6 +1585,11 @@ class Checkpoint3EOrchestrator:
                 "incomplete or failed atomic policy-pair checkpoint cannot be resumed")
 
         try:
+            emit_stage(
+                stage_logger, event="START", stage="router_update",
+                message="LLM router update 시작",
+                iteration_id=iteration_id,
+                candidate_codebook_path=candidate_codebook_path)
             router_result = self.llm_router_updater.run(
                 iteration_id=iteration_id,
                 parent_router_policy=parent_router_policy,
@@ -1651,8 +1714,19 @@ class Checkpoint3EOrchestrator:
                 "checkpoint_manifest_path": manifest_path,
                 "checkpoint_manifest_hash": _file_hash(manifest_path),
             })
+            emit_stage(
+                stage_logger, event="END", stage="router_update",
+                message="LLM router update 및 atomic provisional pair 저장 끝",
+                rendered_router_prompt_hash=rendered["prompt_sha256"],
+                atomic_policy_pair=pair_path,
+                candidate_bank_version=candidate_bank.bank_version,
+                candidate_router_version=candidate_router.router_version)
             return _read_json(manifest_path)
         except Exception as exc:
+            emit_stage(
+                stage_logger, event="ERROR", stage="router_update",
+                message="LLM router update 실패; parent pair 유지",
+                error_type=type(exc).__name__, error=str(exc))
             _write_immutable(failure_target, {
                 "schema_version": "memory_conditioned_atomic_policy_pair_failure_v1",
                 "status": "failed", "iteration_id": iteration_id,

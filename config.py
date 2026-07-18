@@ -63,6 +63,11 @@ CAPTION_DECODING = {
     "max_frames_per_clip": None,  # run_dvd derives sample_fps * clip_secs
     "image_max_pixels": 200704,
 }
+CAPTION_SUBJECT_REGISTRY_MODE = os.environ.get(
+    "SR_CAPTION_SUBJECT_REGISTRY_MODE", "empty").strip().lower()
+if CAPTION_SUBJECT_REGISTRY_MODE not in {"empty", "optional"}:
+    raise ValueError(
+        "SR_CAPTION_SUBJECT_REGISTRY_MODE must be 'empty' or 'optional'")
 
 # --------------------------- DVD run settings ------------------------------ #
 SAMPLE_FPS = 1.0

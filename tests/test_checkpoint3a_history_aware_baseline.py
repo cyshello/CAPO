@@ -5,8 +5,13 @@ from pathlib import Path
 import pytest
 
 from surrogate_rollout.captioning.history_aware_baseline import (
+    CAPTION_OUTPUT_CONTRACT,
+    CAPTION_OUTPUT_CONTRACT_VERSION,
+    CAPTION_PARSE_SCHEMA_VERSION,
     HistoryAwareBaselineCaptionViewBuilder,
     HistoryAwareSegmentCaptioner,
+    _parse_caption_output_with_metadata,
+    build_caption_output_contract,
     build_history_snapshot,
 )
 from surrogate_rollout.prompt_routing.scaffold_applier import create_scaffold_applier
@@ -27,6 +32,71 @@ from surrogate_rollout.prompt_routing.schemas import SegmentContext
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_caption_parser_accepts_description_without_subject_registry():
+    parsed, result = _parse_caption_output_with_metadata(json.dumps({
+        "clip_description": "A person demonstrates an action."
+    }))
+
+    assert parsed == {
+        "clip_description": "A person demonstrates an action.",
+        "subject_registry": {},
+    }
+    assert result["status"] == "valid"
+    assert result["subject_registry_populated"] is False
+    assert "default_empty_subject_registry" in result["normalizations"]
+
+
+def test_default_caption_contract_requests_an_empty_registry():
+    assert 'Set "subject_registry" to an empty object {}' in \
+        CAPTION_OUTPUT_CONTRACT
+
+
+def test_optional_caption_contract_allows_larger_model_registry():
+    contract = build_caption_output_contract("optional")
+
+    assert '"subject_registry" is optional' in contract
+    assert "A valid populated registry is allowed" in contract
+
+
+def test_caption_parser_preserves_populated_registry_for_larger_models():
+    registry = {"person_1": {"name": "demonstrator"}}
+    parsed, result = _parse_caption_output_with_metadata(json.dumps({
+        "clip_description": "A person demonstrates an action.",
+        "subject_registry": registry,
+    }))
+
+    assert parsed["subject_registry"] == registry
+    assert result["subject_registry_populated"] is True
+    assert "default_empty_subject_registry" not in result["normalizations"]
+
+
+def test_caption_parser_safely_unwraps_one_object_array():
+    parsed, result = _parse_caption_output_with_metadata(
+        "```json\n" + json.dumps([{
+            "clip_description": "A map appears on screen."
+        }]) + "\n```")
+
+    assert parsed["clip_description"] == "A map appears on screen."
+    assert parsed["subject_registry"] == {}
+    assert result["original_top_level_type"] == "list"
+    assert "unwrap_singleton_object_array" in result["normalizations"]
+
+
+@pytest.mark.parametrize("value,error", [
+    ([], "invalid_top_level_array"),
+    ([{"clip_description": "one"}, {"clip_description": "two"}],
+     "invalid_top_level_array"),
+    ({"subject_registry": {}}, "missing_clip_description"),
+    ({"clip_description": "   "}, "missing_clip_description"),
+])
+def test_caption_parser_rejects_ambiguous_or_descriptionless_output(value, error):
+    parsed, result = _parse_caption_output_with_metadata(json.dumps(value))
+
+    assert parsed == {}
+    assert result["status"] == "invalid"
+    assert result["error"] == error
 
 
 def components():
@@ -244,12 +314,30 @@ def test_sequential_history_is_shared_persisted_cached_and_resumable(tmp_path):
         assert serialized == histories[index]["serialized_history"]
         assert histories[index]["serialized_history"] in \
             vlm.calls[index * 2 + 1]["prompt"]
+        assert CAPTION_OUTPUT_CONTRACT in vlm.calls[index * 2 + 1]["prompt"]
     assert artifact.caption_call_count == artifact.router_call_count == 3
     assert artifact.caption_cache_hits == 0
     assert Path(artifact.routing_manifest_path).exists()
     assert Path(artifact.routed_view_path).exists()
     captions = json.loads(Path(artifact.captions_path).read_text())
     assert captions["subject_registry"] == {"merged_count": 3}
+    routing_manifest = json.loads(Path(
+        artifact.routing_manifest_path).read_text())
+    first_cache = json.loads(Path(json.loads(
+        Path(routing_manifest["caption_cache_keys_path"])
+        .read_text().splitlines()[0]
+    )["result_path"]).read_text())
+    assert first_cache["schema_version"] == "history_aware_caption_cache_v2"
+    assert first_cache["caption_output_contract_version"] == \
+        CAPTION_OUTPUT_CONTRACT_VERSION
+    assert first_cache["parse_result"]["schema_version"] == \
+        CAPTION_PARSE_SCHEMA_VERSION
+    identity = builder.segment_captioner.configuration_identity
+    assert identity["caption_output_contract_version"] == \
+        CAPTION_OUTPUT_CONTRACT_VERSION
+    assert identity["caption_parse_schema_version"] == \
+        CAPTION_PARSE_SCHEMA_VERSION
+    assert identity["subject_registry_mode"] == "empty"
 
     before = len(vlm.calls)
     resumed = builder.build(

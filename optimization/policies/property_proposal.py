@@ -24,11 +24,12 @@ from surrogate_rollout.prompt_routing.schemas import as_json_dict, dumps_canonic
 from surrogate_rollout.schemas import sha256_text
 
 
-PROPOSAL_POLICY_VERSION = "multi_property_proposer_v4"
-REQUEST_SCHEMA_VERSION = "multimodal_property_proposal_request_v3"
+PROPOSAL_POLICY_VERSION = "multi_property_proposer_v5"
+REQUEST_SCHEMA_VERSION = "multimodal_property_proposal_request_v4"
 INPUT_IDENTITY_SCHEMA_VERSION = "multimodal_property_proposal_identity_v1"
+OPAQUE_CANDIDATE_ID_SCHEMA_VERSION = "opaque_candidate_proposal_id_v1"
 OUTPUT_FIELDS = frozenset({
-    "candidate_property_id", "property_text", "motivating_failure_types",
+    "suggested_property_id", "property_text", "motivating_failure_types",
     "covered_by_existing_property_ids", "proposal_rationale",
 })
 
@@ -68,6 +69,21 @@ def normalize_property_text(value: str) -> str:
 
 def _dedup_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def opaque_candidate_property_id(
+    *, context: VideoProposalContext, property_text: str,
+) -> str:
+    """Return a stable proposal handle, not a proposed final property ID."""
+    digest = sha256_text(dumps_canonical({
+        "schema_version": OPAQUE_CANDIDATE_ID_SCHEMA_VERSION,
+        "source_video_id": context.video_id,
+        "baseline_run_id": context.baseline_run_id,
+        "source_question_ids": tuple(
+            str(row["question_id"]) for row in context.baseline_qa_results),
+        "normalized_property_text": _dedup_key(property_text),
+    }))
+    return f"candidate_{digest[:20]}"
 
 
 def _read_trace(row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -265,14 +281,16 @@ def build_proposal_input(
             "listing coverage hints unless the rationale explicitly explains partial "
             "coverage or uncertainty. Propose only visually verifiable captioning "
             "instructions; never request external, historical, background, or other "
-            "non-visual knowledge. Return only the strict output schema."
+            "non-visual knowledge. suggested_property_id is only a readable naming "
+            "hint and never becomes the proposal or final codebook identity. Return "
+            "only the strict output schema."
         ),
         "max_proposals": max_proposals,
         "qas": tuple(qas),
         "current_codebook": active_codebook,
         "output_schema": {
             "proposals": ({
-                "candidate_property_id": "string",
+                "suggested_property_id": "readable non-binding ID suggestion",
                 "property_text": "concise reusable captioning instruction",
                 "motivating_failure_types": ["snake_case_failure_type"],
                 "covered_by_existing_property_ids": [],
@@ -425,11 +443,13 @@ def parse_proposal_output(
         if not isinstance(row, Mapping) or set(row) != OUTPUT_FIELDS:
             raise PropertyProposalParseError(
                 f"proposal {index} must contain exactly {sorted(OUTPUT_FIELDS)}")
-        candidate_id = row["candidate_property_id"]
-        if not isinstance(candidate_id, str) or not re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", candidate_id):
+        suggested_id = row["suggested_property_id"]
+        if not isinstance(suggested_id, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", suggested_id):
             raise PropertyProposalParseError(f"proposal {index} has invalid ID")
         text = normalize_property_text(row["property_text"])
+        candidate_id = opaque_candidate_property_id(
+            context=context, property_text=text)
         if not text or len(text) > max_property_text_chars:
             raise PropertyProposalParseError(
                 f"proposal {candidate_id} property_text is empty or too long")
@@ -459,26 +479,33 @@ def parse_proposal_output(
                 f"proposal {candidate_id} covers unknown properties: "
                 f"{sorted(unknown_coverage)}")
         text_key = _dedup_key(text)
-        if candidate_id in seen_ids or text_key in seen_text:
+        if suggested_id in seen_ids or text_key in seen_text:
             raise PropertyProposalParseError("duplicated proposal ID or property text")
-        seen_ids.add(candidate_id)
+        seen_ids.add(suggested_id)
         seen_text.add(text_key)
         reason = _instance_specific_reason(text, context)
         if reason:
-            rejected.append({"candidate_property_id": candidate_id, "reason": reason})
+            rejected.append({
+                "candidate_property_id": candidate_id,
+                "suggested_property_id": suggested_id, "reason": reason})
             continue
         reason = _non_visual_knowledge_reason(text)
         if reason:
-            rejected.append({"candidate_property_id": candidate_id, "reason": reason})
+            rejected.append({
+                "candidate_property_id": candidate_id,
+                "suggested_property_id": suggested_id, "reason": reason})
             continue
         coverage_hints = tuple(reported_coverage)
         reason = _coverage_contradiction_reason(coverage_hints, rationale)
         if reason:
-            rejected.append({"candidate_property_id": candidate_id, "reason": reason})
-            continue
-        if candidate_id in active:
             rejected.append({
                 "candidate_property_id": candidate_id,
+                "suggested_property_id": suggested_id, "reason": reason})
+            continue
+        if suggested_id in active:
+            rejected.append({
+                "candidate_property_id": candidate_id,
+                "suggested_property_id": suggested_id,
                 "reason": "candidate_property_id_collides_with_active_property",
             })
             continue
@@ -486,11 +513,13 @@ def parse_proposal_output(
         if computed_coverage:
             rejected.append({
                 "candidate_property_id": candidate_id,
+                "suggested_property_id": suggested_id,
                 "reason": "exact_property_text_match:" + computed_coverage,
             })
             continue
         proposals.append(CandidatePropertyProposal(
             candidate_property_id=candidate_id,
+            suggested_property_id=suggested_id,
             property_text=text,
             source_video_id=context.video_id,
             source_question_ids=source_question_ids,

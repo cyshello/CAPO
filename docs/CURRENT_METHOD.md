@@ -93,6 +93,24 @@ c_{i,t}
 C(s_{i,t},h_{i,t},\theta_{i,t}).
 \]
 
+History-aware caption output uses `caption_output_contract_v2`. The model is
+asked for exactly one JSON object with a non-empty `clip_description`.
+The default `subject_registry` mode is `empty`, which asks the current local
+model to return `{}`. The versioned `optional` mode allows a larger model to
+populate it. In both modes a valid populated object is preserved, while a
+missing, null, or non-object registry is normalized to `{}`. A one-element
+array containing exactly one otherwise-valid caption
+object is conservatively unwrapped for local-model compatibility. Empty or
+multi-element arrays and missing/blank descriptions fail closed. The complete
+raw response remains immutable; `caption_parse_result_v2` records every
+normalization or rejection reason next to the parsed value.
+
+The caption-output contract and parser versions participate in segment-state,
+caption-cache, baseline, intervention, and confirmation identities. Completed
+legacy cache artifacts are never reinterpreted under the new parser. Larger
+caption models may populate `subject_registry` without changing downstream
+interfaces; descriptions remain the only required per-segment semantic field.
+
 History is restricted to configured temporal blocks. Different blocks may be
 processed independently, while segments within one block use preceding
 captions as local history.
@@ -223,6 +241,9 @@ different captioning failures.
 
 Each candidate must record its lineage:
 
+- a deterministic opaque proposal handle, independent of any model-suggested
+  codebook name;
+- the model's readable `suggested_property_id` as a non-binding hint;
 - source video ID;
 - source QA IDs;
 - concise failure evidence;
@@ -264,6 +285,16 @@ drive the iteration-level `add`, `revise`, `merge`, router-supervision, or
 Near-duplicate candidates may be grouped for reporting, but every
 property-source-video pair remains independently evaluable.
 
+The proposer returns `suggested_property_id`, but orchestration never uses that
+name as proposal identity. After parsing, it derives
+`candidate_<sha256-prefix>` from the private source-video/baseline lineage and
+normalized property text under `opaque_candidate_proposal_id_v1`. This handle
+is stable for exact resume and differs across source videos. The updater still
+chooses the final active property ID and may add, revise, or merge candidates.
+Legacy raw artifacts with colliding readable IDs are deterministically migrated
+to opaque temporary handles in compact memory while preserving the original ID
+as audit lineage and a non-binding suggestion.
+
 ### 3.4 Property-conditioned segment retrieval
 
 For each candidate property \(p_{i,j}\), retrieve segments only from its source
@@ -291,6 +322,18 @@ traces, or used-segment references.
 `property_retrieval_top_k` defaults to 5. Persist every frame score and every
 ranked valid segment, not only the selected segment IDs.
 
+The production launcher may place the shared SigLIP embedder on an explicit
+dedicated GPU. When `--embedding-gpu` is provided, it must be a valid free
+physical GPU outside the persistent Qwen `--gpus` set. SigLIP runs in its own
+spawned process with `CUDA_VISIBLE_DEVICES=<physical GPU>` set before child
+bootstrap and always addresses that GPU internally as `cuda:0`. The parent DVD
+backend's visible-device mutation therefore cannot turn a physical ID into an
+invalid logical ordinal. The child process, physical GPU, logical device, PID,
+and release state are persisted. The embedding execution mode is resume
+identity but not visual-index semantic identity, so a complete
+model/sampling/source-compatible frame index remains reusable across CPU/GPU
+execution. Requests are serialized through the child connection.
+
 ### 3.4.1 Post-intervention execution boundary
 
 `Phase4Config.post_intervention_mode` is a typed three-value boundary:
@@ -305,6 +348,23 @@ canonical pointers. The mode is excluded from baseline, proposal, retrieval,
 intervention, and QA identities, allowing a later mode to resume those exact
 artifacts. Feedback and provisional-update manifests bind their respective
 downstream stage identities.
+
+### 3.4.2 Human-readable operational stage log
+
+The production launcher appends a thread-safe human-readable operational log
+to `<output_dir>/iteration.log` and mirrors every line to stdout. It records the
+iteration ordinal, deterministic video waves and GPU assignments, and per-video
+stage boundaries for baseline captioning, baseline QA, property proposal,
+SigLIP similarity retrieval, intervention recaption, candidate QA, flip-only
+feedback, property-memory update, LLM codebook update, LLM router update, and
+atomic pair completion. Successful ends include bounded result summaries;
+failures include exception type/message; exact resume emits `RESUME` and makes
+no model-call claim.
+
+Parallel workers share one logger lock, so each timestamped line is complete
+even when video stages overlap. This `.log` is mutable operational telemetry,
+not immutable scientific evidence, and is excluded from cache keys and artifact
+hash closure. The immutable raw stage artifacts remain the source of truth.
 
 ### 3.5 Independent property interventions
 

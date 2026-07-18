@@ -4,6 +4,28 @@ import pytest
 from surrogate_rollout.retrieval import visual_index as vi
 
 
+def _fixture_isolated_worker(connection, physical_gpu, model_id, batch_size):
+    import os
+
+    connection.send({
+        "status": "ready", "pid": os.getpid(),
+        "physical_gpu": physical_gpu,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "logical_device": "cuda:0",
+    })
+    while True:
+        message = connection.recv()
+        if message["operation"] == "close":
+            connection.send({"status": "closed"})
+            connection.close()
+            return
+        count = len(message["values"])
+        connection.send({
+            "status": "ok",
+            "value": np.full((count, 2), batch_size, dtype=np.float32),
+        })
+
+
 @pytest.fixture
 def frames_dir(tmp_path):
     d = tmp_path / "frames"
@@ -54,3 +76,47 @@ def test_frame_to_clip_mapping_matches_dvd_windows(frames_dir):
     assert idx.clip_ids[10] == "10_20"
     assert idx.clip_ids[20] == "20_25"
     assert idx.clip_ids[24] == "20_25"
+
+
+def test_unloaded_and_cpu_siglip_close_is_idempotent():
+    embedder = vi.SiglipEmbedder(device="cpu")
+    embedder.close()
+    embedder._model = object()
+    embedder._processor = object()
+    embedder.close()
+    embedder.close()
+
+    assert embedder._model is None
+    assert embedder._processor is None
+
+
+def test_dedicated_siglip_process_uses_physical_gpu_as_logical_zero(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5")
+    embedder = vi.ProcessIsolatedSiglipEmbedder(
+        physical_gpu="4", model_id="fixture-model", batch_size=7,
+        worker_target=_fixture_isolated_worker)
+    try:
+        assert embedder.startup_metadata["cuda_visible_devices"] == "4"
+        assert embedder.startup_metadata["logical_device"] == "cuda:0"
+        assert embedder.is_alive
+        assert np.array_equal(
+            embedder.embed_texts(("one", "two")),
+            np.full((2, 2), 7, dtype=np.float32))
+        assert __import__("os").environ["CUDA_VISIBLE_DEVICES"] == "5"
+    finally:
+        embedder.close()
+    assert not embedder.is_alive
+
+
+def test_run_boundary_cleanup_closes_partially_built_runtime_worker(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5")
+    embedder = vi.ProcessIsolatedSiglipEmbedder(
+        physical_gpu="4", model_id="fixture-model", batch_size=3,
+        worker_target=_fixture_isolated_worker)
+
+    records = vi.close_all_isolated_siglip_embedders()
+
+    assert records == ({
+        "pid": embedder.worker_pid, "physical_gpu": "4", "released": True},)
+    assert not embedder.is_alive
+    assert vi.close_all_isolated_siglip_embedders() == ()

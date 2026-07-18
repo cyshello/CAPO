@@ -148,6 +148,17 @@ Use structured-output decoding with fallback disabled. Do not apply this
 constraint to normal caption generation, and include the structured-output
 policy/version in router configuration identity.
 
+Caption generation itself uses the versioned `caption_output_contract_v2`
+compatibility boundary. The rendered request reiterates that the top level is
+one object and requires a non-empty `clip_description`. The default
+`SR_CAPTION_SUBJECT_REGISTRY_MODE=empty` asks Qwen for `{}`; `optional` enables
+registry generation for a more capable model. Parsing preserves a valid registry, defaults a
+missing/null/non-object registry to `{}`, and unwraps only a single-element
+object array. Raw output and `caption_parse_result_v2` are saved in
+`history_aware_caption_cache_v2`; ambiguous arrays, invalid JSON, and blank
+descriptions remain failures. Contract/parser versions enter cache and resume
+identity so v1 cache files remain immutable and are not reinterpreted.
+
 ### 3.3 Property proposal stage
 
 Adapt `optimization/policies/llm_feedback.py` or add a narrowly scoped property
@@ -167,6 +178,8 @@ Input per source video:
 Output:
 
 - zero or more candidate properties;
+- one readable non-binding `suggested_property_id` per candidate; the parser
+  replaces it with a deterministic opaque proposal handle for all lineage;
 - source video ID;
 - source QA IDs;
 - concise failure evidence;
@@ -637,6 +650,17 @@ Schemas are `memory_production_iteration_plan_v1`,
 `production_worker_cleanup_v1`. Confirmation and confirmed-pointer promotion
 remain explicit, separate, and are not run by this launcher.
 
+The launcher also accepts an optional dedicated `--embedding-gpu`. It rejects
+overlap with Qwen worker GPUs and validates availability/free memory before
+model startup. GPU embedding is owned by a spawned child process whose
+bootstrap environment exposes only that physical GPU; inside the child SigLIP
+uses `cuda:0`. CPU remains the compatibility default when omitted. Physical
+GPU, isolated-process mode, logical device, child PID, and cleanup status are
+saved in the plan, execution identity, and `production_worker_cleanup_v2`
+record. Requests are serialized, and the child/model are explicitly closed
+before parent-process exit. This checkpoint does not add asynchronous
+pre-index scheduling.
+
 ### 3.19 Fixed downstream DVD clip-search budget
 
 Previously, the DVD tool schema advised the QA model to use its default
@@ -649,6 +673,76 @@ trajectory; tool events retain both requested and executed arguments plus
 `fixed_clip_search_top_k_v1`. The value and policy version enter baseline,
 intervention, confirmation, and production resume identities. Phase 4
 property-frame retrieval top-k remains a separate setting.
+
+### 3.20 Optional subject registry and caption-object fallback
+
+Before this correction, the DVD caption template asked every model to build a
+detailed `subject_registry`, although Phase 4 success actually consumed only
+`clip_description`. The parser silently converted any top-level list to `{}`;
+Qwen 2.5-VL could return a valid single caption object inside a list, producing
+empty baseline captions and selected-segment intervention failures.
+
+After this correction, `clip_description` is the required semantic field. The
+default prompt asks for an empty registry; setting
+`SR_CAPTION_SUBJECT_REGISTRY_MODE=optional` enables larger models to populate
+it. Missing or invalid registries become `{}`, valid populated registries
+remain available for merging, and exactly one caption object in
+an array is safely unwrapped. All other arrays, invalid JSON, and blank
+descriptions fail closed. Raw responses are unchanged and parse decisions are
+auditable. Output-contract and parser versions invalidate semantic resume and
+cache identity without overwriting or reinterpreting legacy artifacts.
+
+Changed interfaces are `captioning/history_aware_baseline.py` and the
+baseline, intervention, and confirmation identity builders. Router, proposal,
+retrieval, feedback, updater, and confirmation-decision semantics are
+unchanged.
+
+### 3.21 Opaque proposal handles and isolated embedding worker
+
+Before this correction, proposer-controlled `candidate_property_id` was used
+directly as cross-stage lineage. Two source videos could independently return
+the same readable name, making distinct interventions collide in the
+iteration-level updater. A later hotfix prefixed duplicate names during memory
+construction, but that still conflated a naming suggestion with proposal
+identity. Also, `--embedding-gpu 4` constructed `cuda:4` in a parent process
+whose DVD setup could expose only physical GPU 5 as logical `cuda:0`, causing
+`invalid device ordinal`.
+
+`multi_property_proposer_v5` and
+`multimodal_property_proposal_request_v4` now ask for
+`suggested_property_id`. The strict parser validates and preserves that hint,
+then derives an `opaque_candidate_proposal_id_v1` handle from private frozen
+lineage and normalized property text. Retrieval, intervention, feedback,
+memory, and both updaters use the opaque handle; the codebook updater remains
+the only stage that selects a final active property ID. Legacy duplicate names
+receive deterministic opaque migration handles without changing raw artifacts.
+
+`ProcessIsolatedSiglipEmbedder` owns dedicated-GPU SigLIP in one spawned child,
+with the physical GPU visible before bootstrap and logical `cuda:0` inside.
+The parent environment is restored immediately after spawn. Exact execution
+identity records the isolation mapping, and cleanup records the child PID and
+release result. CPU embedding and compatible read-only visual-index caches are
+preserved.
+
+### 3.22 Production iteration operational logging
+
+Before this correction, model/backend output reached stdout but the production
+orchestrator did not provide one readable stage timeline. Parallel video output
+was difficult to associate with an iteration, video, candidate, or update
+boundary.
+
+`optimization/stage_logging.py` adds `phase4_iteration_stage_log_v1`, a
+thread-safe append-only operational logger mirrored to stdout.
+`MemoryConditionedProductionIterationRunner` creates
+`<output_dir>/iteration.log`, reports the iteration ordinal and deterministic
+video waves, and passes the logger into the baseline, intervention, memory,
+codebook, and router boundaries. `BaselinePhaseRunner` reports captioning, QA,
+proposal, and similarity results per video; `PropertyInterventionBatchRunner`
+reports recaption/cache results and all candidate QA transitions;
+`Checkpoint3EOrchestrator` reports memory, validated codebook actions, rendered
+router prompt identity, and atomic pair completion. Resume is explicitly
+reported without changing semantic identity. The operational log is not added
+to immutable artifact hashes.
 
 ## 4. Required tests
 

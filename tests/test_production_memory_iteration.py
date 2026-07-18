@@ -114,6 +114,20 @@ def test_gpu_inventory_and_concurrency_validation():
     launcher._validate_gpu_configuration(
         gpus=("4", "5"), inventory={"4": 0, "5": 0},
         max_parallel_videos=2, require_free=True)
+    launcher._validate_gpu_configuration(
+        gpus=("4", "5"), inventory={"3": 0, "4": 0, "5": 0},
+        max_parallel_videos=2, require_free=True, embedding_gpu="3")
+    assert launcher._embedding_device("3") == \
+        "isolated_process:physical_gpu=3:logical_device=cuda:0"
+    assert launcher._embedding_device(None) == "cpu"
+    with pytest.raises(ProductionIterationError, match="must not overlap"):
+        launcher._validate_gpu_configuration(
+            gpus=("4", "5"), inventory={"4": 0, "5": 0},
+            max_parallel_videos=2, require_free=False, embedding_gpu="4")
+    with pytest.raises(ProductionIterationError, match="embedding GPU"):
+        launcher._validate_gpu_configuration(
+            gpus=("4",), inventory={"4": 0},
+            max_parallel_videos=1, require_free=False, embedding_gpu="3")
     with pytest.raises(ProductionIterationError, match="unavailable GPUs"):
         launcher._validate_gpu_configuration(
             gpus=("4", "8"), inventory={"4": 0},
@@ -126,6 +140,10 @@ def test_gpu_inventory_and_concurrency_validation():
         launcher._validate_gpu_configuration(
             gpus=("4",), inventory={"4": 100},
             max_parallel_videos=1, require_free=True)
+    with pytest.raises(ProductionIterationError, match="not free"):
+        launcher._validate_gpu_configuration(
+            gpus=("4",), inventory={"3": 100, "4": 0},
+            max_parallel_videos=1, require_free=True, embedding_gpu="3")
 
 
 def _write(path: Path, value) -> str:
@@ -142,6 +160,10 @@ class FakeBaseline:
 
     def run(self, **kwargs):
         video_id = kwargs["bounded_smoke_video_id"]
+        log = kwargs.get("stage_logger")
+        if log:
+            log(event="START", stage="property_proposal",
+                message=f"[{video_id}] property proposal 시작")
         self.calls.append((video_id, kwargs["worker_gpus"]))
         root = Path(kwargs["output_dir"])
         proposal_path = _write(root / "proposal.json", {
@@ -160,6 +182,11 @@ class FakeBaseline:
             "video_id": video_id, "property_proposal_path": proposal_path,
             "property_retrieval_paths": [retrieval_path]})
         manifest = _write(root / "manifest.json", {"status": "completed"})
+        if log:
+            log(event="END", stage="property_proposal",
+                message=f"[{video_id}] property proposal 끝", proposal_count=1)
+            log(event="END", stage="similarity_retrieval",
+                message=f"[{video_id}] similarity 측정 끝", retrieval_count=1)
         return SimpleNamespace(
             selected_video_ids=(video_id,), baseline_qa_count=3,
             video_manifest_paths=(video_manifest,), manifest_path=manifest)
@@ -175,6 +202,12 @@ class FakeIntervention:
         video_id = json.loads(Path(
             kwargs["baseline_video_manifest_path"]).read_text())["video_id"]
         self.calls.append(video_id)
+        log = kwargs.get("stage_logger")
+        if log:
+            log(event="START", stage="intervention_recaption",
+                message=f"[{video_id}] intervention recaption 시작")
+            log(event="END", stage="candidate_qa",
+                message=f"[{video_id}] candidate QA 평가 끝")
         path = _write(Path(kwargs["output_dir"]) / "manifest.json", {
             "status": "completed", "source_video_id": video_id, "results": []})
         return SimpleNamespace(manifest_path=path)
@@ -216,6 +249,14 @@ class FakeUpdateEngine:
 
     def run_memory_conditioned_codebook_checkpoint(self, **kwargs):
         self.codebook_calls += 1
+        log = kwargs.get("stage_logger")
+        if log:
+            log(event="START", stage="memory_update",
+                message="property_memory_v1 update 시작")
+            log(event="END", stage="memory_update",
+                message="property_memory_v1 update 끝")
+            log(event="START", stage="codebook_update",
+                message="LLM codebook update 시작")
         assert len(kwargs["baseline_video_manifest_paths"]) in (1, 3, 5, 8)
         root = Path(kwargs["output_dir"])
         snapshot = _write(root / "property_memory_v1.json", {
@@ -224,10 +265,17 @@ class FakeUpdateEngine:
             "schema_version": "memory_conditioned_codebook_iteration_v1",
             "status": "completed"})
         self.llm_codebook_updater.response_provider.call_count += 1
+        if log:
+            log(event="END", stage="codebook_update",
+                message="LLM codebook update 끝")
         return {"artifacts": {"property_memory_snapshot": snapshot}}
 
     def run_memory_conditioned_router_checkpoint(self, **kwargs):
         self.router_calls += 1
+        log = kwargs.get("stage_logger")
+        if log:
+            log(event="START", stage="router_update",
+                message="LLM router update 시작")
         if self.fail_router:
             raise RuntimeError("router failed")
         root = Path(kwargs["output_dir"])
@@ -236,6 +284,9 @@ class FakeUpdateEngine:
         pair = _write(root / "pair" / "policy_pair.json", {"status": "committed"})
         _write(root / "manifest.json", {"status": "committed"})
         self.llm_router_updater.response_provider.call_count += 1
+        if log:
+            log(event="END", stage="router_update",
+                message="LLM router update 끝")
         return {"status": "committed", "artifacts": {
             "atomic_policy_pair": pair,
             "provisional_codebook": bank,
@@ -301,6 +352,30 @@ def test_latest_memory_codebook_router_path_and_atomic_pair(tmp_path):
     assert Path(manifest["artifacts"]["atomic_policy_pair"]).exists()
     assert manifest["num_videos"] == 5
     assert [len(wave) for wave in manifest["waves"]] == [4, 1]
+
+
+def test_human_readable_iteration_log_covers_requested_stage_boundaries(tmp_path):
+    runner, _, _, _, _, _ = _runner(tmp_path)
+    result = _run(runner, tmp_path, count=3)
+    manifest = json.loads(Path(result.manifest_path).read_text())
+    log_path = Path(manifest["operational_log_path"])
+    text = log_path.read_text()
+
+    assert "1번 iter 시작" in text
+    assert "video 0RxMZBLeqRI,7D-gxaie6UI,GLW9omJfAdk 병렬화 시작" in text
+    for phrase in (
+        "property proposal 시작", "similarity 측정 끝",
+        "intervention recaption 시작", "candidate QA 평가 끝",
+        "property_memory_v1 update 시작", "LLM codebook update 끝",
+        "LLM router update 끝", "1번 iter 끝",
+    ):
+        assert phrase in text
+    assert all(line.count("[") >= 2 for line in text.splitlines())
+    assert "iteration_log" not in manifest["artifacts"]
+
+    resumed = _run(runner, tmp_path, count=3)
+    assert resumed.resumed
+    assert "완료 artifact 재사용" in log_path.read_text()
 
 
 def test_exact_resume_identity_includes_order_and_k_without_calls(tmp_path):
@@ -384,6 +459,24 @@ def test_dry_run_plan_has_no_stage_or_worker_calls(tmp_path):
     assert manifest["model_calls"] == 0
     assert not baseline.calls and not intervention.calls and not feedback.calls
     assert update.codebook_calls == update.router_calls == history.starts == 0
+
+
+def test_dry_run_plan_records_dedicated_embedding_gpu(tmp_path):
+    runner, _, _, _, _, _ = _runner(tmp_path)
+    result = _run(runner, tmp_path, count=1, dry=True, execution_identity={
+        "models": "fixture",
+        "retrieval_device": (
+            "isolated_process:physical_gpu=3:logical_device=cuda:0"),
+        "embedding_gpu": "3",
+    })
+    plan = json.loads(Path(result.plan_path).read_text())
+    identity = json.loads(Path(
+        tmp_path / "output/iteration_identity.json").read_text())["identity"]
+
+    assert plan["embedding_gpu"] == "3"
+    assert plan["retrieval_device"] == \
+        "isolated_process:physical_gpu=3:logical_device=cuda:0"
+    assert identity["execution_identity"]["embedding_gpu"] == "3"
 
 
 def test_launcher_does_not_import_obsolete_stage_413_path():

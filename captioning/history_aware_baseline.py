@@ -51,6 +51,34 @@ DEFAULT_HISTORY_BLOCK_SECONDS = 300.0
 DEFAULT_MAX_HISTORY_CAPTIONS = 30
 PARALLEL_GROUP_SCHEDULER_VERSION = "history_block_gpu_scheduler_v1"
 LOCAL_QWEN_BACKEND_ID = "captioning.qwen25_vl.Qwen25VLCaptioner"
+CAPTION_OUTPUT_CONTRACT_VERSION = "caption_output_contract_v2"
+CAPTION_PARSE_SCHEMA_VERSION = "caption_parse_result_v2"
+CAPTION_CACHE_SCHEMA_VERSION = "history_aware_caption_cache_v2"
+
+
+def build_caption_output_contract(subject_registry_mode: str) -> str:
+    if subject_registry_mode == "empty":
+        registry_contract = (
+            '- Set "subject_registry" to an empty object {}. Do not create '
+            'registry entries.')
+    elif subject_registry_mode == "optional":
+        registry_contract = (
+            '- "subject_registry" is optional. If reliable subject entries '
+            'are unavailable, omit it or return an empty object {} rather '
+            'than inventing entries. A valid populated registry is allowed.')
+    else:
+        raise ValueError("subject_registry_mode must be 'empty' or 'optional'")
+    return f"""
+
+CAPTION_OUTPUT_CONTRACT (this supersedes any earlier output-format wording):
+- Return exactly one JSON object. Do not wrap it in an array.
+- "clip_description" is required and must be a non-empty visual description.
+{registry_contract}
+""".rstrip()
+
+
+CAPTION_OUTPUT_CONTRACT = build_caption_output_contract(
+    config.CAPTION_SUBJECT_REGISTRY_MODE)
 
 
 class _LazyLocalQwenBackend:
@@ -133,8 +161,12 @@ def build_history_snapshot(
     }
 
 
-def _parse_caption_output(raw: str) -> dict[str, Any]:
+def _parse_caption_output_with_metadata(
+    raw: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Parse the DVD caption contract and record every safe normalization."""
     text = raw.strip()
+    normalizations: list[str] = []
     if text.startswith("```"):
         lines = text.splitlines()
         if lines and lines[0].startswith("```"):
@@ -142,17 +174,72 @@ def _parse_caption_output(raw: str) -> dict[str, Any]:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines).strip()
+        normalizations.append("strip_markdown_fence")
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
         start, end = text.find("{"), text.rfind("}")
         if start < 0 or end < start:
-            return {}
+            return {}, {
+                "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+                "status": "invalid", "error": "invalid_json",
+                "normalizations": normalizations,
+            }
         try:
             value = json.loads(text[start:end + 1])
         except json.JSONDecodeError:
-            return {}
-    return value if isinstance(value, dict) else {}
+            return {}, {
+                "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+                "status": "invalid", "error": "invalid_json",
+                "normalizations": normalizations,
+            }
+        normalizations.append("extract_embedded_object")
+
+    original_top_level_type = type(value).__name__
+    if isinstance(value, list):
+        if len(value) != 1 or not isinstance(value[0], dict):
+            return {}, {
+                "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+                "status": "invalid", "error": "invalid_top_level_array",
+                "original_top_level_type": original_top_level_type,
+                "normalizations": normalizations,
+            }
+        value = value[0]
+        normalizations.append("unwrap_singleton_object_array")
+    if not isinstance(value, dict):
+        return {}, {
+            "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "status": "invalid", "error": "invalid_top_level_type",
+            "original_top_level_type": original_top_level_type,
+            "normalizations": normalizations,
+        }
+
+    description = value.get("clip_description")
+    if not isinstance(description, str) or not description.strip():
+        return {}, {
+            "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "status": "invalid", "error": "missing_clip_description",
+            "original_top_level_type": original_top_level_type,
+            "normalizations": normalizations,
+        }
+    parsed = dict(value)
+    parsed["clip_description"] = description.strip()
+    registry = parsed.get("subject_registry")
+    if not isinstance(registry, dict):
+        parsed["subject_registry"] = {}
+        normalizations.append("default_empty_subject_registry")
+    return parsed, {
+        "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+        "status": "valid", "error": None,
+        "original_top_level_type": original_top_level_type,
+        "normalizations": normalizations,
+        "subject_registry_populated": bool(parsed["subject_registry"]),
+    }
+
+
+def _parse_caption_output(raw: str) -> dict[str, Any]:
+    """Compatibility wrapper for callers which only consume parsed output."""
+    return _parse_caption_output_with_metadata(raw)[0]
 
 
 def _history_blocks(
@@ -342,6 +429,9 @@ class HistoryAwareSegmentCaptioner:
             "model": self.caption_model_id,
             "backend": self.backend_id,
             "decoding": as_json_dict(config.CAPTION_DECODING),
+            "caption_output_contract_version": CAPTION_OUTPUT_CONTRACT_VERSION,
+            "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
             "real_model": True,
         }
 
@@ -388,6 +478,12 @@ class HistoryAwareSegmentCaptioner:
                 - history_snapshot["block_start_seconds"],
                 "max_history_captions": history_snapshot["max_history_captions"],
                 "boundary_rule": "floor_segment_start_div_block_seconds",
+                "caption_output_contract_version":
+                    CAPTION_OUTPUT_CONTRACT_VERSION,
+                "caption_output_contract_hash":
+                    sha256_text(CAPTION_OUTPUT_CONTRACT),
+                "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+                "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
             })),
             caption_model_id=self.caption_model_id,
             intervention_identity_hash=intervention_identity_hash,
@@ -420,6 +516,7 @@ class HistoryAwareSegmentCaptioner:
                   .replace("TRANSCRIPT_PLACEHOLDER", transcript)
                   .replace("CLIP_START_TIME", _hhmmss(start))
                   .replace("CLIP_END_TIME", _hhmmss(end)))
+        prompt += CAPTION_OUTPUT_CONTRACT
         prompt += (
             "\n\nFROZEN_PRECEDING_CAPTION_HISTORY_JSON:\n"
             + str(history_snapshot["serialized_history"])
@@ -433,17 +530,20 @@ class HistoryAwareSegmentCaptioner:
             max_tokens=int(config.CAPTION_DECODING["max_tokens"]),
         )
         elapsed = time.monotonic() - t0
-        parsed = _parse_caption_output(raw)
+        parsed, parse_result = _parse_caption_output_with_metadata(raw)
         if parsed:
             parsed["clip_description"] = (
-                str(parsed.get("clip_description") or "")
+                str(parsed["clip_description"])
                 + f"\n\nTranscript during this video clip: {transcript}."
             )
         payload = {
-            "schema_version": "history_aware_caption_cache_v1",
+            "schema_version": CAPTION_CACHE_SCHEMA_VERSION,
             "cache_key": key_as_dict(key),
             "history_hash": history_snapshot["history_hash"],
             "rendered_prompt_hash": sha256_text(prompt),
+            "caption_output_contract_version":
+                CAPTION_OUTPUT_CONTRACT_VERSION,
+            "parse_result": parse_result,
             "raw_output": raw,
             "parsed": parsed,
         }
@@ -654,6 +754,10 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 "caption_model_id": self.segment_captioner.caption_model_id,
                 "caption_backend_id": self.segment_captioner.backend_id,
                 "caption_decoding_hash": config.decoding_hash(),
+                "caption_output_contract_version":
+                    CAPTION_OUTPUT_CONTRACT_VERSION,
+                "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+                "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
                 "caption_run_identity_hash": caption_run_identity_hash,
                 "history_configuration": {
                     "schema_version": HISTORY_SCHEMA_VERSION,
@@ -977,8 +1081,11 @@ class HistoryAwareBaselineCaptionViewBuilder:
         return item
 
     def _route_pool_results(self) -> None:
+        result_queue = self._pool_result_queue
+        if result_queue is None:
+            return
         while True:
-            item = self._pool_result_queue.get()
+            item = result_queue.get()
             request_id = str(item.get("request_id"))
             if request_id == "__parent_stop__":
                 return

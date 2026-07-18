@@ -11,6 +11,7 @@ from surrogate_rollout.prompt_routing.schemas import PromptBankSnapshot
 @dataclass(frozen=True, init=False)
 class CandidatePropertyProposal:
     candidate_property_id: str
+    suggested_property_id: str
     property_text: str
     source_video_id: str
     source_question_ids: tuple[str, ...]
@@ -23,6 +24,7 @@ class CandidatePropertyProposal:
         self,
         *,
         candidate_property_id: str | None = None,
+        suggested_property_id: str | None = None,
         property_text: str | None = None,
         source_video_id: str,
         source_question_ids: tuple[str, ...] | None = None,
@@ -54,6 +56,8 @@ class CandidatePropertyProposal:
         normalized_hints = nonempty_hint_values[0] if nonempty_hint_values else ()
         values = {
             "candidate_property_id": candidate_property_id or property_id or "",
+            "suggested_property_id": (
+                suggested_property_id or candidate_property_id or property_id or ""),
             "property_text": property_text or instruction or "",
             "source_video_id": source_video_id,
             "source_question_ids": tuple(source_question_ids or source_qa_ids or ()),
@@ -66,8 +70,9 @@ class CandidatePropertyProposal:
         }
         for name, value in values.items():
             object.__setattr__(self, name, value)
-        for name in ("candidate_property_id", "property_text", "source_video_id",
-                     "proposal_rationale", "proposer_policy_version"):
+        for name in ("candidate_property_id", "suggested_property_id",
+                     "property_text", "source_video_id", "proposal_rationale",
+                     "proposer_policy_version"):
             if not getattr(self, name):
                 raise ValueError(f"CandidatePropertyProposal.{name} must be non-empty")
         if not self.source_question_ids or len(self.source_question_ids) != len(

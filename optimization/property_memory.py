@@ -900,7 +900,21 @@ class CompactPropertyMemoryRunner:
             audit.extend({"property_id": property_id, **item} for item in (
                 *audit_strong, *audit_weak, *audit_negative, *audit_no_effect,
                 *audit_route_pos, *audit_route_neg))
+        raw_candidate_counts: dict[str, int] = {}
+        for candidate in candidates.values():
+            raw_id = str(candidate.get("candidate_property_id") or "")
+            raw_candidate_counts[raw_id] = raw_candidate_counts.get(raw_id, 0) + 1
         for candidate_key, candidate in sorted(candidates.items()):
+            raw_id = str(candidate.get("candidate_property_id") or "")
+            if raw_candidate_counts.get(raw_id, 0) > 1:
+                candidate["original_candidate_property_id"] = raw_id
+                candidate.setdefault("suggested_property_id", raw_id)
+                candidate["candidate_property_id"] = (
+                    "candidate_" + sha256_json({
+                        "schema_version": "legacy_candidate_id_migration_v1",
+                        "candidate_key": candidate_key,
+                        "property_text": candidate.get("property_text"),
+                    })[:20])
             prior = tuple(candidate.pop("intervention_examples", ()))
             all_examples = tuple({str(item["example_id"]): dict(item) for item in (
                 *candidate.get("positive_examples", ()),

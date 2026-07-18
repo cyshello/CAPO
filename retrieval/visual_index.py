@@ -15,7 +15,10 @@ embedder is injectable so tests build indexes without model weights.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
+import threading
+import traceback
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -23,6 +26,11 @@ import numpy as np
 
 from surrogate_rollout import config
 from surrogate_rollout.schemas import sha256_json
+
+
+_PROCESS_ENVIRONMENT_LOCK = threading.Lock()
+_ISOLATED_EMBEDDER_REGISTRY_LOCK = threading.Lock()
+_LIVE_ISOLATED_EMBEDDERS: set["ProcessIsolatedSiglipEmbedder"] = set()
 
 
 def frames_source_hash(frames_dir: str) -> str:
@@ -156,44 +164,243 @@ class SiglipEmbedder:
         self._device = device
         self._model = None
         self._processor = None
+        self._load_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
 
     def _load(self):
-        if self._model is None:
-            import torch
-            from transformers import AutoModel, AutoProcessor
+        with self._load_lock:
+            if self._model is None:
+                import torch
+                from transformers import AutoModel, AutoProcessor
 
-            if self._device is None:
-                self._device = "cuda" if torch.cuda.is_available() else "cpu"
-            self._model = AutoModel.from_pretrained(
-                self.model_id, torch_dtype=torch.float32).to(self._device).eval()
-            self._processor = AutoProcessor.from_pretrained(self.model_id)
+                if self._device is None:
+                    self._device = "cuda" if torch.cuda.is_available() else "cpu"
+                self._model = AutoModel.from_pretrained(
+                    self.model_id, torch_dtype=torch.float32).to(self._device).eval()
+                self._processor = AutoProcessor.from_pretrained(self.model_id)
         return self._model, self._processor
 
     def embed_images(self, paths: Sequence[str]) -> np.ndarray:
         import torch
         from PIL import Image
 
-        model, processor = self._load()
-        out = []
-        with torch.no_grad():
-            for i in range(0, len(paths), self.batch_size):
-                imgs = [Image.open(p).convert("RGB")
-                        for p in paths[i:i + self.batch_size]]
-                inputs = processor(images=imgs, return_tensors="pt").to(self._device)
-                feats = model.get_image_features(**inputs)
-                out.append(feats.cpu().numpy())
+        with self._inference_lock:
+            model, processor = self._load()
+            out = []
+            with torch.no_grad():
+                for i in range(0, len(paths), self.batch_size):
+                    imgs = [Image.open(p).convert("RGB")
+                            for p in paths[i:i + self.batch_size]]
+                    inputs = processor(
+                        images=imgs, return_tensors="pt").to(self._device)
+                    feats = model.get_image_features(**inputs)
+                    out.append(feats.cpu().numpy())
         emb = np.concatenate(out, axis=0).astype(np.float32)
         return emb / np.clip(np.linalg.norm(emb, axis=1, keepdims=True), 1e-12, None)
 
     def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
         import torch
 
-        model, processor = self._load()
-        with torch.no_grad():
-            inputs = processor(text=list(texts), padding="max_length",
-                               return_tensors="pt").to(self._device)
-            feats = model.get_text_features(**inputs).cpu().numpy().astype(np.float32)
+        with self._inference_lock:
+            model, processor = self._load()
+            with torch.no_grad():
+                inputs = processor(text=list(texts), padding="max_length",
+                                   return_tensors="pt").to(self._device)
+                feats = model.get_text_features(
+                    **inputs).cpu().numpy().astype(np.float32)
         return feats / np.clip(np.linalg.norm(feats, axis=1, keepdims=True), 1e-12, None)
+
+    def close(self) -> None:
+        """Release this process's model references and cached GPU allocator."""
+        with self._inference_lock:
+            with self._load_lock:
+                loaded = self._model is not None or self._processor is not None
+                self._model = None
+                self._processor = None
+            if loaded and str(self._device or "").startswith("cuda"):
+                import gc
+                import torch
+
+                gc.collect()
+                torch.cuda.empty_cache()
+
+
+class IsolatedSiglipWorkerError(RuntimeError):
+    pass
+
+
+def _isolated_siglip_worker_main(
+    connection, physical_gpu: str, model_id: str, batch_size: int,
+) -> None:
+    """Own one physical GPU without inheriting the parent's logical ordinal."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = physical_gpu
+    embedder = SiglipEmbedder(
+        model_id=model_id, device="cuda:0", batch_size=batch_size)
+    try:
+        connection.send({
+            "status": "ready", "pid": os.getpid(),
+            "physical_gpu": physical_gpu,
+            "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
+            "logical_device": "cuda:0",
+        })
+        while True:
+            message = connection.recv()
+            operation = message.get("operation")
+            if operation == "close":
+                connection.send({"status": "closed"})
+                return
+            try:
+                if operation == "embed_images":
+                    value = embedder.embed_images(tuple(message["values"]))
+                elif operation == "embed_texts":
+                    value = embedder.embed_texts(tuple(message["values"]))
+                else:
+                    raise ValueError(f"unknown SigLIP worker operation: {operation}")
+                connection.send({"status": "ok", "value": value})
+            except BaseException as exc:
+                connection.send({
+                    "status": "error", "error_type": type(exc).__name__,
+                    "error": str(exc), "traceback": traceback.format_exc(),
+                })
+                return
+    except (EOFError, BrokenPipeError):
+        return
+    finally:
+        embedder.close()
+        connection.close()
+
+
+class ProcessIsolatedSiglipEmbedder:
+    """Serialize SigLIP requests through one GPU-owning spawn subprocess."""
+
+    def __init__(
+        self, *, physical_gpu: str,
+        model_id: str = config.VISUAL_INDEX_MODEL_ID,
+        batch_size: int = config.VISUAL_INDEX_BATCH_SIZE,
+        startup_timeout_seconds: float = 30.0,
+        worker_target: Callable = _isolated_siglip_worker_main,
+    ) -> None:
+        if not physical_gpu or "," in physical_gpu:
+            raise ValueError("physical_gpu must be exactly one GPU ID")
+        self.model_id = model_id
+        self.batch_size = batch_size
+        self.physical_gpu = physical_gpu
+        self.logical_device = "cuda:0"
+        self._lock = threading.Lock()
+        self._closed = False
+        context = multiprocessing.get_context("spawn")
+        parent_connection, child_connection = context.Pipe(duplex=True)
+        self._connection = parent_connection
+        self._process = context.Process(
+            target=worker_target,
+            args=(child_connection, physical_gpu, model_id, batch_size),
+            name=f"siglip-gpu-{physical_gpu}", daemon=False)
+        # Spawn copies the environment before entering the child target. Set and
+        # restore it under a process-wide lock so even imports performed by the
+        # spawn bootstrap see only the dedicated physical GPU.
+        with _PROCESS_ENVIRONMENT_LOCK:
+            previous_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = physical_gpu
+            try:
+                self._process.start()
+            finally:
+                if previous_visible is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = previous_visible
+        child_connection.close()
+        if not self._connection.poll(startup_timeout_seconds):
+            self._process.terminate()
+            self._process.join(timeout=5.0)
+            self._connection.close()
+            self._closed = True
+            raise IsolatedSiglipWorkerError(
+                "timed out starting isolated SigLIP worker")
+        try:
+            ready = self._connection.recv()
+        except (EOFError, BrokenPipeError, OSError) as exc:
+            self._process.join(timeout=5.0)
+            self._connection.close()
+            self._closed = True
+            raise IsolatedSiglipWorkerError(
+                "isolated SigLIP worker exited during startup") from exc
+        if ready.get("status") != "ready" or \
+                ready.get("cuda_visible_devices") != physical_gpu or \
+                ready.get("logical_device") != "cuda:0":
+            self.close()
+            raise IsolatedSiglipWorkerError(
+                f"invalid isolated SigLIP worker startup: {ready}")
+        self.startup_metadata = dict(ready)
+        with _ISOLATED_EMBEDDER_REGISTRY_LOCK:
+            _LIVE_ISOLATED_EMBEDDERS.add(self)
+
+    @property
+    def worker_pid(self) -> int | None:
+        return self._process.pid
+
+    @property
+    def is_alive(self) -> bool:
+        return self._process.is_alive()
+
+    def _request(self, operation: str, values: Sequence[str]) -> np.ndarray:
+        with self._lock:
+            if self._closed or not self._process.is_alive():
+                raise IsolatedSiglipWorkerError(
+                    "isolated SigLIP worker is not running")
+            try:
+                self._connection.send({
+                    "operation": operation, "values": tuple(values)})
+                response = self._connection.recv()
+            except (EOFError, BrokenPipeError, OSError) as exc:
+                raise IsolatedSiglipWorkerError(
+                    f"isolated SigLIP worker exited during {operation}") from exc
+            if response.get("status") != "ok":
+                raise IsolatedSiglipWorkerError(
+                    f"isolated SigLIP {operation} failed: "
+                    f"{response.get('error_type')}: {response.get('error')}")
+            return np.asarray(response["value"], dtype=np.float32)
+
+    def embed_images(self, paths: Sequence[str]) -> np.ndarray:
+        return self._request("embed_images", paths)
+
+    def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
+        return self._request("embed_texts", texts)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._process.is_alive():
+                try:
+                    self._connection.send({"operation": "close"})
+                    if self._connection.poll(10.0):
+                        self._connection.recv()
+                except (EOFError, BrokenPipeError, OSError):
+                    pass
+            self._process.join(timeout=10.0)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=5.0)
+            self._connection.close()
+            with _ISOLATED_EMBEDDER_REGISTRY_LOCK:
+                _LIVE_ISOLATED_EMBEDDERS.discard(self)
+
+
+def close_all_isolated_siglip_embedders() -> tuple[dict[str, object], ...]:
+    """Best-effort run-boundary cleanup, including partial runtime builds."""
+    with _ISOLATED_EMBEDDER_REGISTRY_LOCK:
+        embedders = tuple(_LIVE_ISOLATED_EMBEDDERS)
+    records = []
+    for embedder in embedders:
+        pid = embedder.worker_pid
+        physical_gpu = embedder.physical_gpu
+        embedder.close()
+        records.append({
+            "pid": pid, "physical_gpu": physical_gpu,
+            "released": not embedder.is_alive,
+        })
+    return tuple(records)
 
 
 def load_or_build_visual_index(

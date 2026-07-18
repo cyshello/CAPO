@@ -475,3 +475,27 @@ def test_exact_resume_detects_nested_raw_artifact_change(tmp_path):
             iteration_id="i1", iteration_ordinal=1, prompt_bank=bank(),
             baseline_video_manifest_paths=(baseline,), intervention_manifest_paths=(),
             output_dir=str(output))
+
+
+def test_legacy_duplicate_candidate_names_become_distinct_opaque_handles(tmp_path):
+    candidate = "pe_visual_context"
+    baselines = tuple(baseline_fixture(
+        tmp_path, video_id, proposals=(proposal(candidate, video_id),))
+        for video_id in ("video-a", "video-b"))
+    interventions = tuple(intervention_fixture(
+        tmp_path, video_id, ((candidate, counts(cc=1)),))
+        for video_id in ("video-a", "video-b"))
+
+    result = CompactPropertyMemoryRunner().run(
+        iteration_id="i1", iteration_ordinal=1, prompt_bank=bank(),
+        baseline_video_manifest_paths=baselines,
+        intervention_manifest_paths=interventions,
+        output_dir=str(tmp_path / "memory-duplicates"))
+    candidates = load_snapshot(result)["candidates"]
+
+    assert len({item["candidate_property_id"] for item in candidates}) == 2
+    assert all(item["candidate_property_id"].startswith("candidate_")
+               for item in candidates)
+    assert all(item["original_candidate_property_id"] == candidate
+               for item in candidates)
+    assert all(item["suggested_property_id"] == candidate for item in candidates)

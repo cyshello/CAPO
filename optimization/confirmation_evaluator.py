@@ -11,6 +11,8 @@ from typing import Any, Callable, Mapping
 from surrogate_rollout import config
 from surrogate_rollout.captioning.candidate_captions import build_clip_index
 from surrogate_rollout.captioning.history_aware_baseline import (
+    CAPTION_OUTPUT_CONTRACT_VERSION,
+    CAPTION_PARSE_SCHEMA_VERSION,
     DEFAULT_HISTORY_BLOCK_SECONDS,
     DEFAULT_MAX_HISTORY_CAPTIONS,
     HISTORY_SCHEMA_VERSION,
@@ -237,6 +239,10 @@ class HistoryAwareDVDConfirmationEvaluator:
             "caption_backend_id": self._caption_backend_id,
             "router_adapter": self._router_identity,
             "caption_decoding": self._caption_decoding,
+            "caption_output_contract_version":
+                CAPTION_OUTPUT_CONTRACT_VERSION,
+            "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
             "frame_sampling": self._frame_sampling,
             "history": {
                 "schema_version": HISTORY_SCHEMA_VERSION,

@@ -10,12 +10,17 @@ from typing import Any, Callable, Mapping
 
 from surrogate_rollout import config
 from surrogate_rollout.captioning.candidate_captions import build_clip_index
+from surrogate_rollout.captioning.history_aware_baseline import (
+    CAPTION_OUTPUT_CONTRACT_VERSION,
+    CAPTION_PARSE_SCHEMA_VERSION,
+)
 from surrogate_rollout.evaluation.dvd_qa import (
     dvd_qa_execution_identity,
     run_dvd_qa,
 )
 from surrogate_rollout.mixed_views.builder import MixedViewBuilder
 from surrogate_rollout.optimization.property_proposal import CandidatePropertyProposal
+from surrogate_rollout.optimization.stage_logging import StageLogger, emit_stage
 from surrogate_rollout.prompt_routing.intervention_composer import (
     InterventionCompositionError,
     compose_forced_property,
@@ -174,6 +179,7 @@ class PropertyInterventionBatchRunner:
         output_dir: str,
         gpu: str | None = None,
         dvd_max_iterations: int = 10,
+        stage_logger: StageLogger | None = None,
     ) -> PropertyInterventionBatchResult:
         baseline = _read_json(baseline_video_manifest_path)
         video_id = str(baseline["video_id"])
@@ -238,6 +244,13 @@ class PropertyInterventionBatchRunner:
                     "intervention batch output exists for different frozen inputs")
         results = []
         for work_item, proposal in zip(work_items, proposals):
+            emit_stage(
+                stage_logger, event="START", stage="intervention",
+                message=(f"[{video_id}] candidate "
+                         f"{proposal.candidate_property_id} intervention 시작"),
+                video_id=video_id,
+                candidate_property_id=proposal.candidate_property_id,
+                property_text=proposal.property_text)
             try:
                 result = self._run_one(
                     work_item=work_item, proposal=proposal,
@@ -250,13 +263,25 @@ class PropertyInterventionBatchRunner:
                     scaffold_contract=scaffold_contract,
                     base_prompt_template=base_prompt_template,
                     merge_prompt=merge_prompt, gpu=gpu,
-                    dvd_max_iterations=dvd_max_iterations)
+                    dvd_max_iterations=dvd_max_iterations,
+                    stage_logger=stage_logger)
             except Exception as exc:
                 result = PropertyInterventionResult(
                     candidate_property_id=proposal.candidate_property_id,
                     source_video_id=video_id, status="failed", result_path=None,
                     failure_type=type(exc).__name__, failure_reason=str(exc))
             results.append(result)
+            emit_stage(
+                stage_logger,
+                event=("END" if result.status == "completed" else "ERROR"),
+                stage="intervention",
+                message=(f"[{video_id}] candidate "
+                         f"{proposal.candidate_property_id} intervention 끝"),
+                video_id=video_id,
+                candidate_property_id=proposal.candidate_property_id,
+                status=result.status, resumed=result.resumed,
+                failure_type=result.failure_type,
+                failure_reason=result.failure_reason)
 
         manifest_path = _write_json(os.path.join(output_dir, "manifest.json"), {
             "schema_version": "property_intervention_batch_v1",
@@ -305,6 +330,7 @@ class PropertyInterventionBatchRunner:
         merge_prompt: str,
         gpu: str | None,
         dvd_max_iterations: int,
+        stage_logger: StageLogger | None,
     ) -> PropertyInterventionResult:
         if retrieval.get("source_video_id") != work_item.source_video_id or \
                 retrieval.get("candidate_property_id") != proposal.candidate_property_id:
@@ -378,7 +404,7 @@ class PropertyInterventionBatchRunner:
                 if not all(path and os.path.exists(path) for path in required):
                     raise PropertyInterventionError(
                         "completed candidate is missing required artifacts")
-            return PropertyInterventionResult(
+            resumed_result = PropertyInterventionResult(
                 candidate_property_id=proposal.candidate_property_id,
                 source_video_id=work_item.source_video_id,
                 status=existing["status"], result_path=os.path.abspath(result_path),
@@ -386,6 +412,18 @@ class PropertyInterventionBatchRunner:
                 transitions_path=existing.get("transitions_path"),
                 failure_type=existing.get("failure_type"),
                 failure_reason=existing.get("failure_reason"), resumed=True)
+            for stage, label in (
+                ("intervention_recaption", "intervention recaption"),
+                ("candidate_qa", "candidate QA 평가"),
+            ):
+                emit_stage(
+                    stage_logger, event="RESUME", stage=stage,
+                    message=(f"[{work_item.source_video_id}] "
+                             f"{proposal.candidate_property_id} {label} artifact 재사용"),
+                    video_id=work_item.source_video_id,
+                    candidate_property_id=proposal.candidate_property_id,
+                    status=existing["status"])
+            return resumed_result
 
         os.makedirs(work_item.output_dir, exist_ok=True)
         _write_json(os.path.join(work_item.output_dir, "work_item.json"), {
@@ -421,6 +459,13 @@ class PropertyInterventionBatchRunner:
         cache_rows = []
         composed_by_id = {item.segment_id: item for item in composed}
         history_by_id = {item["segment_id"]: item for item in frozen}
+        emit_stage(
+            stage_logger, event="START", stage="intervention_recaption",
+            message=(f"[{work_item.source_video_id}] "
+                     f"{proposal.candidate_property_id} intervention recaption 시작"),
+            video_id=work_item.source_video_id,
+            candidate_property_id=proposal.candidate_property_id,
+            selected_segments=selected)
         try:
             for segment_id in selected:
                 intervention_identity = sha256_json({
@@ -461,11 +506,27 @@ class PropertyInterventionBatchRunner:
                     "caption_seconds": result.caption_seconds,
                 })
         except Exception as exc:
+            emit_stage(
+                stage_logger, event="ERROR", stage="intervention_recaption",
+                message=(f"[{work_item.source_video_id}] "
+                         f"{proposal.candidate_property_id} intervention recaption 실패"),
+                video_id=work_item.source_video_id,
+                candidate_property_id=proposal.candidate_property_id,
+                error_type=type(exc).__name__, error=str(exc))
             return self._persist_failure(
                 work_item, fingerprint, "selected_segment_caption_failed",
                 f"{type(exc).__name__}: {exc}")
         _write_jsonl(os.path.join(
             work_item.output_dir, "caption_cache_keys.jsonl"), cache_rows)
+        emit_stage(
+            stage_logger, event="END", stage="intervention_recaption",
+            message=(f"[{work_item.source_video_id}] "
+                     f"{proposal.candidate_property_id} intervention recaption 끝"),
+            video_id=work_item.source_video_id,
+            candidate_property_id=proposal.candidate_property_id,
+            recaptioned_segments=tuple(parsed),
+            cache_hits=sum(bool(item["cache_hit"]) for item in cache_rows),
+            model_calls=sum(not bool(item["cache_hit"]) for item in cache_rows))
 
         try:
             registries = self._baseline_registries(
@@ -488,6 +549,13 @@ class PropertyInterventionBatchRunner:
                 f"{type(exc).__name__}: {exc}")
 
         transition_rows = []
+        emit_stage(
+            stage_logger, event="START", stage="candidate_qa",
+            message=(f"[{work_item.source_video_id}] "
+                     f"{proposal.candidate_property_id} candidate QA 평가 시작"),
+            video_id=work_item.source_video_id,
+            candidate_property_id=proposal.candidate_property_id,
+            qa_count=len(baseline_qas))
         try:
             for baseline_qa in baseline_qas:
                 provider_index = int(baseline_qa["provider_index"])
@@ -539,10 +607,24 @@ class PropertyInterventionBatchRunner:
                     _write_json(record_path, row)
                 transition_rows.append(row)
         except Exception as exc:
+            emit_stage(
+                stage_logger, event="ERROR", stage="candidate_qa",
+                message=(f"[{work_item.source_video_id}] "
+                         f"{proposal.candidate_property_id} candidate QA 평가 실패"),
+                video_id=work_item.source_video_id,
+                candidate_property_id=proposal.candidate_property_id,
+                error_type=type(exc).__name__, error=str(exc))
             return self._persist_failure(
                 work_item, fingerprint, "qa_rerun_failed",
                 f"{type(exc).__name__}: {exc}")
         if len(transition_rows) != 3:
+            emit_stage(
+                stage_logger, event="ERROR", stage="candidate_qa",
+                message=(f"[{work_item.source_video_id}] "
+                         f"{proposal.candidate_property_id} candidate QA 평가 실패"),
+                video_id=work_item.source_video_id,
+                candidate_property_id=proposal.candidate_property_id,
+                completed_qa_count=len(transition_rows), expected_qa_count=3)
             return self._persist_failure(
                 work_item, fingerprint, "qa_rerun_failed",
                 "candidate did not produce exactly three QA results")
@@ -550,6 +632,19 @@ class PropertyInterventionBatchRunner:
             label: sum(row["transition"] == label for row in transition_rows)
             for label in TRANSITION_LABELS
         }
+        emit_stage(
+            stage_logger, event="END", stage="candidate_qa",
+            message=(f"[{work_item.source_video_id}] "
+                     f"{proposal.candidate_property_id} candidate QA 평가 끝"),
+            video_id=work_item.source_video_id,
+            candidate_property_id=proposal.candidate_property_id,
+            transition_counts=transition_counts,
+            results=tuple({
+                "question_id": item["question_id"],
+                "candidate_prediction": item.get("candidate_prediction"),
+                "transition": item["transition"],
+                "runtime_valid": not bool(item.get("errors")),
+            } for item in transition_rows))
         transitions_path = _write_json(os.path.join(
             work_item.output_dir, "transitions.json"), {
             "candidate_property_id": proposal.candidate_property_id,
@@ -613,6 +708,10 @@ class PropertyInterventionBatchRunner:
             "model_id": self.segment_captioner.caption_model_id,
             "backend_id": self.segment_captioner.backend_id,
             "decoding_hash": config.decoding_hash(),
+            "caption_output_contract_version":
+                CAPTION_OUTPUT_CONTRACT_VERSION,
+            "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
         }
 
     def _qa_configuration(self, dvd_max_iterations: int) -> dict[str, Any]:

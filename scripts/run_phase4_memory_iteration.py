@@ -80,6 +80,7 @@ def _gpu_inventory() -> dict[str, int]:
 def _validate_gpu_configuration(
     *, gpus: tuple[str, ...], inventory: dict[str, int],
     max_parallel_videos: int, require_free: bool,
+    embedding_gpu: str | None = None,
 ) -> None:
     if not gpus or len(gpus) != len(set(gpus)):
         raise ProductionIterationError("--gpus must contain unique GPU IDs")
@@ -89,11 +90,25 @@ def _validate_gpu_configuration(
     if not 1 <= max_parallel_videos <= len(gpus):
         raise ProductionIterationError(
             "--max-parallel-videos exceeds the usable worker count")
+    if embedding_gpu is not None:
+        if embedding_gpu in gpus:
+            raise ProductionIterationError(
+                "--embedding-gpu must not overlap --gpus caption workers")
+        if embedding_gpu not in inventory:
+            raise ProductionIterationError(
+                f"unavailable embedding GPU: {embedding_gpu}")
     if require_free:
         occupied = {gpu: inventory[gpu] for gpu in gpus if inventory[gpu] >= 100}
+        if embedding_gpu is not None and inventory[embedding_gpu] >= 100:
+            occupied[embedding_gpu] = inventory[embedding_gpu]
         if occupied:
             raise ProductionIterationError(
                 f"configured GPUs are not free: {occupied}")
+
+
+def _embedding_device(embedding_gpu: str | None) -> str:
+    return ("cpu" if embedding_gpu is None else
+            f"isolated_process:physical_gpu={embedding_gpu}:logical_device=cuda:0")
 
 
 def _load_parent_pair(*, components: dict, state_dir: str):
@@ -184,7 +199,8 @@ def _build_runtime(args, *, gpus, bank, router, components, split_hash):
         PropertyFrameRetriever, PropertyRetrievalBatchRunner,
     )
     from surrogate_rollout.retrieval.visual_index import (
-        SiglipEmbedder, load_or_build_visual_index,
+        ProcessIsolatedSiglipEmbedder, SiglipEmbedder,
+        load_or_build_visual_index,
     )
 
     for path in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
@@ -204,8 +220,12 @@ def _build_runtime(args, *, gpus, bank, router, components, split_hash):
     prompts = get_prompts()
     history_builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen(
         parallel_gpus=gpus)
-    retrieval_embedder = SiglipEmbedder(
-        model_id=config.VISUAL_INDEX_MODEL_ID, device="cpu")
+    retrieval_embedder = (
+        SiglipEmbedder(model_id=config.VISUAL_INDEX_MODEL_ID, device="cpu")
+        if args.embedding_gpu is None else
+        ProcessIsolatedSiglipEmbedder(
+            model_id=config.VISUAL_INDEX_MODEL_ID,
+            physical_gpu=args.embedding_gpu))
 
     def visual_index_loader(sample: dict, video_id: str):
         return load_or_build_visual_index(
@@ -276,6 +296,7 @@ def _build_runtime(args, *, gpus, bank, router, components, split_hash):
         history_builder=history_builder)
     return {
         "runner": runner, "history_builder": history_builder,
+        "retrieval_embedder": retrieval_embedder,
         "sample_loader": sample_loader, "prompts": prompts,
         "scaffold": scaffold, "contract": contract,
         "codebook_provider": codebook_provider,
@@ -283,7 +304,13 @@ def _build_runtime(args, *, gpus, bank, router, components, split_hash):
     }
 
 
-def _write_cleanup(output_dir: str, history_builder, gpus, *, calls) -> None:
+def _write_cleanup(
+    output_dir: str, history_builder, gpus, *, calls,
+    embedding_gpu: str | None = None,
+    embedding_model_closed: bool = True,
+    embedding_worker_pid: int | None = None,
+    embedding_worker_released: bool = True,
+) -> None:
     root = os.path.join(os.path.abspath(output_dir), "worker_cleanup")
     os.makedirs(root, exist_ok=True)
     attempt = len([name for name in os.listdir(root) if name.endswith(".json")]) + 1
@@ -298,15 +325,23 @@ def _write_cleanup(output_dir: str, history_builder, gpus, *, calls) -> None:
     except BaseException:
         inventory = {gpu: None for gpu in gpus}
     configured = {gpu: inventory.get(gpu) for gpu in gpus}
+    embedding_memory = (
+        inventory.get(embedding_gpu) if embedding_gpu is not None else None)
     released = (
         (history_builder is None or not history_builder._pool_processes)
         and not any(process.is_alive() for _, _, process in workers)
+        and embedding_worker_released
         and all(value is not None and value < 100 for value in configured.values()))
     path = os.path.join(root, f"attempt_{attempt:03d}.json")
     with open(path, "w") as handle:
         json.dump({
-            "schema_version": "production_worker_cleanup_v1",
+            "schema_version": "production_worker_cleanup_v2",
             "configured_gpus": gpus,
+            "embedding_gpu": embedding_gpu,
+            "embedding_model_closed": embedding_model_closed,
+            "embedding_worker_pid": embedding_worker_pid,
+            "embedding_worker_released": embedding_worker_released,
+            "embedding_gpu_memory_before_parent_exit_mib": embedding_memory,
             "workers_before_close": tuple({"gpu": gpu, "pid": pid}
                                           for gpu, pid, _ in workers),
             "workers_alive_after_close": tuple(
@@ -331,6 +366,9 @@ def main() -> None:
     parser.add_argument("--video-ids")
     parser.add_argument("--max-parallel-videos", type=int)
     parser.add_argument("--gpus", required=True)
+    parser.add_argument(
+        "--embedding-gpu",
+        help="dedicated SigLIP GPU; must not overlap --gpus (default: CPU)")
     parser.add_argument("--selection-seed", type=int, default=0)
     parser.add_argument("--dry-run-plan", action="store_true")
     parser.add_argument("--components", default=DEFAULT_COMPONENTS)
@@ -387,7 +425,8 @@ def main() -> None:
         _validate_gpu_configuration(
             gpus=gpus, inventory=inventory,
             max_parallel_videos=max_parallel,
-            require_free=not args.dry_run_plan)
+            require_free=not args.dry_run_plan,
+            embedding_gpu=args.embedding_gpu)
     except ProductionIterationError as exc:
         raise SystemExit(str(exc)) from exc
     phase4_config = Phase4Config(
@@ -404,11 +443,15 @@ def main() -> None:
         "split_manifest_hash": split_hash,
         "feedback_model": args.feedback_model,
         "dvd_max_iterations": args.dvd_max_iterations,
-        "gpu_inventory_at_plan": {gpu: inventory[gpu] for gpu in gpus},
+        "gpu_inventory_at_plan": {
+            gpu: inventory[gpu] for gpu in
+            (*gpus, *((args.embedding_gpu,) if args.embedding_gpu else ()))},
         "caption_model": config.CAPTION_MODEL_ID,
         "caption_decoding": config.CAPTION_DECODING,
         "retrieval_model": config.VISUAL_INDEX_MODEL_ID,
-        "retrieval_device": "cpu",
+        "retrieval_device": _embedding_device(args.embedding_gpu),
+        "embedding_gpu": args.embedding_gpu,
+        "embedding_process_isolation": args.embedding_gpu is not None,
         "max_proposals_per_video": args.max_proposals_per_video,
         "property_retrieval_top_k": args.property_retrieval_top_k,
         "dvd_clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
@@ -484,13 +527,38 @@ def main() -> None:
         print(result.manifest_path, flush=True)
     finally:
         if not args.dry_run_plan:
+            embedding_model_closed = args.embedding_gpu is None
+            embedding_worker_pid = None
+            embedding_worker_released = args.embedding_gpu is None
             if runtime is not None:
                 calls = {
                     "codebook": runtime["codebook_provider"].call_count,
                     "router": runtime["router_provider"].call_count,
                 }
-            _write_cleanup(
-                args.output_dir, history_builder, gpus, calls=calls)
+            try:
+                if runtime is not None:
+                    embedding_worker_pid = getattr(
+                        runtime["retrieval_embedder"], "worker_pid", None)
+                    runtime["retrieval_embedder"].close()
+                    embedding_model_closed = True
+                    embedding_worker_released = not bool(getattr(
+                        runtime["retrieval_embedder"], "is_alive", False))
+            finally:
+                from surrogate_rollout.retrieval.visual_index import (
+                    close_all_isolated_siglip_embedders,
+                )
+                orphan_records = close_all_isolated_siglip_embedders()
+                if orphan_records:
+                    embedding_worker_pid = int(orphan_records[-1]["pid"])
+                    embedding_worker_released = all(
+                        bool(item["released"]) for item in orphan_records)
+                    embedding_model_closed = embedding_worker_released
+                _write_cleanup(
+                    args.output_dir, history_builder, gpus, calls=calls,
+                    embedding_gpu=args.embedding_gpu,
+                    embedding_model_closed=embedding_model_closed,
+                    embedding_worker_pid=embedding_worker_pid,
+                    embedding_worker_released=embedding_worker_released)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from surrogate_rollout.optimization.startup_models import (
     build_startup_model_manifest,
     log_startup_models,
 )
+from surrogate_rollout.optimization.stage_logging import IterationStageLogger
 from surrogate_rollout.optimization.train_roles import (
     EvidenceCoverageState,
     TrainRoleAssignment,
@@ -392,6 +393,8 @@ class MemoryConditionedProductionIterationRunner:
             "selection_seed": selection_seed,
             "rotation_position": coverage_state.rotation_cursor,
             "gpu_ids": gpus,
+            "embedding_gpu": execution_identity.get("embedding_gpu"),
+            "retrieval_device": execution_identity.get("retrieval_device"),
             "max_parallel_videos": max_parallel_videos,
             "scheduler_version": SCHEDULER_VERSION,
             "waves": waves,
@@ -427,6 +430,9 @@ class MemoryConditionedProductionIterationRunner:
         except FinalIterationConflictError as exc:
             raise ProductionIterationConflictError(
                 "output identity conflicts with an existing run") from exc
+        stage_log = IterationStageLogger(
+            os.path.join(output_dir, "iteration.log"))
+        iteration_ordinal = coverage_state.iterations_since_confirmation + 1
         manifest_path = os.path.join(output_dir, "manifest.json")
         startup_models_path = None
         if self.require_real_models and not dry_run_plan:
@@ -441,14 +447,29 @@ class MemoryConditionedProductionIterationRunner:
             manifest = _read_json(manifest_path)
             if dry_run_plan and manifest.get("status") == "dry_run_planned" and \
                     manifest.get("identity_hash") == identity_hash:
+                stage_log.emit(
+                    event="RESUME", stage="iteration",
+                    message=f"{iteration_ordinal}번 iter dry-run 재확인",
+                    iteration_id=iteration_id, videos=selected_video_ids)
                 return ProductionIterationResult(
                     manifest_path=os.path.abspath(manifest_path),
                     plan_path=os.path.abspath(plan_path),
                     selected_video_ids=selected_video_ids, resumed=True, dry_run=True)
-            return self._resume(
+            result = self._resume(
                 manifest_path=manifest_path, identity_hash=identity_hash,
                 selected_video_ids=selected_video_ids, plan_path=plan_path)
+            stage_log.emit(
+                event="RESUME", stage="iteration",
+                message=f"{iteration_ordinal}번 iter 완료 artifact 재사용",
+                iteration_id=iteration_id, videos=selected_video_ids,
+                repeated_model_calls=0)
+            return result
         if dry_run_plan:
+            stage_log.emit(
+                event="PLAN", stage="iteration",
+                message=f"{iteration_ordinal}번 iter dry-run 계획 생성",
+                iteration_id=iteration_id, videos=selected_video_ids,
+                waves=waves)
             manifest_path = _write_immutable(manifest_path, {
                 "schema_version": MANIFEST_SCHEMA_VERSION,
                 "status": "dry_run_planned", "identity_hash": identity_hash,
@@ -462,7 +483,18 @@ class MemoryConditionedProductionIterationRunner:
                 manifest_path=manifest_path, plan_path=plan_path,
                 selected_video_ids=selected_video_ids, resumed=False, dry_run=True)
 
+        stage_log.emit(
+            event="START", stage="iteration",
+            message=f"{iteration_ordinal}번 iter 시작",
+            iteration_id=iteration_id, videos=selected_video_ids,
+            gpu_ids=gpus, max_parallel_videos=max_parallel_videos)
+        stage_log.emit(
+            event="START", stage="worker_pool",
+            message="persistent GPU worker pool 시작", gpu_ids=gpus)
         self.history_builder.start_worker_pool()
+        stage_log.emit(
+            event="END", stage="worker_pool",
+            message="persistent GPU worker pool 준비 완료", gpu_ids=gpus)
         cache_manifest_path = os.path.join(cache_dir, "caption_cache_manifest.jsonl")
         baseline_by_video: dict[str, Any] = {}
         intervention_by_video: dict[str, Any] = {}
@@ -481,10 +513,39 @@ class MemoryConditionedProductionIterationRunner:
                     bounded_smoke_video_id=item.video_id,
                     caption_cache_root=os.path.join(cache_dir, "captions"),
                     cache_manifest_path=cache_manifest_path,
-                    worker_gpus=(item.gpu_id,), **dict(baseline_kwargs))
+                    worker_gpus=(item.gpu_id,), stage_logger=stage_log.emit,
+                    **dict(baseline_kwargs))
+
+        def run_logged_wave(
+            phase: str, wave: Sequence[VideoWaveAssignment],
+            fn: Callable[[VideoWaveAssignment], Any],
+        ) -> dict[str, Any]:
+            video_ids = tuple(item.video_id for item in wave)
+            assignments = {item.video_id: item.gpu_id for item in wave}
+            stage_log.emit(
+                event="START", stage="parallel_wave",
+                message=f"video {','.join(video_ids)} 병렬화 시작",
+                phase=phase, wave_index=wave[0].wave_index,
+                gpu_assignments=assignments)
+            try:
+                completed = self._run_wave(wave, fn)
+            except Exception as exc:
+                stage_log.emit(
+                    event="ERROR", stage="parallel_wave",
+                    message=f"video {','.join(video_ids)} 병렬화 실패",
+                    phase=phase, wave_index=wave[0].wave_index,
+                    error_type=type(exc).__name__, error=str(exc))
+                raise
+            stage_log.emit(
+                event="END", stage="parallel_wave",
+                message=f"video {','.join(video_ids)} 병렬화 끝",
+                phase=phase, wave_index=wave[0].wave_index,
+                completed_videos=tuple(completed))
+            return completed
 
         for wave in waves:
-            baseline_by_video.update(self._run_wave(wave, run_baseline))
+            baseline_by_video.update(run_logged_wave(
+                "baseline_proposal_similarity", wave, run_baseline))
 
         baseline_manifest_paths = []
         video_manifest_paths = []
@@ -527,27 +588,45 @@ class MemoryConditionedProductionIterationRunner:
                     scaffold_contract=scaffold_contract,
                     output_dir=os.path.join(
                         output_dir, "interventions", video_id),
-                    **dict(intervention_kwargs))
+                    stage_logger=stage_log.emit, **dict(intervention_kwargs))
 
         for wave in waves:
-            intervention_by_video.update(self._run_wave(wave, run_intervention))
+            intervention_by_video.update(run_logged_wave(
+                "intervention_recaption_and_qa", wave, run_intervention))
         intervention_manifest_paths = tuple(
             intervention_by_video[item].manifest_path for item in selected_video_ids)
 
         def run_feedback(item: VideoWaveAssignment) -> Any:
             video_id = item.video_id
-            return self.feedback_runner.run(
-                iteration_id=iteration_id,
-                baseline_video_manifest_path=video_manifest_paths[
-                    selected_video_ids.index(video_id)],
-                proposals=proposal_by_video[video_id],
-                retrieval_artifact_paths=retrieval_by_video[video_id],
-                intervention_manifest_path=intervention_by_video[video_id].manifest_path,
-                prompt_bank=prompt_bank,
-                output_dir=os.path.join(output_dir, "feedback", video_id))
+            stage_log.emit(
+                event="START", stage="feedback", video_id=video_id,
+                message=f"[{video_id}] flip-only feedback 시작")
+            try:
+                result = self.feedback_runner.run(
+                    iteration_id=iteration_id,
+                    baseline_video_manifest_path=video_manifest_paths[
+                        selected_video_ids.index(video_id)],
+                    proposals=proposal_by_video[video_id],
+                    retrieval_artifact_paths=retrieval_by_video[video_id],
+                    intervention_manifest_path=(
+                        intervention_by_video[video_id].manifest_path),
+                    prompt_bank=prompt_bank,
+                    output_dir=os.path.join(output_dir, "feedback", video_id))
+            except Exception as exc:
+                stage_log.emit(
+                    event="ERROR", stage="feedback", video_id=video_id,
+                    message=f"[{video_id}] flip-only feedback 실패",
+                    error_type=type(exc).__name__, error=str(exc))
+                raise
+            stage_log.emit(
+                event="END", stage="feedback", video_id=video_id,
+                message=f"[{video_id}] flip-only feedback 끝",
+                manifest_path=result.manifest_path)
+            return result
 
         for wave in waves:
-            feedback_by_video.update(self._run_wave(wave, run_feedback))
+            feedback_by_video.update(run_logged_wave(
+                "flip_only_feedback", wave, run_feedback))
         feedback_manifest_paths = tuple(
             feedback_by_video[item].manifest_path for item in selected_video_ids)
 
@@ -559,14 +638,14 @@ class MemoryConditionedProductionIterationRunner:
             intervention_manifest_paths=intervention_manifest_paths,
             feedback_manifest_paths=feedback_manifest_paths,
             output_dir=os.path.join(output_dir, "memory_codebook_checkpoint"),
-            state_dir=state_dir)
+            state_dir=state_dir, stage_logger=stage_log.emit)
         codebook_manifest_path = os.path.join(
             output_dir, "memory_codebook_checkpoint", "manifest.json")
         router = self.update_engine.run_memory_conditioned_router_checkpoint(
             iteration_id=iteration_id, parent_router_policy=router_policy,
             codebook_checkpoint_manifest_path=codebook_manifest_path,
             output_dir=os.path.join(output_dir, "memory_router_checkpoint"),
-            state_dir=state_dir)
+            state_dir=state_dir, stage_logger=stage_log.emit)
         if router.get("status") != "committed":
             raise ProductionIterationError(
                 "router checkpoint did not atomically commit the policy pair")
@@ -611,6 +690,7 @@ class MemoryConditionedProductionIterationRunner:
             "confirmed_pointer_hash_after": confirmed_after,
             "confirmed_production_pointer_mutated": False,
             "confirmation_run": False,
+            "operational_log_path": stage_log.path,
         }
         manifest_path = _write_immutable(manifest_path, manifest)
         selection_pointer = os.path.join(
@@ -623,6 +703,11 @@ class MemoryConditionedProductionIterationRunner:
             "selection_seed": selection_seed,
             "coverage_state": next_coverage_state,
         })
+        stage_log.emit(
+            event="END", stage="iteration",
+            message=f"{iteration_ordinal}번 iter 끝",
+            iteration_id=iteration_id, status="completed",
+            atomic_policy_pair=router["artifacts"]["atomic_policy_pair"])
         return ProductionIterationResult(
             manifest_path=manifest_path, plan_path=plan_path,
             selected_video_ids=selected_video_ids, resumed=False, dry_run=False)

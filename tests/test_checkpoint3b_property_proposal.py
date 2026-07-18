@@ -82,7 +82,7 @@ def context(tmp_path, *, prediction="B"):
 def proposal(candidate_id, text, qids=("q1",), **over):
     del qids
     value = {
-        "candidate_property_id": candidate_id,
+        "suggested_property_id": candidate_id,
         "property_text": text,
         "motivating_failure_types": ["missing_visual_attribute"],
         "covered_by_existing_property_ids": [],
@@ -212,7 +212,7 @@ def test_policy_persists_private_identity_and_exact_provider_body(tmp_path):
     artifact_dir = Path(ctx.proposal_artifact_dir)
     assert json.loads((artifact_dir / "provider_request.json").read_text()) == {
         "exact": True,
-        "request_schema": "multimodal_property_proposal_request_v3",
+        "request_schema": "multimodal_property_proposal_request_v4",
     }
     model_request = (artifact_dir / "request.json").read_text()
     private_identity = (artifact_dir / "input_identity.json").read_text()
@@ -232,10 +232,10 @@ def test_instance_specific_answer_leaking_and_codebook_duplicates_are_rejected(t
     accepted, rejected = parse_proposal_output(
         raw, ctx, max_proposals=4, max_property_text_chars=240)
     assert accepted == ()
-    assert {item["candidate_property_id"] for item in rejected} == {
+    assert {item["suggested_property_id"] for item in rejected} == {
         "cp_video", "cp_answer", "cp_existing"}
     exact = next(item for item in rejected
-                 if item["candidate_property_id"] == "cp_existing")
+                 if item["suggested_property_id"] == "cp_existing")
     assert exact["reason"] == "exact_property_text_match:pe_default"
 
 
@@ -253,6 +253,8 @@ def test_coverage_hints_are_non_binding_and_persisted_for_later_feedback(tmp_pat
         response_provider=provider).propose(ctx))
 
     assert len(result) == 1
+    assert result[0].candidate_property_id.startswith("candidate_")
+    assert result[0].suggested_property_id == "cp_roles"
     assert result[0].coverage_hints == ("pe_default", "pe_temporal")
     assert result[0].covered_by_existing_property_ids == result[0].coverage_hints
     assert result[0].coverage_assessment == "deferred_to_intervention"
@@ -279,7 +281,7 @@ def test_contradictory_coverage_and_nonvisual_knowledge_are_explicitly_rejected(
         raw, ctx, max_proposals=4, max_property_text_chars=240)
 
     assert accepted == ()
-    assert {item["candidate_property_id"]: item["reason"] for item in rejected} == {
+    assert {item["suggested_property_id"]: item["reason"] for item in rejected} == {
         "cp_contradiction": "contradictory_coverage_hints_without_uncertainty",
         "cp_history": (
             "requires non-visual or external/background/historical knowledge"),
@@ -308,10 +310,33 @@ def test_active_property_id_collision_is_deterministically_rejected(tmp_path):
         context(tmp_path), max_proposals=1, max_property_text_chars=240)
 
     assert accepted == ()
-    assert rejected == ({
-        "candidate_property_id": "pe_default",
-        "reason": "candidate_property_id_collides_with_active_property",
-    },)
+    assert rejected[0]["candidate_property_id"].startswith("candidate_")
+    assert rejected[0]["suggested_property_id"] == "pe_default"
+    assert rejected[0]["reason"] == \
+        "candidate_property_id_collides_with_active_property"
+
+
+def test_candidate_handle_is_stable_opaque_and_source_specific(tmp_path):
+    raw = json.dumps({"proposals": [proposal(
+        "pe_visual_context", "Record salient visible context precisely.")]})
+    first, _ = parse_proposal_output(
+        raw, context(tmp_path), max_proposals=1, max_property_text_chars=240)
+    repeated, _ = parse_proposal_output(
+        raw, context(tmp_path), max_proposals=1, max_property_text_chars=240)
+    other = context(tmp_path)
+    other = type(other)(
+        video_id="video-2", baseline_run_id=other.baseline_run_id,
+        baseline_qa_results=other.baseline_qa_results,
+        captions=other.captions, frame_references=other.frame_references,
+        frozen_histories=other.frozen_histories, prompt_bank=other.prompt_bank,
+        proposal_artifact_dir=other.proposal_artifact_dir)
+    second_video, _ = parse_proposal_output(
+        raw, other, max_proposals=1, max_property_text_chars=240)
+
+    assert first[0].candidate_property_id == repeated[0].candidate_property_id
+    assert first[0].candidate_property_id != second_video[0].candidate_property_id
+    assert first[0].suggested_property_id == "pe_visual_context"
+    assert first[0].candidate_property_id != first[0].suggested_property_id
 
 
 def test_exact_proposal_resume_skips_provider_and_stale_input_fails_closed(tmp_path):

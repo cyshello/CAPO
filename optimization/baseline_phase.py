@@ -28,6 +28,7 @@ from surrogate_rollout.optimization.property_proposal import (
     VideoPropertyProposalRecord,
     VideoProposalContext,
 )
+from surrogate_rollout.optimization.stage_logging import StageLogger, emit_stage
 from surrogate_rollout.optimization.train_roles import (
     EvidenceCoverageState,
     TrainRoleAssignment,
@@ -217,6 +218,7 @@ class BaselinePhaseRunner:
         caption_cache_root: str | None = None,
         cache_manifest_path: str | None = None,
         worker_gpus: tuple[str, ...] | None = None,
+        stage_logger: StageLogger | None = None,
     ) -> BaselinePhaseResult:
         if bounded_smoke_video_id is None:
             selected_ids, next_coverage = select_evidence_batch(coverage_state)
@@ -271,6 +273,9 @@ class BaselinePhaseRunner:
                 "mode": "sequential_vlm",
                 "history_block_seconds": history_block_seconds,
                 "max_history_captions": max_history_captions,
+                "captioner_configuration": as_json_dict(
+                    self.history_aware_builder.segment_captioner
+                    .configuration_identity),
             }
         else:
             # Preserve the exact Checkpoint 2 fingerprint for old completed runs.
@@ -355,8 +360,29 @@ class BaselinePhaseRunner:
                 total_router_calls += int(complete.get("real_vlm_router_calls", 0))
                 retrieval_paths.extend(
                     complete.get("property_retrieval_paths") or ())
+                proposal_count = len((_read_json(
+                    complete["property_proposal_path"]).get("proposals") or ()))
+                for stage, message, details in (
+                    ("baseline_captioning", "baseline captioning artifact 재사용", {
+                        "caption_path": complete["captions_path"]}),
+                    ("baseline_qa", "baseline QA 평가 artifact 재사용", {
+                        "qa_count": complete["qa_count"]}),
+                    ("property_proposal", "property proposal artifact 재사용", {
+                        "proposal_count": proposal_count}),
+                    ("similarity_retrieval", "similarity 측정 artifact 재사용", {
+                        "retrieval_count": len(
+                            complete.get("property_retrieval_paths") or ())}),
+                ):
+                    emit_stage(
+                        stage_logger, event="RESUME", stage=stage,
+                        message=f"[{record.video_id}] {message}",
+                        video_id=record.video_id, **details)
                 continue
 
+            emit_stage(
+                stage_logger, event="START", stage="baseline_captioning",
+                message=f"[{record.video_id}] baseline captioning 시작",
+                video_id=record.video_id, worker_gpus=worker_gpus)
             samples = tuple(sample_loader(index) for index in record.provider_indices)
             if any(_video_id(sample) != record.video_id for sample in samples):
                 raise RuntimeError(f"provider video changed for {record.video_id}")
@@ -423,9 +449,21 @@ class BaselinePhaseRunner:
                     dumps_canonical(item) + "\n" for item in histories))
                 routing_manifest_path = routing.manifest_path
 
+            emit_stage(
+                stage_logger, event="END", stage="baseline_captioning",
+                message=f"[{record.video_id}] baseline captioning 끝",
+                video_id=record.video_id,
+                segment_count=len(segment_ids),
+                router_calls=int(getattr(caption_view, "router_call_count", 0)),
+                caption_calls=int(getattr(caption_view, "caption_call_count", 0)))
+
             with open(caption_view.captions_path) as f:
                 captions = json.load(f)
 
+            emit_stage(
+                stage_logger, event="START", stage="baseline_qa",
+                message=f"[{record.video_id}] baseline QA 평가 시작",
+                video_id=record.video_id, qa_count=len(record.question_ids))
             qa_rows = []
             for question_id, provider_index, sample in zip(
                     record.question_ids, record.provider_indices, samples):
@@ -468,6 +506,17 @@ class BaselinePhaseRunner:
                 }
                 _write(os.path.join(qa_dir, "baseline_record.json"), row)
                 qa_rows.append(row)
+            emit_stage(
+                stage_logger, event="END", stage="baseline_qa",
+                message=f"[{record.video_id}] baseline QA 평가 끝",
+                video_id=record.video_id,
+                results=tuple({
+                    "question_id": item["question_id"],
+                    "prediction": item["prediction"],
+                    "correct": item["is_correct"],
+                    "runtime_valid": not bool(
+                        qa_execution_failure_reasons(item)),
+                } for item in qa_rows))
             qa_path = os.path.join(video_dir, "baseline_qas.jsonl")
             _atomic_write_text(qa_path, "".join(
                 dumps_canonical(item) + "\n" for item in qa_rows))
@@ -500,7 +549,28 @@ class BaselinePhaseRunner:
                 proposal_artifact_dir=os.path.join(
                     output_dir, "property_proposals", record.video_id,
                     "model_artifacts"))
-            proposals = tuple(self.proposal_policy.propose(proposal_context))
+            emit_stage(
+                stage_logger, event="START", stage="property_proposal",
+                message=f"[{record.video_id}] property proposal 시작",
+                video_id=record.video_id)
+            try:
+                proposals = tuple(self.proposal_policy.propose(proposal_context))
+            except Exception as exc:
+                emit_stage(
+                    stage_logger, event="ERROR", stage="property_proposal",
+                    message=f"[{record.video_id}] property proposal 실패",
+                    video_id=record.video_id, error_type=type(exc).__name__,
+                    error=str(exc))
+                raise
+            emit_stage(
+                stage_logger, event="END", stage="property_proposal",
+                message=f"[{record.video_id}] property proposal 끝",
+                video_id=record.video_id, proposal_count=len(proposals),
+                proposals=tuple({
+                    "candidate_property_id": item.candidate_property_id,
+                    "suggested_property_id": item.suggested_property_id,
+                    "property_text": item.property_text,
+                } for item in proposals))
             proposal_record = VideoPropertyProposalRecord(
                 video_id=record.video_id, baseline_run_id=run_id,
                 baseline_qa_ids=record.question_ids, proposals=proposals,
@@ -511,12 +581,36 @@ class BaselinePhaseRunner:
             video_retrieval_paths: tuple[str, ...] = ()
             retrieval_manifest_path: str | None = None
             if self.property_retrieval_runner is not None:
-                retrieval_result = self.property_retrieval_runner.run(
-                    sample=dict(samples[0]), proposals=proposals,
-                    output_dir=os.path.join(
-                        output_dir, "property_retrieval", record.video_id))
+                emit_stage(
+                    stage_logger, event="START", stage="similarity_retrieval",
+                    message=f"[{record.video_id}] similarity 측정 시작",
+                    video_id=record.video_id, proposal_count=len(proposals))
+                try:
+                    retrieval_result = self.property_retrieval_runner.run(
+                        sample=dict(samples[0]), proposals=proposals,
+                        output_dir=os.path.join(
+                            output_dir, "property_retrieval", record.video_id))
+                except Exception as exc:
+                    emit_stage(
+                        stage_logger, event="ERROR",
+                        stage="similarity_retrieval",
+                        message=f"[{record.video_id}] similarity 측정 실패",
+                        video_id=record.video_id,
+                        error_type=type(exc).__name__, error=str(exc))
+                    raise
                 video_retrieval_paths = retrieval_result.retrieval_artifact_paths
                 retrieval_manifest_path = retrieval_result.manifest_path
+                retrieval_summaries = tuple({
+                    "candidate_property_id": row.get("candidate_property_id"),
+                    "selected_segments": tuple(row.get("s_sim") or ()),
+                } for row in (
+                    _read_json(path) for path in video_retrieval_paths))
+                emit_stage(
+                    stage_logger, event="END", stage="similarity_retrieval",
+                    message=f"[{record.video_id}] similarity 측정 끝",
+                    video_id=record.video_id,
+                    retrieval_count=len(video_retrieval_paths),
+                    results=retrieval_summaries)
             complete = {
                 "video_id": record.video_id,
                 "video_fingerprint": video_fingerprint,

@@ -70,7 +70,7 @@ Checkpoint 3B artifacts:
 │   └── completed.json
 └── property_retrieval/<video_id>/
     ├── manifest.json
-    └── <candidate_property_id>/retrieval.json
+    └── <opaque_candidate_property_id>/retrieval.json
 ```
 
 An exact completed proposal skips the optimization-LLM provider. An exact
@@ -84,7 +84,7 @@ artifact per candidate. Its artifact layout is:
 ```text
 <iteration>/property_interventions/<video_id>/
 ├── manifest.json
-└── <candidate_property_id>_p<property_text_hash>/
+└── <opaque_candidate_property_id>_p<property_text_hash>/
     ├── work_item.json
     ├── composed_prompts.jsonl
     ├── frozen_histories.jsonl
@@ -140,7 +140,7 @@ quality and resize ladder is exhausted while it remains over the byte limit.
 ```text
 <iteration>/property_feedback/
 ├── manifest.json
-└── <video_id>/<candidate_property_id>_p<property_text_hash>/
+└── <video_id>/<opaque_candidate_property_id>_p<property_text_hash>/
     ├── input_identity.json
     ├── qa/<question_id>/
     │   ├── request.json
@@ -626,6 +626,16 @@ intervention correctness-flip feedback using Checkpoint 3D
 legacy alias; completed top-level bounded-smoke manifests retain their normal
 exact-resume behavior.
 
+`multi_property_proposer_v5` separates naming from identity. The model returns
+`suggested_property_id`; the parser preserves it only as a readable hint and
+derives `candidate_<20 hex characters>` under
+`opaque_candidate_proposal_id_v1`. That opaque handle is used in retrieval,
+intervention, feedback, memory, and updater artifact paths. The same frozen
+proposal resumes to the same handle, while identical suggestions from distinct
+videos remain distinct. The codebook updater, not the proposer, determines the
+eventual active property ID. Start a fresh output/state root for v5; old
+completed proposal artifacts are not reinterpreted.
+
 `flip_only_property_feedback_v2` carries the proposal `coverage_hints` into
 the bounded feedback request and aggregate artifact as context and lineage.
 They do not populate `covered_by_property_ids`; only the post-intervention
@@ -757,6 +767,9 @@ CLI selection and scheduling:
   `--num-videos` is also supplied, the count must agree;
 - `--max-parallel-videos P`: deterministic video-wave width;
 - `--gpus 4,5,6,7`: unique iteration-scoped persistent worker set;
+- `--embedding-gpu 3`: optional dedicated SigLIP GPU, which must be available,
+  free, and disjoint from `--gpus`; a spawned child exposes physical GPU 3 as
+  its private logical `cuda:0`; omission preserves CPU embedding;
 - `--selection-seed`: deterministic initial rotation offset, default zero;
 - `--dry-run-plan`: save selection, waves, identities, paths, and expected
   stages with zero model calls.
@@ -774,6 +787,7 @@ conda run --no-capture-output -n local_llm_vllm \
   --dry-run-plan \
   --iteration-id phase4-memory-pilot-k3-plan \
   --num-videos 3 --max-parallel-videos 3 --gpus 4,5,6,7 \
+  --embedding-gpu 3 \
   --output-dir runs/phase4_memory_pilot_k3_plan_output \
   --state-dir runs/phase4_memory_pilot_k3_plan_state \
   --cache-dir runs/phase4_memory_pilot_k3_plan_cache
@@ -787,6 +801,7 @@ conda run --no-capture-output -n local_llm_vllm \
   scripts/run_phase4_memory_iteration.py \
   --iteration-id phase4-memory-pilot-k3-iteration-001 \
   --num-videos 3 --max-parallel-videos 3 --gpus 4,5,6,7 \
+  --embedding-gpu 3 \
   --output-dir runs/phase4_memory_pilot_k3_output \
   --state-dir runs/phase4_memory_pilot_k3_state \
   --cache-dir runs/phase4_memory_pilot_k3_cache
@@ -800,6 +815,7 @@ conda run --no-capture-output -n local_llm_vllm \
   scripts/run_phase4_memory_iteration.py \
   --iteration-id phase4-memory-pilot-k5-iteration-001 \
   --num-videos 5 --max-parallel-videos 4 --gpus 4,5,6,7 \
+  --embedding-gpu 3 \
   --output-dir runs/phase4_memory_pilot_k5_output \
   --state-dir runs/phase4_memory_pilot_k5_state \
   --cache-dir runs/phase4_memory_pilot_k5_cache
@@ -813,6 +829,7 @@ conda run --no-capture-output -n local_llm_vllm \
   scripts/run_phase4_memory_iteration.py \
   --iteration-id phase4-memory-full-k8-iteration-001 \
   --num-videos 8 --max-parallel-videos 4 --gpus 4,5,6,7 \
+  --embedding-gpu 3 \
   --output-dir runs/phase4_memory_full_k8_output \
   --state-dir runs/phase4_memory_full_k8_state \
   --cache-dir runs/phase4_memory_full_k8_cache
@@ -833,6 +850,7 @@ Artifacts:
 <output_dir>/
 ├── iteration_identity.json
 ├── iteration_plan.json
+├── iteration.log                           # human-readable live stage timeline
 ├── startup_models.json                  # real run only
 ├── baseline_videos/<video_id>/
 ├── baseline_batch_manifest.json
@@ -850,10 +868,25 @@ Artifacts:
 └── production_selection/current.json
 ```
 
-The worker cleanup artifact is written from `finally` on success, failure,
-interruption, and completed resume. Router/update failure cannot create the
+The `production_worker_cleanup_v2` artifact is written from `finally` on
+success, failure, interruption, and completed resume. It records the SigLIP
+child PID and release state as well as Qwen workers. Router/update failure cannot create the
 top-level completed manifest or a codebook-only policy pair. Raw stage
 artifacts remain in place for diagnosis and exact stage resume.
+
+Follow a live production iteration with:
+
+```bash
+tail -f runs/phase4_memory_k4_isolated_001_output/iteration.log
+```
+
+Each line has timestamp, event (`START`, `END`, `ERROR`, `RESUME`, or `PLAN`),
+stage, a readable Korean message, and compact JSON details. In particular,
+look for `N번 iter 시작`, `video <ids> 병렬화 시작`, and paired boundaries for
+`property_proposal`, `similarity_retrieval`, `intervention_recaption`,
+`candidate_qa`, `memory_update`, `codebook_update`, and `router_update`.
+The file is operational telemetry and may append on exact resume; use the
+referenced immutable JSON/JSONL artifacts for scientific analysis.
 
 All new QA runs deterministically execute DVD `clip_search_tool` with
 `top_k=16`. This is `DVD_CLIP_SEARCH_TOP_K`, not
@@ -1042,6 +1075,40 @@ At minimum locate:
 
 ## 8. Resume and recovery
 
+Caption caches produced under `history_aware_caption_cache_v1` remain
+immutable legacy completed artifacts. `caption_output_contract_v2` and
+`caption_parse_result_v2` use a distinct cache/resume identity; do not copy a
+v1 `caption.json` into a v2 cache directory or edit its `parsed` field. Exact
+resume is supported only when the output-contract and parser versions match.
+
+The current Qwen default is:
+
+```bash
+export SR_CAPTION_SUBJECT_REGISTRY_MODE=empty
+```
+
+For a later caption model that reliably emits the full registry, start a fresh
+compatible run with:
+
+```bash
+export SR_CAPTION_SUBJECT_REGISTRY_MODE=optional
+```
+
+The mode is part of cache/resume identity. Changing it cannot resume or
+reinterpret captions generated under the other mode.
+
+For a v2 caption, inspect the untouched response and parser action together:
+
+```bash
+find runs -path '*/history_v1/*/caption.json' -type f -print0 \
+  | xargs -0 -n1 jq '{raw_output, parse_result, parsed}'
+```
+
+Expected compatibility normalizations are
+`default_empty_subject_registry` and, for a single-object Qwen response,
+`unwrap_singleton_object_array`. `invalid_top_level_array`, `invalid_json`, or
+`missing_clip_description` is a real caption execution failure.
+
 The top-level resume key hashes the parent confirmed checkpoint, current and
 confirmed component snapshots, coverage state, train roles, explicit execution
 identity, stage configuration identities, fixed-scaffold setting, and update
@@ -1076,6 +1143,11 @@ or fails closed before QA.
 
 A healthy run satisfies:
 
+- every new history-aware caption artifact reports
+  `history_aware_caption_cache_v2` and `caption_parse_result_v2`;
+- `clip_description` is non-empty while `subject_registry` may be `{}`;
+- populated registries from capable models are preserved;
+- singleton object arrays are audibly normalized rather than discarded;
 - current policy is frozen within an iteration;
 - each of the selected `K` batch videos has one complete incumbent caption view;
 - one video may generate multiple candidate properties;

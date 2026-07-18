@@ -157,6 +157,7 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
         property_retrieval_runner=retrieval_runner)
     bank, router, scaffold, contract = components()
     output = tmp_path / "iteration"
+    stage_events = []
     result = runner.run(
         roles=roles, coverage_state=initial_coverage(roles),
         sample_loader=samples.__getitem__, prompt_bank=bank,
@@ -164,7 +165,8 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
         scaffold_contract=contract, phase4_config=Phase4Config(),
         base_prompt_template="base", merge_prompt="merge",
         output_dir=str(output), parent_confirmed_checkpoint_id="confirmed_0",
-        history_block_size=2, source_revision="fixture")
+        history_block_size=2, source_revision="fixture",
+        stage_logger=lambda **event: stage_events.append(event))
 
     assert len(set(result.selected_video_ids)) == 3
     assert result.baseline_qa_count == 9
@@ -174,6 +176,14 @@ def test_baseline_materializes_three_videos_once_runs_nine_qas_and_resumes(tmp_p
     assert proposer.calls == list(result.selected_video_ids)
     assert [len(item[1]) for item in retrieval_runner.calls] == [0, 1, 2]
     assert len(result.property_retrieval_paths) == 3
+    stage_pairs = {(item["event"], item["stage"]) for item in stage_events}
+    assert stage_pairs >= {
+        ("START", "baseline_captioning"), ("END", "baseline_captioning"),
+        ("START", "baseline_qa"), ("END", "baseline_qa"),
+        ("START", "property_proposal"), ("END", "property_proposal"),
+        ("START", "similarity_retrieval"),
+        ("END", "similarity_retrieval"),
+    }
     assert [len(json.loads(Path(path).read_text())["proposals"])
             for path in result.property_proposal_paths] == [0, 1, 2]
     for path in result.video_manifest_paths:
