@@ -12,6 +12,7 @@ from surrogate_rollout.optimization.llm_codebook_updater import (
     LLMCodebookUpdaterConflictError,
     LLMCodebookUpdaterParseError,
     MemoryConditionedLLMCodebookUpdater,
+    deterministic_property_id,
     parse_updater_plan,
 )
 from surrogate_rollout.optimization.property_memory import CompactPropertyMemoryRunner
@@ -103,14 +104,17 @@ def memory_snapshot(tmp_path, *, candidates=None, properties=None, schema="prope
     })
 
 
-def effects_path(tmp_path, candidate_id="cp-new"):
+def effects_path(tmp_path, candidate_id="cp-new", *, effect="positive",
+                 transition_counts=None):
+    transition_counts = transition_counts or {
+        "wrong_to_correct": 1, "correct_to_wrong": 0,
+        "correct_to_correct": 2, "wrong_to_wrong": 0,
+        "runtime_failure": 0, "intervention_failure": 0}
     return write_jsonl(tmp_path / "effects.jsonl", ({
         "schema_version": "property_compact_summary_v1",
         "summary_id": f"effect-{candidate_id}", "kind": "intervention_effect",
         "candidate_property_id": candidate_id, "video_id": "v1",
-        "effect": "positive",
-        "transition_counts": {"wrong_to_correct": 1, "correct_to_wrong": 0,
-                              "correct_to_correct": 2, "wrong_to_wrong": 0},
+        "effect": effect, "transition_counts": transition_counts,
         "one_sentence_summary": "The intervention improved one QA.",
         "artifact_refs": [], "iteration_ordinal": 1,
     },))
@@ -120,7 +124,7 @@ def action(action_id, name, **overrides):
     value = {
         "action_id": action_id, "action": name,
         "target_property_ids": [], "candidate_ids": [],
-        "proposed_property_id": None, "proposed_property_text": None,
+        "proposed_property_text": None,
         "reasoning": "Conservative bounded-memory decision.",
         "supporting_memory_example_ids": [], "supporting_evidence_ids": [],
         "behaviors_to_preserve": [], "confidence": 0.8,
@@ -164,14 +168,16 @@ class SequenceProvider:
                 "real_model": False}
 
 
-def run_updater(tmp_path, actions, *, candidates=None, properties=None, output="updater"):
+def run_updater(tmp_path, actions, *, candidates=None, properties=None, output="updater",
+                effect="positive", transition_counts=None):
     provider = MockProvider(actions)
     updater = MemoryConditionedLLMCodebookUpdater(response_provider=provider)
     result = updater.run(
         iteration_id="iteration-1", prompt_bank=bank(),
         property_memory_snapshot_path=memory_snapshot(
             tmp_path, candidates=candidates, properties=properties),
-        intervention_summary_path=effects_path(tmp_path),
+        intervention_summary_path=effects_path(
+            tmp_path, effect=effect, transition_counts=transition_counts),
         output_dir=str(tmp_path / output))
     return result, provider
 
@@ -244,18 +250,20 @@ def test_partial_retry_resume_does_not_repeat_completed_provider_call(tmp_path):
 def test_supported_add_and_promotion_after_validation(tmp_path):
     add = action(
         "add-1", "add", candidate_ids=["cp-new"],
-        proposed_property_id="pe_memory_new",
         proposed_property_text="Track reusable object completion states precisely.",
         supporting_memory_example_ids=["candidate-positive"],
         supporting_evidence_ids=["effect-cp-new"])
     result, provider = run_updater(
         tmp_path, [add], candidates=[candidate_memory()])
     output = candidate_bank(result)
-    assert output.entry("pe_memory_new").status == "active"
-    assert output.entry("pe_memory_new").applicability_traits[
+    property_id = deterministic_property_id(
+        "cp-new", add["proposed_property_text"])
+    assert property_id.startswith("pe_") and len(property_id) == 23
+    assert output.entry(property_id).status == "active"
+    assert output.entry(property_id).applicability_traits[
         "required_modalities"] == ("frames",)
     mapping = json.loads(Path(result["artifacts"]["property_id_mapping"]).read_text())
-    assert mapping["candidate_promotions"] == {"cp-new": "pe_memory_new"}
+    assert mapping["candidate_promotions"] == {"cp-new": property_id}
     promoted = json.loads(Path(
         result["artifacts"]["promoted_property_memory"]).read_text())
     candidate = next(item for item in promoted["candidates"]
@@ -266,32 +274,40 @@ def test_supported_add_and_promotion_after_validation(tmp_path):
     assert provider.calls[0][1]["candidate_memories"][0]["failure_analysis"] == (
         "The generated description omitted completion.")
     assert provider.calls[0][1]["schema_version"] == \
-        "memory_codebook_updater_request_v2"
+        "memory_codebook_updater_request_v4"
+    assert "proposed_property_id" not in provider.calls[0][1][
+        "output_schema"]["actions"][0]
 
 
-def test_unsupported_add_is_rejected_and_candidate_stays_separate(tmp_path):
+def test_add_without_correctness_flip_or_positive_label_is_structurally_allowed(tmp_path):
     add = action(
         "add-unsupported", "add", candidate_ids=["cp-new"],
-        proposed_property_id="pe_unsupported",
         proposed_property_text="Track reusable object completion states precisely.",
         supporting_memory_example_ids=["candidate-none"],
         supporting_evidence_ids=["effect-cp-new"])
     result, _ = run_updater(
-        tmp_path, [add], candidates=[candidate_memory(positive=False)])
-    assert candidate_bank(result).bank_version == bank().bank_version
+        tmp_path, [add], candidates=[candidate_memory(positive=False)],
+        effect="no_effect", transition_counts={
+            "wrong_to_correct": 0, "correct_to_wrong": 0,
+            "correct_to_correct": 3, "wrong_to_wrong": 0,
+            "runtime_failure": 0, "intervention_failure": 0})
+    property_id = deterministic_property_id(
+        "cp-new", add["proposed_property_text"])
+    assert candidate_bank(result).entry(property_id).status == "active"
     report = json.loads(Path(result["artifacts"]["validation_report"]).read_text())
-    assert "add lacks positive intervention support" in \
-        report["rejected_actions"][0]["reasons"]
+    assert report["status"] == "valid"
+    assert report["rejected_actions"] == []
+    assert report["non_blocking_warnings"]
     promoted = json.loads(Path(
         result["artifacts"]["promoted_property_memory"]).read_text())
-    assert promoted["candidates"][0]["status"] == "candidate"
+    assert promoted["candidates"][0]["status"] == "promoted"
 
 
 def test_revise_preserves_identity_and_positive_behavior(tmp_path):
     source = bank().entry("pe_temporal")
     revise = action(
         "revise-1", "revise", target_property_ids=["pe_temporal"],
-        candidate_ids=["cp-new"], proposed_property_id="pe_temporal",
+        candidate_ids=["cp-new"],
         proposed_property_text=(
             "Preserve temporal order and explicit action completion states."),
         supporting_memory_example_ids=["pos-pe_temporal", "candidate-positive"],
@@ -312,7 +328,7 @@ def test_merge_aliases_and_complete_old_id_mapping(tmp_path):
     merge = action(
         "merge-1", "merge",
         target_property_ids=["pe_default", "pe_temporal"],
-        candidate_ids=["cp-new"], proposed_property_id="pe_default",
+        candidate_ids=["cp-new"],
         proposed_property_text=(
             "Describe visually supported events while preserving temporal order."),
         supporting_memory_example_ids=["pos-pe_default", "pos-pe_temporal",
@@ -331,7 +347,84 @@ def test_merge_aliases_and_complete_old_id_mapping(tmp_path):
         "pe_text": "pe_text"}
 
 
-def test_insufficient_retire_rejected_and_noop_is_conservative(tmp_path):
+def test_revise_and_merge_do_not_require_token_overlap(tmp_path):
+    revise = action(
+        "revise-no-overlap", "revise", target_property_ids=["pe_temporal"],
+        candidate_ids=["cp-new"],
+        proposed_property_text="Record causally linked scene developments succinctly.",
+        supporting_memory_example_ids=["candidate-none"],
+        supporting_evidence_ids=["effect-cp-new"])
+    revised, _ = run_updater(
+        tmp_path / "revise", [revise], candidates=[candidate_memory(positive=False)],
+        effect="no_effect", transition_counts={
+            "wrong_to_correct": 0, "correct_to_wrong": 0,
+            "correct_to_correct": 3, "wrong_to_wrong": 0,
+            "runtime_failure": 0, "intervention_failure": 0})
+    assert candidate_bank(revised).entry("pe_temporal").prompt_text == \
+        revise["proposed_property_text"]
+
+    merge = action(
+        "merge-no-overlap", "merge",
+        target_property_ids=["pe_default", "pe_temporal"],
+        proposed_property_text="Summarize grounded scene developments concisely.",
+        supporting_memory_example_ids=["pos-pe_default"])
+    merged, _ = run_updater(tmp_path / "merge", [merge])
+    assert candidate_bank(merged).entry("pe_temporal").status == "retired"
+
+
+def test_unknown_references_and_conflicting_mutations_are_structurally_rejected(tmp_path):
+    actions = [
+        action("unknown-property", "retire", target_property_ids=["pe_missing"],
+               supporting_evidence_ids=["effect-cp-new"]),
+        action("unknown-evidence", "retire", target_property_ids=["pe_text"],
+               supporting_evidence_ids=["missing-effect"]),
+        action("revise", "revise", target_property_ids=["pe_temporal"],
+               proposed_property_text="Record ordered scene developments clearly.",
+               supporting_evidence_ids=["effect-cp-new"]),
+        action("conflict", "retire", target_property_ids=["pe_temporal"],
+               supporting_evidence_ids=["effect-cp-new"]),
+    ]
+    result, _ = run_updater(tmp_path, actions)
+    report = json.loads(Path(result["artifacts"]["validation_report"]).read_text())
+    assert report["status"] == "invalid_with_structural_errors"
+    reasons = {row["action_id"]: row["reasons"]
+               for row in report["structural_errors"]}
+    assert any("unknown or inactive" in reason
+               for reason in reasons["unknown-property"])
+    assert any("unknown compact evidence" in reason
+               for reason in reasons["unknown-evidence"])
+    assert any("conflicts" in reason for reason in reasons["conflict"])
+
+
+def test_runtime_failure_evidence_is_visible_but_not_semantically_gated(tmp_path):
+    candidate = candidate_memory(positive=False)
+    candidate["no_effect_examples"] = []
+    candidate["failure_examples"] = [example(
+        "runtime-only", effect="unavailable")]
+    revise = action(
+        "runtime-cited", "revise", target_property_ids=["pe_temporal"],
+        candidate_ids=["cp-new"],
+        proposed_property_text="Describe ordered visible developments compactly.",
+        supporting_memory_example_ids=["runtime-only"],
+        supporting_evidence_ids=["effect-cp-new"])
+    result, provider = run_updater(
+        tmp_path, [revise], candidates=[candidate], effect="unavailable",
+        transition_counts={
+            "wrong_to_correct": 0, "correct_to_wrong": 0,
+            "correct_to_correct": 0, "wrong_to_wrong": 0,
+            "runtime_failure": 3, "intervention_failure": 0})
+    loaded = json.loads(Path(
+        result["artifacts"]["validation_report"]).read_text())
+    assert loaded["accepted_action_ids"] == ["runtime-cited"]
+    assert provider.calls[0][1]["evidence_status_contract"][
+        "reliability_only"] == ["runtime_failure", "intervention_failure"]
+    for name in ("llm_proposed_plan", "structural_validation_result",
+                 "structural_errors", "non_blocking_warnings",
+                 "final_applied_plan"):
+        assert Path(result["artifacts"][name]).exists()
+
+
+def test_single_harmful_example_retire_is_structurally_allowed(tmp_path):
     source = bank().entry("pe_default")
     properties = [property_memory(entry.prompt_id, entry.prompt_text)
                   for entry in bank().entries]
@@ -346,11 +439,13 @@ def test_insufficient_retire_rejected_and_noop_is_conservative(tmp_path):
     result, _ = run_updater(
         tmp_path, [retire, noop], candidates=[candidate_memory(positive=False)],
         properties=properties)
-    assert candidate_bank(result).entry("pe_default").status == "active"
+    assert candidate_bank(result).entry("pe_default").status == "retired"
     report = json.loads(Path(result["artifacts"]["validation_report"]).read_text())
-    assert report["accepted_action_ids"] == ["noop-1"]
-    assert "retire lacks harmful support across distinct videos or iterations" in \
-        report["rejected_actions"][0]["reasons"]
+    assert report["accepted_action_ids"] == ["retire-1", "noop-1"]
+    assert report["rejected_actions"] == []
+    assert any("fewer than two" in warning
+               for row in report["non_blocking_warnings"]
+               for warning in row["warnings"])
 
 
 def test_exact_resume_and_incompatible_memory_fail_closed(tmp_path):
@@ -448,7 +543,6 @@ def orchestration_raw_artifacts(tmp_path, *, with_candidate=True):
 def test_orchestrator_automatically_feeds_memory_snapshot_to_updater(tmp_path):
     add = action(
         "add-1", "add", candidate_ids=["cp-new"],
-        proposed_property_id="pe_memory_new",
         proposed_property_text="Track reusable object completion states precisely.",
         supporting_memory_example_ids=[], supporting_evidence_ids=[])
     # Fill IDs after inspecting the automatically generated bounded artifacts.
@@ -521,4 +615,4 @@ def test_zero_proposal_checkpoint_and_legacy_deterministic_constructor_compatibl
         require_real_models=False)
     assert legacy.property_memory_runner is None
     assert legacy.llm_codebook_updater is None
-    assert SYSTEM_PROMPT_VERSION == "memory_codebook_updater_prompt_v1"
+    assert SYSTEM_PROMPT_VERSION == "memory_codebook_updater_prompt_v3_deterministic_ids"

@@ -235,6 +235,25 @@ class FakeQA:
             errors=[], latency_seconds=0.01)
 
 
+class RuntimeFailureQA(FakeQA):
+    def __call__(self, **kwargs):
+        if kwargs["question_id"] != "q2":
+            return super().__call__(**kwargs)
+        captions = json.loads(Path(kwargs["captions_path"]).read_text())
+        candidate_id = next(
+            value["caption"].split()[2] for key, value in captions.items()
+            if key in SEGMENTS and "candidate caption" in value["caption"])
+        self.calls.append((candidate_id, "q2"))
+        run_dir = Path(kwargs["run_dir"])
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "trajectory.jsonl").write_text("{}\n")
+        (run_dir / "result.json").write_text("{}")
+        return SimpleNamespace(
+            score=0.0, prediction=None, ground_truth="A",
+            references=ReferenceSets(consumed_segments={"0_10"}),
+            errors=["provider timeout"], latency_seconds=0.01)
+
+
 def clip_index(sample, video_id):
     assert video_id == "video-1"
     return [(segment_id, {
@@ -362,7 +381,7 @@ def test_independent_selected_only_interventions_history_mixed_view_and_resume(t
     }
 
     transitions_a = json.loads(Path(result.results[0].transitions_path).read_text())
-    assert transitions_a["schema_version"] == "property_intervention_transitions_v2"
+    assert transitions_a["schema_version"] == "property_intervention_transitions_v3"
     assert transitions_a["original_proposal"]["property_text"] == a.property_text
     assert transitions_a["source_question_ids"] == ["q1"]
     assert transitions_a["source_qa_baseline_correct"] is False
@@ -371,11 +390,13 @@ def test_independent_selected_only_interventions_history_mixed_view_and_resume(t
                and "transition" in row for row in transitions_a["qas"])
     assert transitions_a["transition_counts"] == {
         "correct_to_correct": 0, "correct_to_wrong": 1,
-        "wrong_to_correct": 1, "wrong_to_wrong": 1}
+        "wrong_to_correct": 1, "wrong_to_wrong": 1,
+        "runtime_failure": 0}
     transitions_b = json.loads(Path(result.results[1].transitions_path).read_text())
     assert transitions_b["transition_counts"] == {
         "correct_to_correct": 1, "correct_to_wrong": 0,
-        "wrong_to_correct": 1, "wrong_to_wrong": 1}
+        "wrong_to_correct": 1, "wrong_to_wrong": 1,
+        "runtime_failure": 0}
 
     caption_calls = len(captioner.calls)
     qa_calls = len(qa.calls)
@@ -394,6 +415,39 @@ def test_independent_selected_only_interventions_history_mixed_view_and_resume(t
     assert any(item["event"] == "RESUME" and
                item["stage"] == "intervention_recaption"
                for item in stage_events)
+
+
+def test_candidate_runtime_failure_is_not_an_answer_transition(tmp_path):
+    baseline_path, _ = baseline_fixture(tmp_path)
+    item = proposal("cp_a", "Track fine-grained actions precisely.")
+    retrieval_path = retrieval_fixture(tmp_path, item, ("0_10",))
+    qa = RuntimeFailureQA()
+    runner = PropertyInterventionBatchRunner(
+        segment_captioner=FakeSegmentCaptioner(), qa_fn=qa,
+        clip_index_fn=clip_index,
+        mixed_view_builder=MixedViewBuilder(merge_fn=lambda values: values),
+        caption_cache_root=str(tmp_path / "cache"),
+        caption_cache_manifest_path=str(tmp_path / "cache_manifest.jsonl"))
+    bank, router, scaffold, contract = components()
+
+    result = runner.run(
+        iteration_id="iteration-runtime", baseline_video_manifest_path=baseline_path,
+        proposals=(item,), retrieval_artifact_paths=(retrieval_path,),
+        sample_loader=sample_loader, prompt_bank=bank, router_policy=router,
+        scaffold_policy=scaffold, scaffold_contract=contract,
+        base_prompt_template=BASE_PROMPT, merge_prompt="merge",
+        output_dir=str(tmp_path / "interventions"))
+
+    transitions = json.loads(Path(result.results[0].transitions_path).read_text())
+    assert transitions["transition_counts"] == {
+        "correct_to_correct": 0, "correct_to_wrong": 0,
+        "wrong_to_correct": 1, "wrong_to_wrong": 1,
+        "runtime_failure": 1,
+    }
+    failed = next(row for row in transitions["qas"] if row["question_id"] == "q2")
+    assert failed["runtime_valid"] is False
+    assert failed["candidate_correct"] is None
+    assert failed["transition"] == "runtime_failure"
 
 
 def test_changed_property_or_parent_baseline_fails_closed(tmp_path):

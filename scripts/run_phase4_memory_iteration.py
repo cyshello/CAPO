@@ -30,6 +30,7 @@ from surrogate_rollout.optimization.production_iteration import (
     ProductionIterationError,
     resolve_video_selection,
 )
+from surrogate_rollout.optimization.stage_logging import IterationStageLogger
 from surrogate_rollout.optimization.train_roles import (
     EvidenceCoverageState, derive_train_roles,
 )
@@ -557,9 +558,9 @@ def main() -> None:
             DVD_EMBEDDER_PRELOAD_POLICY_VERSION,
         "dvd_qa_concurrency_policy_version":
             DVD_QA_CONCURRENCY_POLICY_VERSION,
-        "codebook_updater_prompt_version": "memory_codebook_updater_prompt_v1",
-        "router_updater_prompt_version": "memory_router_updater_prompt_v1",
-        "structured_router_policy_version": "structured_router_policy_v1",
+        "codebook_updater_prompt_version": "memory_codebook_updater_prompt_v3_deterministic_ids",
+        "router_updater_prompt_version": "memory_router_updater_prompt_v2_semantic_llm",
+        "structured_router_policy_version": "structured_router_policy_v2_total_examples",
         "rendered_router_prompt_version": "rendered_router_prompt_v1",
     }
     runtime = None
@@ -639,6 +640,12 @@ def main() -> None:
             print(result.manifest_path, flush=True)
     finally:
         if not args.dry_run_plan:
+            cleanup_log = IterationStageLogger(
+                os.path.join(os.path.abspath(args.output_dir), "iteration.log"))
+            cleanup_log.emit(
+                event="START", stage="worker_cleanup",
+                message="iteration model worker 및 embedding process 종료 시작",
+                gpu_ids=gpus, embedding_gpu=args.embedding_gpu)
             embedding_model_closed = args.embedding_gpu is None
             embedding_worker_pid = None
             embedding_worker_released = args.embedding_gpu is None
@@ -665,12 +672,23 @@ def main() -> None:
                     embedding_worker_released = all(
                         bool(item["released"]) for item in orphan_records)
                     embedding_model_closed = embedding_worker_released
-                _write_cleanup(
-                    args.output_dir, history_builder, gpus, calls=calls,
-                    embedding_gpu=args.embedding_gpu,
-                    embedding_model_closed=embedding_model_closed,
-                    embedding_worker_pid=embedding_worker_pid,
-                    embedding_worker_released=embedding_worker_released)
+                try:
+                    _write_cleanup(
+                        args.output_dir, history_builder, gpus, calls=calls,
+                        embedding_gpu=args.embedding_gpu,
+                        embedding_model_closed=embedding_model_closed,
+                        embedding_worker_pid=embedding_worker_pid,
+                        embedding_worker_released=embedding_worker_released)
+                except BaseException as exc:
+                    cleanup_log.emit(
+                        event="ERROR", stage="worker_cleanup",
+                        message="iteration process 종료 실패",
+                        error_type=type(exc).__name__, error=str(exc))
+                    raise
+                cleanup_log.emit(
+                    event="END", stage="worker_cleanup",
+                    message="모든 iteration process 종료 완료; launcher exit",
+                    gpu_ids=gpus, embedding_gpu=args.embedding_gpu)
 
 
 if __name__ == "__main__":

@@ -44,13 +44,20 @@ from surrogate_rollout.prompt_routing.schemas import (
     dumps_canonical,
 )
 from surrogate_rollout.schemas import sha256_text
+from .qwen25_vl import (
+    VLLM_MM_CACHE_POLICY_VERSION,
+    VLLM_MM_PROCESSOR_CACHE_GB,
+    VLLM_PREFIX_CACHING_ENABLED,
+)
 
 
 HISTORY_SCHEMA_VERSION = "frozen_local_caption_history_v1"
 DEFAULT_HISTORY_BLOCK_SECONDS = 300.0
 DEFAULT_MAX_HISTORY_CAPTIONS = 30
 PARALLEL_GROUP_SCHEDULER_VERSION = "history_block_gpu_scheduler_v1"
-LOCAL_QWEN_BACKEND_ID = "captioning.qwen25_vl.Qwen25VLCaptioner"
+LOCAL_QWEN_BACKEND_ID = (
+    "captioning.qwen25_vl.Qwen25VLCaptioner:"
+    + VLLM_MM_CACHE_POLICY_VERSION)
 CAPTION_OUTPUT_CONTRACT_VERSION = "caption_output_contract_v2"
 CAPTION_PARSE_SCHEMA_VERSION = "caption_parse_result_v2"
 CAPTION_PARSE_NORMALIZATION_VERSION = (
@@ -469,6 +476,10 @@ class HistoryAwareSegmentCaptioner:
             "caption_retry_policy_version": CAPTION_RETRY_POLICY_VERSION,
             "caption_parse_max_retries": config.CAPTION_PARSE_MAX_RETRIES,
             "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
+            "vllm_multimodal_cache_policy_version":
+                VLLM_MM_CACHE_POLICY_VERSION,
+            "vllm_mm_processor_cache_gb": VLLM_MM_PROCESSOR_CACHE_GB,
+            "vllm_enable_prefix_caching": VLLM_PREFIX_CACHING_ENABLED,
             "real_model": True,
         }
 
@@ -1444,21 +1455,44 @@ class HistoryAwareBaselineCaptionViewBuilder:
             cleanup_error = f"{type(exc).__name__}: {exc}"
         finally:
             with self._pool_lock:
-                for process in self._pool_processes.values():
+                processes = tuple(self._pool_processes.values())
+                command_queues = tuple(self._pool_command_queues.values())
+                result_queue = self._pool_result_queue
+                for process in processes:
                     process.join(timeout=30.0)
                     if process.is_alive():
                         process.terminate()
                         process.join(timeout=10.0)
-                self._pool_processes.clear()
-                self._pool_command_queues.clear()
-                if self._pool_result_queue is not None:
-                    self._pool_result_queue.put({"request_id": "__parent_stop__"})
+                if result_queue is not None:
+                    result_queue.put({"request_id": "__parent_stop__"})
                 if self._pool_result_thread is not None:
                     self._pool_result_thread.join(timeout=5.0)
+                    if self._pool_result_thread.is_alive():
+                        message = "result-router thread did not stop"
+                        cleanup_error = (
+                            f"{cleanup_error}; {message}" if cleanup_error else message)
+                # multiprocessing.Queue owns non-daemon feeder resources. Explicitly
+                # close and join them so interpreter exit never waits on an implicit
+                # queue finalizer after the scientific iteration has completed.
+                for channel in (*command_queues, result_queue):
+                    if channel is None:
+                        continue
+                    try:
+                        channel.close()
+                        channel.join_thread()
+                    except BaseException as exc:
+                        message = f"queue cleanup {type(exc).__name__}: {exc}"
+                        cleanup_error = (
+                            f"{cleanup_error}; {message}" if cleanup_error else message)
+                self._pool_processes.clear()
+                self._pool_command_queues.clear()
                 self._pool_result_thread = None
                 self._pool_result_queue = None
                 self._pool_pending.clear()
                 self._restore_parent_vlm_proxy()
+                if self._pool_registered_with_atexit:
+                    atexit.unregister(self.close_worker_pool)
+                    self._pool_registered_with_atexit = False
         if cleanup_error:
             print(
                 "CAPTION_WORKER_CLEANUP_WARNING " + cleanup_error,

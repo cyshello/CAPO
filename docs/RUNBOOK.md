@@ -253,8 +253,8 @@ Artifact layout:
 <iteration>/compact_property_memory/
 ├── manifest.json                         # property_memory_manifest_v1
 ├── compact_summaries/
-│   ├── correct_qa_property_credit.jsonl  # property_compact_summary_v1
-│   └── intervention_effects.jsonl        # property_compact_summary_v1
+│   ├── correct_qa_property_credit.jsonl  # property_compact_summary_v3_runtime_validity
+│   └── intervention_effects.jsonl        # property_compact_summary_v3_runtime_validity
 └── property_memory/
     ├── snapshot.json                     # property_memory_v1 parent unit
     ├── selection_audit.json
@@ -321,7 +321,7 @@ Prompt:
 
 ```text
 optimization/prompts/codebook_updater_v1.txt
-memory_codebook_updater_prompt_v1
+memory_codebook_updater_prompt_v3_deterministic_ids
 ```
 
 Artifacts:
@@ -342,9 +342,14 @@ Artifacts:
     ├── attempts/attempt_NNN/{raw_response.txt,result.json}
     ├── raw_response.txt
     ├── parsed_plan.json
+    ├── llm_proposed_plan.json
     ├── validation_report.json
+    ├── structural_validation_result.json
     ├── rejected_actions.json
+    ├── structural_errors.json
+    ├── non_blocking_warnings.json
     ├── applied_plan.json
+    ├── final_applied_plan.json
     ├── candidate_codebook.json
     ├── property_id_mapping.json
     └── promoted_property_memory.json
@@ -356,7 +361,7 @@ Artifacts:
 
 ```json
 {
-  "schema_version": "property_id_mapping_v1",
+  "schema_version": "property_id_mapping_v2",
   "old_to_new_property_ids": {
     "unchanged_or_canonical_id": "same_or_canonical_id",
     "retired_id": null
@@ -422,9 +427,9 @@ Prompt and versions:
 
 ```text
 optimization/prompts/router_updater_v1.txt
-memory_router_updater_prompt_v1
-structured_router_policy_v1
-history_aware_router_prompt_renderer_v1
+memory_router_updater_prompt_v2_semantic_llm
+structured_router_policy_v2_total_examples
+history_aware_router_prompt_renderer_v2
 rendered_router_prompt_v1
 ```
 
@@ -445,9 +450,14 @@ Artifacts:
 │   ├── attempts/attempt_NNN/{raw_response.txt,result.json}
 │   ├── raw_response.txt
 │   ├── parsed_plan.json
+│   ├── llm_proposed_plan.json
 │   ├── validation_report.json
+│   ├── structural_validation_result.json
 │   ├── rejected_actions.json
+│   ├── structural_errors.json
+│   ├── non_blocking_warnings.json
 │   ├── applied_plan.json
+│   ├── final_applied_plan.json
 │   ├── structured_router_policy.json
 │   ├── rendered_router_prompt.json
 │   ├── rendered_router_prompt.txt
@@ -462,28 +472,39 @@ Artifacts:
 ```
 
 The updater accepts only bounded memory/effect IDs and targets active IDs in
-the candidate codebook. Selection guidance and positive examples require
-positive demonstrated effects; avoidance guidance and negative examples
-require negative demonstrated effects. The validator rejects stale IDs,
-unsupported examples, question/answer/gold/prediction/reasoning leakage,
-conflicting writes, retired guidance, mapping inconsistencies, protocol or
-selection-limit changes, and rendered-prompt hash mismatches.
+the candidate codebook. The LLM, not the validator, decides how evidence
+supports selection/avoidance guidance or either stored example label. The
+structural validator rejects stale IDs, unknown evidence, malformed or
+conflicting writes, exact duplicates, retired guidance, mapping
+inconsistencies, protocol or selection-limit changes, and rendered-prompt hash
+mismatches. Ordinary `question` or `answer` words and evidence polarity are not
+hard rejection rules.
 
 If both `routing_memory_examples` and
-`current_compact_routing_evidence` are empty, the updater uses
-`execution.mode=deterministic_empty_plan`, writes a strict zero-action raw and
-parsed plan, and does not call the router-update provider. Rendering, hashing,
-ID-space validation, and atomic pair persistence still run. Check
+`current_compact_routing_evidence` are empty, the default updater still calls
+the provider in `execution.mode=llm_provider_no_evidence`; the LLM should
+normally return an explicit empty plan. Constructing it with
+`skip_llm_when_no_evidence=True` enables the cost/legacy optimization
+`configured_empty_evidence_skip` with reason
+`explicit_skip_llm_when_no_evidence`. Rendering, hashing, ID-space validation,
+and atomic pair persistence still run in both modes. Check
 `llm_router_updater/execution.json` or the updater manifest fields
 `execution_mode`, `provider_called`, and `deterministic_reason`. An empty
-`target_property_id` is never accepted; with non-empty evidence it remains a
-strict parse failure.
+`target_property_id` is never accepted and remains a strict parse failure.
 
 The real router-updater provider uses its own strict response schema and the
 same maximum of three parse attempts. Parser failures are auditable in
 `response_attempts.json`; API/runtime failures stop immediately. Exact partial
-resume reuses persisted raw attempts. The no-routing-evidence branch remains
-deterministic, records `accepted_attempt_index=0`, and consumes zero calls.
+resume reuses persisted raw attempts. Only the explicit no-evidence
+optimization records `accepted_attempt_index=0` and consumes zero calls.
+
+Inspect `llm_proposed_plan.json` for the untouched LLM decision,
+`structural_validation_result.json` and `structural_errors.json` for blocking
+schema/reference/executability failures, `non_blocking_warnings.json` for audit
+hints that did not block application, and `final_applied_plan.json` for the
+exact applied actions. Runtime and intervention failures remain in the updater
+request as reliability-only evidence; they must not become `wrong_to_wrong` or
+harmful examples.
 
 The provisional pair references/hashes its parent pair, property memory,
 candidate codebook, complete ID mapping, structured policy, rendered prompt,
@@ -779,9 +800,9 @@ Versions are `multimodal_property_proposal_request_v9`,
 `multimodal_property_proposal_identity_v5`,
 `opaque_candidate_proposal_id_v3`, `multi_property_proposal_artifact_v5`, and
 `property_proposer_meta_prompt_v4`. Intervention provenance uses
-`property_intervention_transitions_v2` and `property_intervention_result_v2`;
-bounded updater provenance uses `property_compact_summary_v2` and
-`memory_codebook_updater_request_v2`. Start a fresh output/state directory for
+`property_intervention_transitions_v3` and `property_intervention_result_v3`;
+bounded updater provenance uses `property_compact_summary_v3_runtime_validity`
+and `memory_codebook_updater_request_v4`. Start a fresh output/state directory for
 v10. Compatible caption caches may be reused, but a completed v9 proposal artifact
 must not be reinterpreted or overwritten.
 
@@ -849,6 +870,21 @@ parent merges them into the configured caption manifest after all workers
 succeed. `routing_manifest.json` records the scheduler version, worker/GPU and
 block counts, and deterministic merge rule. GPU assignment is not part of the
 semantic caption-cache key.
+
+The current worker backend runs vLLM with:
+
+```text
+qwen25_vl_mm_cache_disabled_v1
+mm_processor_cache_gb=0
+enable_prefix_caching=False
+```
+
+Do not resume an incomplete run created before this policy using the same
+output/state roots. Its EngineCore may have died after the multimodal feature
+LRU diverged from the frontend metadata LRU, and already completed failed
+interventions remain immutable. Stop that process and launch the same video
+list with fresh output/state/cache roots. Reuse a completed caption cache only
+when its backend identity matches this policy.
 
 The first multi-GPU attempt on 2026-07-17 completed all 184 segment states but
 stalled before the parent merge because the parent joined one-build workers
@@ -1079,7 +1115,12 @@ Artifacts:
 
 The `production_worker_cleanup_v2` artifact is written from `finally` on
 success, failure, interruption, and completed resume. It records the SigLIP
-child PID and release state as well as Qwen workers. Router/update failure cannot create the
+child PID and release state as well as Qwen workers. After the scientific
+`[END] [iteration]` line, cleanup emits explicit `[START] [worker_cleanup]` and
+`[END] [worker_cleanup]` lines; only the latter means the launcher is ready to
+exit. Persistent-worker command/result queues are explicitly closed and their
+feeder threads joined, preventing interpreter shutdown from waiting on implicit
+multiprocessing queue finalizers. Router/update failure cannot create the
 top-level completed manifest or a codebook-only policy pair. Raw stage
 artifacts remain in place for diagnosis and exact stage resume.
 
@@ -1094,6 +1135,7 @@ stage, a readable Korean message, and compact JSON details. In particular,
 look for `N번 iter 시작`, `video <ids> 병렬화 시작`, and paired boundaries for
 `property_proposal`, `similarity_retrieval`, `intervention_recaption`,
 `candidate_qa`, `memory_update`, `codebook_update`, and `router_update`.
+For process completion, also require the final `worker_cleanup` END line.
 The file is operational telemetry and may append on exact resume; use the
 referenced immutable JSON/JSONL artifacts for scientific analysis.
 

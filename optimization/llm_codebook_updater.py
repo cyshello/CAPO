@@ -23,20 +23,21 @@ from surrogate_rollout.prompt_routing.validators import validate_prompt_bank
 from surrogate_rollout.schemas import sha256_json, sha256_text
 
 
-SYSTEM_PROMPT_VERSION = "memory_codebook_updater_prompt_v1"
-UPDATER_REQUEST_SCHEMA_VERSION = "memory_codebook_updater_request_v2"
-UPDATER_RESPONSE_SCHEMA_VERSION = "memory_codebook_updater_response_v1"
-VALIDATION_REPORT_SCHEMA_VERSION = "memory_codebook_validation_report_v1"
-APPLIED_PLAN_SCHEMA_VERSION = "memory_codebook_applied_plan_v1"
-CANDIDATE_CODEBOOK_SCHEMA_VERSION = "memory_candidate_codebook_v1"
-ID_MAPPING_SCHEMA_VERSION = "property_id_mapping_v1"
-CHECKPOINT_MANIFEST_SCHEMA_VERSION = "memory_codebook_checkpoint_manifest_v2"
+SYSTEM_PROMPT_VERSION = "memory_codebook_updater_prompt_v3_deterministic_ids"
+UPDATER_REQUEST_SCHEMA_VERSION = "memory_codebook_updater_request_v4"
+UPDATER_RESPONSE_SCHEMA_VERSION = "memory_codebook_updater_response_v2"
+VALIDATION_REPORT_SCHEMA_VERSION = "memory_codebook_structural_validation_v2"
+APPLIED_PLAN_SCHEMA_VERSION = "memory_codebook_applied_plan_v3"
+CANDIDATE_CODEBOOK_SCHEMA_VERSION = "memory_candidate_codebook_v2"
+ID_MAPPING_SCHEMA_VERSION = "property_id_mapping_v2"
+CHECKPOINT_MANIFEST_SCHEMA_VERSION = "memory_codebook_checkpoint_manifest_v4"
 UPDATER_INPUT_IDENTITY_SCHEMA_VERSION = "memory_codebook_updater_input_identity_v1"
 UPDATER_ATTEMPTS_SCHEMA_VERSION = "memory_codebook_updater_attempts_v1"
+ACTIVE_PROPERTY_ID_SCHEMA_VERSION = "deterministic_candidate_property_id_v1"
 ACTION_NAMES = ("add", "revise", "merge", "preserve", "retire", "no_op")
 ACTION_FIELDS = frozenset({
     "action_id", "action", "target_property_ids", "candidate_ids",
-    "proposed_property_id", "proposed_property_text", "reasoning",
+    "proposed_property_text", "reasoning",
     "supporting_memory_example_ids", "supporting_evidence_ids",
     "behaviors_to_preserve", "confidence",
 })
@@ -62,7 +63,6 @@ class CodebookUpdaterBounds:
     max_actions: int = 32
     max_reasoning_chars: int = 600
     max_behavior_chars: int = 300
-    min_retire_support_groups: int = 2
     max_parse_attempts: int = 3
 
     def __post_init__(self) -> None:
@@ -123,28 +123,35 @@ def _normalized(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
-def _tokens(value: str) -> frozenset[str]:
-    stop = {"a", "an", "and", "the", "to", "of", "or", "when", "only",
-            "describe", "preserve", "capture", "include", "visible", "visually"}
-    return frozenset(token for token in re.findall(r"[a-z0-9]+", value.casefold())
-                     if len(token) > 2 and token not in stop)
+def deterministic_property_id(candidate_id: str, property_text: str) -> str:
+    """Assign an opaque active ID without asking the semantic updater to name it."""
+    return "pe_" + sha256_json({
+        "schema_version": ACTIVE_PROPERTY_ID_SCHEMA_VERSION,
+        "candidate_id": str(candidate_id),
+        "normalized_property_text": " ".join(str(property_text).split()),
+    })[:20]
 
 
-def _text_rejection(text: str) -> str | None:
+def _text_rejection(
+    text: str, *, source_lineage_values: tuple[str, ...] = (),
+) -> str | None:
+    """Reject only text that is structurally unusable or memorizes lineage."""
     normalized = " ".join(str(text or "").split())
     if len(normalized) < 12 or len(normalized) > 300:
         return "property text must contain 12-300 normalized characters"
-    lowered = normalized.casefold()
-    forbidden = (
-        r"\bthis video\b", r"\bthe question\b", r"\bground[ -]?truth\b",
-        r"\bcorrect answer\b", r"\banswer (?:is|option)\b",
-        r"\boption\s+[a-z0-9]\b", r"\b\d{1,2}:\d{2}(?::\d{2})?\b",
-        r"\b\d+_\d+\b", r"\bvideo[-_ ]?id\b", r"\bquestion[-_ ]?id\b",
-)
+    if re.search(r"\{\{[^{}]+\}\}|\$\{[^{}]+\}|\[(?:placeholder|todo|tbd)\]",
+                 normalized, re.IGNORECASE) or normalized.casefold() in {
+                     "todo", "tbd", "placeholder", "property_text"}:
+        return "property text contains an unresolved placeholder"
+    for lineage in source_lineage_values:
+        lineage = " ".join(str(lineage or "").split())
+        if len(lineage) >= 3 and lineage.casefold() in normalized.casefold():
+            return "property text directly memorizes a source lineage identifier"
+    return None
 
 
 def _non_visual_knowledge_reason(text: str) -> str | None:
-    """Updater-only semantic guard; proposal generation intentionally defers it."""
+    """Return a non-blocking semantic warning for LLM/audit review."""
     lowered = text.casefold()
     direct = (
         r"\bnon[- ]visual (?:knowledge|information|context|facts?)\b",
@@ -158,15 +165,26 @@ def _non_visual_knowledge_reason(text: str) -> str | None:
     if any(re.search(pattern, lowered) for pattern in direct):
         return "requires non-visual or external/background/historical knowledge"
     return None
-    if any(re.search(pattern, lowered) for pattern in forbidden):
-        return "property text contains instance-specific lineage or answer language"
+
+
+def _text_warnings(text: str) -> tuple[str, ...]:
+    """Legacy semantic heuristics are audit warnings, never application gates."""
+    normalized = " ".join(str(text or "").split())
+    lowered = normalized.casefold()
+    warnings = []
+    if any(re.search(pattern, lowered) for pattern in (
+            r"\bthis video\b", r"\bthe question\b", r"\bground[ -]?truth\b",
+            r"\bcorrect answer\b", r"\banswer (?:is|option)\b",
+            r"\boption\s+[a-z0-9]\b", r"\b\d{1,2}:\d{2}(?::\d{2})?\b",
+            r"\b\d+_\d+\b")):
+        warnings.append("text may contain instance-specific or answer-oriented language")
     if re.search(r"\b(?:describe|capture|record|track|transcribe)\s+(?:the|a|an)\s+"
                  r"[a-z][a-z-]*['’]s\b", lowered):
-        return "property text contains a domain-specific possessive subject"
+        warnings.append("text may contain a domain-specific possessive subject")
     knowledge = _non_visual_knowledge_reason(normalized)
     if knowledge:
-        return knowledge
-    return None
+        warnings.append(knowledge)
+    return tuple(warnings)
 
 
 def _provider_identity(provider: Callable[..., str]) -> Mapping[str, Any]:
@@ -209,10 +227,11 @@ def parse_updater_plan(raw: str, *, max_actions: int) -> tuple[dict[str, Any], .
                     len(items) != len(set(items)):
                 raise LLMCodebookUpdaterParseError(
                     f"{field} must be a unique string array")
-        for field in ("proposed_property_id", "proposed_property_text"):
-            if action[field] is not None and (
-                    not isinstance(action[field], str) or not action[field]):
-                raise LLMCodebookUpdaterParseError(f"{field} must be null or string")
+        if action["proposed_property_text"] is not None and (
+                not isinstance(action["proposed_property_text"], str) or
+                not action["proposed_property_text"]):
+            raise LLMCodebookUpdaterParseError(
+                "proposed_property_text must be null or string")
         if not isinstance(action["reasoning"], str) or not action["reasoning"]:
             raise LLMCodebookUpdaterParseError("reasoning must be a non-empty string")
         confidence = action["confidence"]
@@ -224,7 +243,7 @@ def parse_updater_plan(raw: str, *, max_actions: int) -> tuple[dict[str, Any], .
 
 
 class MemoryConditionedLLMCodebookUpdater:
-    policy_version = "memory_conditioned_llm_codebook_updater_v3_strict_retry"
+    policy_version = "memory_conditioned_llm_codebook_updater_v5_deterministic_ids"
 
     def __init__(
         self, *, response_provider: Callable[[str, str], str],
@@ -305,26 +324,48 @@ class MemoryConditionedLLMCodebookUpdater:
         raw, actions, attempts_path = self._load_or_generate_plan(
             output_dir=output_dir, request=request)
         raw_path = _write_text_immutable(os.path.join(output_dir, "raw_response.txt"), raw)
-        parsed_path = _write_immutable(os.path.join(output_dir, "parsed_plan.json"), {
-            "schema_version": UPDATER_RESPONSE_SCHEMA_VERSION, "actions": actions})
-        validated, rejected = self._validate_actions(
+        proposed_plan = {
+            "schema_version": UPDATER_RESPONSE_SCHEMA_VERSION, "actions": actions}
+        parsed_path = _write_immutable(
+            os.path.join(output_dir, "parsed_plan.json"), proposed_plan)
+        proposed_plan_path = _write_immutable(
+            os.path.join(output_dir, "llm_proposed_plan.json"), proposed_plan)
+        validated, rejected, warnings = self._validate_actions(
             actions=actions, prompt_bank=prompt_bank, memory=memory, effects=effects)
+        validation_payload = {
+            "schema_version": VALIDATION_REPORT_SCHEMA_VERSION,
+            "status": ("invalid_with_structural_errors" if rejected else "valid"),
+            "accepted_action_ids": tuple(item["action_id"] for item in validated),
+            "rejected_actions": rejected,
+            "structural_errors": rejected,
+            "non_blocking_warnings": warnings,
+        }
         validation_path = _write_immutable(
-            os.path.join(output_dir, "validation_report.json"), {
-                "schema_version": VALIDATION_REPORT_SCHEMA_VERSION,
-                "accepted_action_ids": tuple(item["action_id"] for item in validated),
-                "rejected_actions": rejected,
-            })
+            os.path.join(output_dir, "validation_report.json"), validation_payload)
+        structural_validation_path = _write_immutable(
+            os.path.join(output_dir, "structural_validation_result.json"),
+            validation_payload)
+        rejected_payload = {
+            "schema_version": VALIDATION_REPORT_SCHEMA_VERSION,
+            "actions": rejected}
         rejected_path = _write_immutable(
-            os.path.join(output_dir, "rejected_actions.json"), {
+            os.path.join(output_dir, "rejected_actions.json"), rejected_payload)
+        structural_errors_path = _write_immutable(
+            os.path.join(output_dir, "structural_errors.json"), rejected_payload)
+        warnings_path = _write_immutable(
+            os.path.join(output_dir, "non_blocking_warnings.json"), {
                 "schema_version": VALIDATION_REPORT_SCHEMA_VERSION,
-                "actions": rejected})
+                "warnings": warnings})
         candidate_bank, mapping, promotions, summaries = self._apply_actions(
             prompt_bank=prompt_bank, actions=validated, memory=memory,
             iteration_id=iteration_id)
-        applied_path = _write_immutable(os.path.join(output_dir, "applied_plan.json"), {
+        applied_payload = {
             "schema_version": APPLIED_PLAN_SCHEMA_VERSION,
-            "actions": validated, **summaries})
+            "actions": validated, **summaries}
+        applied_path = _write_immutable(
+            os.path.join(output_dir, "applied_plan.json"), applied_payload)
+        final_applied_path = _write_immutable(
+            os.path.join(output_dir, "final_applied_plan.json"), applied_payload)
         bank_path = _write_immutable(os.path.join(output_dir, "candidate_codebook.json"), {
             "schema_version": CANDIDATE_CODEBOOK_SCHEMA_VERSION,
             "input_bank_version": prompt_bank.bank_version,
@@ -347,8 +388,13 @@ class MemoryConditionedLLMCodebookUpdater:
             "system_prompt": prompt_copy, "request": request_path,
             "response_attempts": attempts_path,
             "raw_response": raw_path, "parsed_plan": parsed_path,
+            "llm_proposed_plan": proposed_plan_path,
             "validation_report": validation_path, "rejected_actions": rejected_path,
-            "applied_plan": applied_path, "candidate_codebook": bank_path,
+            "structural_validation_result": structural_validation_path,
+            "structural_errors": structural_errors_path,
+            "non_blocking_warnings": warnings_path,
+            "applied_plan": applied_path, "final_applied_plan": final_applied_path,
+            "candidate_codebook": bank_path,
             "property_id_mapping": mapping_path,
             "promoted_property_memory": promoted_memory_path,
         }
@@ -446,6 +492,9 @@ class MemoryConditionedLLMCodebookUpdater:
             if item.get("no_effect_examples"):
                 recent.append({"candidate_id": item["candidate_property_id"],
                                "reason": "bounded no-effect intervention memory"})
+            if item.get("failure_examples"):
+                recent.append({"candidate_id": item["candidate_property_id"],
+                               "reason": "runtime/intervention failure; reliability only"})
         request = {
             "schema_version": UPDATER_REQUEST_SCHEMA_VERSION,
             "system_prompt_version": SYSTEM_PROMPT_VERSION,
@@ -459,6 +508,14 @@ class MemoryConditionedLLMCodebookUpdater:
             "active_property_memories": properties,
             "candidate_memories": candidates,
             "current_intervention_summaries": effects,
+            "evidence_status_contract": {
+                "semantic_transitions": (
+                    "wrong_to_correct", "correct_to_wrong",
+                    "correct_to_correct", "wrong_to_wrong"),
+                "reliability_only": ("runtime_failure", "intervention_failure"),
+                "rule": ("Reliability-only failures remain visible but must not be "
+                         "treated as positive or negative answer evidence."),
+            },
             "recent_rejection_or_no_op_summaries": tuple(recent[-12:]),
             "output_schema": {
                 "schema_version": UPDATER_RESPONSE_SCHEMA_VERSION,
@@ -466,7 +523,6 @@ class MemoryConditionedLLMCodebookUpdater:
                     "action_id": "unique string", "action": " | ".join(ACTION_NAMES),
                     "target_property_ids": ["active property ID"],
                     "candidate_ids": ["candidate ID"],
-                    "proposed_property_id": "string or null",
                     "proposed_property_text": "string or null",
                     "reasoning": "concise bounded reasoning",
                     "supporting_memory_example_ids": ["existing example_id"],
@@ -484,7 +540,9 @@ class MemoryConditionedLLMCodebookUpdater:
         self, *, actions: tuple[dict[str, Any], ...],
         prompt_bank: PromptBankSnapshot, memory: Mapping[str, Any],
         effects: tuple[Mapping[str, Any], ...],
-    ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+    ) -> tuple[
+            tuple[dict[str, Any], ...], tuple[dict[str, Any], ...],
+            tuple[dict[str, Any], ...]]:
         active = {entry.prompt_id: entry for entry in prompt_bank.entries
                   if entry.status == "active"}
         properties = {item["property_id"]: item for item in memory.get("properties") or ()}
@@ -496,15 +554,17 @@ class MemoryConditionedLLMCodebookUpdater:
         example_ids = set()
         for item in (*properties.values(), *candidates.values()):
             for field in ("positive_examples", "negative_examples", "mixed_examples",
-                          "no_effect_examples"):
+                          "no_effect_examples", "failure_examples",
+                          "intervention_examples"):
                 example_ids.update(example.get("example_id")
                                    for example in item.get(field) or ())
             routing = item.get("routing_examples") or {}
             for values in routing.values():
                 example_ids.update(example.get("example_id") for example in values)
         evidence_ids = {item.get("summary_id") for item in effects}
-        accepted, rejected = [], []
+        accepted, rejected, warnings = [], [], []
         claimed_targets, claimed_candidates, proposed_ids = set(), set(), set()
+        proposed_texts: set[str] = set()
         for action in actions:
             reasons = []
             name = action["action"]
@@ -523,60 +583,52 @@ class MemoryConditionedLLMCodebookUpdater:
             if any(len(item) > self.bounds.max_behavior_chars
                    for item in action["behaviors_to_preserve"]):
                 reasons.append("preserved behavior exceeds configured bound")
-            proposed_id = action["proposed_property_id"]
             proposed_text = action["proposed_property_text"]
-            if proposed_id and not re.fullmatch(r"pe_[a-z0-9_]+", proposed_id):
-                reasons.append("proposed property ID must use stable pe_snake_case form")
             if name == "add":
-                if len(candidate_ids) != 1 or targets or not proposed_id or not proposed_text:
-                    reasons.append("add requires one candidate, no target, and proposed ID/text")
+                proposed_id = (deterministic_property_id(
+                    candidate_ids[0], proposed_text)
+                    if len(candidate_ids) == 1 and proposed_text else None)
+                if len(candidate_ids) != 1 or targets or not proposed_text:
+                    reasons.append("add requires one candidate, no target, and proposed text")
                 elif proposed_id in active or proposed_id in proposed_ids:
                     reasons.append("added property ID collides")
-                else:
-                    candidate = candidates[candidate_ids[0]]
-                    completed = tuple(candidate.get("positive_examples") or ()) + tuple(
-                        candidate.get("negative_examples") or ()) + tuple(
-                        candidate.get("mixed_examples") or ()) + tuple(
-                        candidate.get("no_effect_examples") or ())
-                    if not completed:
-                        reasons.append("add candidate lacks completed intervention memory")
-                    if not candidate.get("positive_examples"):
-                        reasons.append("add lacks positive intervention support")
-                    elif not ({item["example_id"] for item in
-                               candidate.get("positive_examples") or ()} & set(
-                                   action["supporting_memory_example_ids"])):
-                        reasons.append("add does not cite its positive candidate memory")
             elif name == "revise":
-                if len(targets) != 1 or not proposed_text or proposed_id != targets[0]:
+                proposed_id = targets[0] if len(targets) == 1 else None
+                if len(targets) != 1 or not proposed_text:
                     reasons.append("revise must preserve one existing property identity")
-                elif not self._preserves_positive_behavior(
-                        properties.get(targets[0], {}), action, proposed_text):
-                    reasons.append("revise does not preserve documented positive behavior")
             elif name == "merge":
-                if len(targets) < 2 or not proposed_text or proposed_id not in targets:
-                    reasons.append("merge requires two active sources and one canonical source ID")
-                elif not all(self._preserves_positive_behavior(
-                        properties.get(target, {}), action, proposed_text)
-                             for target in targets):
-                    reasons.append("merge does not preserve source positive behavior")
+                proposed_id = targets[0] if targets else None
+                if len(targets) < 2 or not proposed_text:
+                    reasons.append(
+                        "merge requires two active sources ordered with the canonical source first")
             elif name == "retire":
-                if len(targets) != 1 or candidate_ids or proposed_id or proposed_text:
+                proposed_id = None
+                if len(targets) != 1 or candidate_ids or proposed_text:
                     reasons.append("retire requires exactly one active target")
-                elif self._harmful_support(properties.get(targets[0], {})) < \
-                        self.bounds.min_retire_support_groups:
-                    reasons.append("retire lacks harmful support across distinct videos or iterations")
             elif name in ("preserve", "no_op"):
-                if proposed_id or proposed_text:
-                    reasons.append(f"{name} cannot propose property ID or text")
+                proposed_id = None
+                if proposed_text:
+                    reasons.append(f"{name} cannot propose property text")
             if name in ("add", "revise", "merge", "retire") and not (
                     action["supporting_memory_example_ids"] or
                     action["supporting_evidence_ids"]):
                 reasons.append("mutating action must cite bounded support")
             if proposed_text:
-                text_reason = _text_rejection(proposed_text)
+                lineage_values_list = []
+                for candidate_id in candidate_ids:
+                    candidate = candidates.get(candidate_id, {})
+                    lineage_values_list.extend((
+                        candidate.get("source_video_id"),
+                        *(candidate.get("source_question_ids") or ())))
+                lineage_values = tuple(
+                    str(value) for value in lineage_values_list if value)
+                text_reason = _text_rejection(
+                    proposed_text, source_lineage_values=lineage_values)
                 if text_reason:
                     reasons.append(text_reason)
                 normalized_text = _normalized(proposed_text)
+                if normalized_text in proposed_texts:
+                    reasons.append("update plan repeats exact normalized property text")
                 duplicate = next((property_id for property_id, entry in active.items()
                                   if _normalized(entry.prompt_text) == normalized_text
                                   and property_id not in targets), None)
@@ -591,33 +643,29 @@ class MemoryConditionedLLMCodebookUpdater:
                                  "action": name, "reasons": tuple(reasons)})
                 continue
             accepted.append(action)
+            action_warnings = list(_text_warnings(proposed_text or ""))
+            if name == "add" and candidate_ids and not candidates.get(
+                    candidate_ids[0], {}).get("positive_examples"):
+                action_warnings.append(
+                    "add has no positive-labeled memory; semantic sufficiency was left to the LLM")
+            if name == "retire" and targets:
+                negative = properties.get(targets[0], {}).get("negative_examples") or ()
+                groups = {(str(item.get("video_id") or ""),
+                           int(item.get("iteration_ordinal", 0))) for item in negative}
+                if len(groups) < 2:
+                    action_warnings.append(
+                        "retire has fewer than two harmful-support groups; sufficiency was left to the LLM")
+            if action_warnings:
+                warnings.append({"action_id": action["action_id"],
+                                 "warnings": tuple(action_warnings)})
             if mutating:
                 claimed_targets.update(targets)
                 claimed_candidates.update(candidate_ids)
                 if proposed_id:
                     proposed_ids.add(proposed_id)
-        return tuple(accepted), tuple(rejected)
-
-    @staticmethod
-    def _preserves_positive_behavior(
-        memory: Mapping[str, Any], action: Mapping[str, Any], proposed_text: str,
-    ) -> bool:
-        positive = tuple(memory.get("positive_examples") or ())
-        intended = str(memory.get("intended_behavior") or "")
-        behaviors = tuple(action["behaviors_to_preserve"])
-        if positive and not set(example["example_id"] for example in positive) <= set(
-                action["supporting_memory_example_ids"]):
-            return False
-        if intended and _normalized(intended) not in {_normalized(item) for item in behaviors}:
-            return False
-        return not intended or bool(_tokens(intended) & _tokens(proposed_text))
-
-    @staticmethod
-    def _harmful_support(memory: Mapping[str, Any]) -> int:
-        groups = {(str(item.get("video_id") or ""),
-                   int(item.get("iteration_ordinal", 0)))
-                  for item in memory.get("negative_examples") or ()}
-        return len(groups)
+                if proposed_text:
+                    proposed_texts.add(_normalized(proposed_text))
+        return tuple(accepted), tuple(rejected), tuple(warnings)
 
     def _apply_actions(
         self, *, prompt_bank: PromptBankSnapshot,
@@ -646,8 +694,9 @@ class MemoryConditionedLLMCodebookUpdater:
             changed = True
             proposed_text = action["proposed_property_text"]
             if name == "add":
-                property_id = action["proposed_property_id"]
-                candidate = candidates[action["candidate_ids"][0]]
+                candidate_id = action["candidate_ids"][0]
+                property_id = deterministic_property_id(candidate_id, proposed_text)
+                candidate = candidates[candidate_id]
                 entries.append(PromptEntry(
                     prompt_id=property_id, prompt_text=proposed_text,
                     prompt_hash=sha256_text(proposed_text),
@@ -657,6 +706,8 @@ class MemoryConditionedLLMCodebookUpdater:
                     applicability_traits=candidate.get("applicability") or {},
                     provenance={"iteration_id": iteration_id,
                                 "action_id": action["action_id"],
+                                "property_id_schema_version":
+                                    ACTIVE_PROPERTY_ID_SCHEMA_VERSION,
                                 "candidate_ids": action["candidate_ids"],
                                 "proposal_failure_analysis": candidate.get(
                                     "failure_analysis")}))
@@ -676,7 +727,7 @@ class MemoryConditionedLLMCodebookUpdater:
                                     "action_id": action["action_id"],
                                     "previous_text": current.prompt_text})})
             elif name == "merge":
-                canonical = action["proposed_property_id"]
+                canonical = action["target_property_ids"][0]
                 sources = tuple(action["target_property_ids"])
                 current = entries[by_id[canonical]]
                 aliases = tuple(dict.fromkeys((
@@ -761,6 +812,7 @@ class MemoryConditionedLLMCodebookUpdater:
                     "positive_examples": candidate.get("positive_examples") or [],
                     "negative_examples": candidate.get("negative_examples") or [],
                     "no_effect_examples": candidate.get("no_effect_examples") or [],
+                    "failure_examples": candidate.get("failure_examples") or [],
                     "routing_examples": {"positive": [], "negative": []},
                     "aliases": [], "revision_history": [],
                     "latest_decision": {"action": "add", "reason": "validated LLM action",
@@ -770,7 +822,8 @@ class MemoryConditionedLLMCodebookUpdater:
                 target = by_property[property_id]
                 for field, limit in (("positive_examples", 5),
                                      ("negative_examples", 3),
-                                     ("no_effect_examples", 2)):
+                                     ("no_effect_examples", 2),
+                                     ("failure_examples", 2)):
                     combined = [*target.get(field, ()), *candidate.get(field, ())]
                     unique = {item["example_id"]: item for item in combined}
                     selected = []
@@ -798,7 +851,7 @@ class MemoryConditionedLLMCodebookUpdater:
                     "previous_intended_behavior": action["behaviors_to_preserve"],
                 }]
             elif action["action"] == "merge":
-                canonical = action["proposed_property_id"]
+                canonical = action["target_property_ids"][0]
                 target = by_property[canonical]
                 target["property_text"] = action["proposed_property_text"]
                 target["intended_behavior"] = action["proposed_property_text"]
@@ -813,7 +866,8 @@ class MemoryConditionedLLMCodebookUpdater:
                     source_memory = by_property[source]
                     for field, limit in (("positive_examples", 5),
                                          ("negative_examples", 3),
-                                         ("no_effect_examples", 2)):
+                                         ("no_effect_examples", 2),
+                                         ("failure_examples", 2)):
                         combined = [*target.get(field, ()),
                                     *source_memory.get(field, ())]
                         target[field] = list({item["example_id"]: item

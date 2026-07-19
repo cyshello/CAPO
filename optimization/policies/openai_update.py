@@ -9,7 +9,7 @@ from surrogate_rollout.optimization.policies.codex_feedback import (
 )
 
 
-OPENAI_STRICT_UPDATE_POLICY_VERSION = "openai_strict_component_update_v2"
+OPENAI_STRICT_UPDATE_POLICY_VERSION = "openai_strict_component_update_v3"
 
 
 def codebook_updater_response_schema(*, max_actions: int) -> dict:
@@ -21,7 +21,6 @@ def codebook_updater_response_schema(*, max_actions: int) -> dict:
             "add", "revise", "merge", "preserve", "retire", "no_op"]},
         "target_property_ids": string_array,
         "candidate_ids": string_array,
-        "proposed_property_id": nullable_string,
         "proposed_property_text": nullable_string,
         "reasoning": {"type": "string"},
         "supporting_memory_example_ids": string_array,
@@ -35,7 +34,7 @@ def codebook_updater_response_schema(*, max_actions: int) -> dict:
         "properties": {
             "schema_version": {
                 "type": "string",
-                "enum": ["memory_codebook_updater_response_v1"]},
+                "enum": ["memory_codebook_updater_response_v2"]},
             "actions": {
                 "type": "array", "maxItems": max_actions,
                 "items": {

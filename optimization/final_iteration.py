@@ -8,6 +8,9 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol
 
+from surrogate_rollout.optimization.llm_codebook_updater import (
+    CHECKPOINT_MANIFEST_SCHEMA_VERSION as CODEBOOK_UPDATER_MANIFEST_SCHEMA_VERSION,
+)
 from surrogate_rollout.optimization.iteration_state import (
     ComponentVersions,
     ConfirmedCheckpointState,
@@ -1508,7 +1511,7 @@ class Checkpoint3EOrchestrator:
         updater_manifest_path = checkpoint_artifacts["llm_codebook_updater_manifest"]
         codebook_updater_manifest = _read_json(updater_manifest_path)
         if codebook_updater_manifest.get("schema_version") != \
-                "memory_codebook_checkpoint_manifest_v1" or \
+                CODEBOOK_UPDATER_MANIFEST_SCHEMA_VERSION or \
                 codebook_updater_manifest.get("status") != "completed":
             raise FinalIterationConflictError("incompatible codebook-updater artifacts")
         updater_artifacts = codebook_updater_manifest.get("artifacts") or {}

@@ -41,11 +41,11 @@ from surrogate_rollout.schemas import sha256_json, sha256_text
 
 TRANSITION_LABELS = (
     "wrong_to_correct", "correct_to_wrong",
-    "correct_to_correct", "wrong_to_wrong",
+    "correct_to_correct", "wrong_to_wrong", "runtime_failure",
 )
-INTERVENTION_POLICY_VERSION = "property_selective_intervention_v2"
-INTERVENTION_RESULT_SCHEMA_VERSION = "property_intervention_result_v2"
-INTERVENTION_TRANSITIONS_SCHEMA_VERSION = "property_intervention_transitions_v2"
+INTERVENTION_POLICY_VERSION = "property_selective_intervention_v3_runtime_validity"
+INTERVENTION_RESULT_SCHEMA_VERSION = "property_intervention_result_v3"
+INTERVENTION_TRANSITIONS_SCHEMA_VERSION = "property_intervention_transitions_v3"
 
 
 class PropertyInterventionError(RuntimeError):
@@ -595,7 +595,17 @@ class PropertyInterventionBatchRunner:
                         run_dir=qa_dir, question_id=question_id,
                         database_path=mixed.database_path,
                         max_iterations=dvd_max_iterations, gpu=gpu)
-                    candidate_correct = float(result.score) > 0.0
+                    baseline_runtime_valid = not bool(baseline_qa.get("errors")) and \
+                        baseline_qa.get("prediction") is not None
+                    candidate_runtime_valid = not bool(result.errors) and \
+                        result.prediction is not None
+                    candidate_correct = (
+                        float(result.score) > 0.0 if candidate_runtime_valid else None)
+                    transition = (
+                        correctness_transition(
+                            bool(baseline_qa["is_correct"]), candidate_correct)
+                        if baseline_runtime_valid and candidate_runtime_valid else
+                        "runtime_failure")
                     row = {
                         "qa_identity": qa_identity,
                         "candidate_property_id": proposal.candidate_property_id,
@@ -607,8 +617,9 @@ class PropertyInterventionBatchRunner:
                         "ground_truth": result.ground_truth,
                         "baseline_correct": bool(baseline_qa["is_correct"]),
                         "candidate_correct": candidate_correct,
-                        "transition": correctness_transition(
-                            bool(baseline_qa["is_correct"]), candidate_correct),
+                        "transition": transition,
+                        "baseline_runtime_valid": baseline_runtime_valid,
+                        "runtime_valid": candidate_runtime_valid,
                         "reference_sets": _reference_sets(result),
                         "trajectory_path": os.path.join(qa_dir, "trajectory.jsonl"),
                         "result_path": os.path.join(qa_dir, "result.json"),
@@ -654,7 +665,7 @@ class PropertyInterventionBatchRunner:
                 "question_id": item["question_id"],
                 "candidate_prediction": item.get("candidate_prediction"),
                 "transition": item["transition"],
-                "runtime_valid": not bool(item.get("errors")),
+                "runtime_valid": bool(item.get("runtime_valid")),
             } for item in transition_rows))
         transitions_path = _write_json(os.path.join(
             work_item.output_dir, "transitions.json"), {

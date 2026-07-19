@@ -210,7 +210,7 @@ def test_intervention_effects_and_candidate_memory_stay_separate(tmp_path):
     }
     positive = next(item for item in effects
                     if item["candidate_property_id"] == "cp-pos")
-    assert positive["schema_version"] == "property_compact_summary_v2"
+    assert positive["schema_version"] == "property_compact_summary_v3_runtime_validity"
     assert positive["original_proposal"]["property_text"] == (
         "Track object completion states.")
     assert positive["source_question_ids"] == ["q1"]
@@ -228,6 +228,74 @@ def test_intervention_effects_and_candidate_memory_stay_separate(tmp_path):
                for item in snapshot["candidates"])
     assert all(item["property_id"] not in {"cp-pos", "cp-neg", "cp-mix", "cp-none"}
                for item in snapshot["properties"])
+
+
+def test_runtime_and_intervention_failures_are_reliability_only(tmp_path):
+    props = (
+        proposal("cp-runtime", "video-a"),
+        proposal("cp-intervention", "video-a"),
+    )
+    baseline = baseline_fixture(tmp_path, proposals=props)
+    root = tmp_path / "failure-interventions"
+    runtime_transition_path = write_json(
+        root / "cp-runtime" / "transitions.json", {
+            "candidate_property_id": "cp-runtime",
+            "source_video_id": "video-a",
+            "original_proposal": props[0],
+            "source_question_ids": ["q1"],
+            "source_qa_baseline_correct": False,
+            # This legacy label must be recomputed from runtime validity.
+            "transition_counts": counts(ww=1),
+            "qas": [{
+                "question_id": "q1", "baseline_prediction": "B",
+                "candidate_prediction": None, "baseline_correct": False,
+                "candidate_correct": False, "transition": "wrong_to_wrong",
+                "errors": ["provider timeout"],
+            }],
+        })
+    runtime_result_path = write_json(root / "cp-runtime" / "result.json", {
+        "schema_version": "property_intervention_result_v2",
+        "status": "completed", "candidate_property_id": "cp-runtime",
+        "source_video_id": "video-a", "original_proposal": props[0],
+        "transitions_path": runtime_transition_path,
+        "transition_counts": counts(ww=1),
+    })
+    failed_result_path = write_json(root / "cp-intervention" / "result.json", {
+        "schema_version": "property_intervention_result_v2",
+        "status": "failed", "candidate_property_id": "cp-intervention",
+        "source_video_id": "video-a", "original_proposal": props[1],
+        "failure_type": "selected_segment_caption_failed",
+        "errors": ["caption provider failure"],
+    })
+    intervention = write_json(root / "manifest.json", {
+        "status": "completed", "source_video_id": "video-a",
+        "results": [
+            {"candidate_property_id": "cp-runtime",
+             "result_path": runtime_result_path},
+            {"candidate_property_id": "cp-intervention",
+             "result_path": failed_result_path},
+        ],
+    })
+
+    result = CompactPropertyMemoryRunner().run(
+        iteration_id="i-failures", iteration_ordinal=1, prompt_bank=bank(),
+        baseline_video_manifest_paths=(baseline,),
+        intervention_manifest_paths=(intervention,),
+        output_dir=str(tmp_path / "failure-memory"))
+    effects = [json.loads(line) for line in Path(
+        result["effect_summary_path"]).read_text().splitlines()]
+    by_candidate = {row["candidate_property_id"]: row for row in effects}
+    assert by_candidate["cp-runtime"]["effect"] == "unavailable"
+    assert by_candidate["cp-runtime"]["transition_counts"]["runtime_failure"] == 1
+    assert by_candidate["cp-intervention"]["effect"] == "unavailable"
+    assert by_candidate["cp-intervention"]["transition_counts"][
+        "intervention_failure"] == 1
+
+    candidates = {row["candidate_property_id"]: row
+                  for row in load_snapshot(result)["candidates"]}
+    for candidate_id in ("cp-runtime", "cp-intervention"):
+        assert candidates[candidate_id]["negative_examples"] == []
+        assert len(candidates[candidate_id]["failure_examples"]) == 1
 
 
 def test_promoted_and_related_effects_accumulate_without_changing_plan(tmp_path):

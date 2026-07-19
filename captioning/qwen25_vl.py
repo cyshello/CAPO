@@ -14,6 +14,9 @@ from .base import (
 )
 
 _MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+VLLM_MM_CACHE_POLICY_VERSION = "qwen25_vl_mm_cache_disabled_v1"
+VLLM_MM_PROCESSOR_CACHE_GB = 0.0
+VLLM_PREFIX_CACHING_ENABLED = False
 
 
 class Qwen25VLCaptioner(BaseCaptioner):
@@ -38,6 +41,8 @@ class Qwen25VLCaptioner(BaseCaptioner):
         seed: int = 0,
         image_min_pixels: int | None = None,
         image_max_pixels: int | None = None,
+        mm_processor_cache_gb: float = VLLM_MM_PROCESSOR_CACHE_GB,
+        enable_prefix_caching: bool = VLLM_PREFIX_CACHING_ENABLED,
     ) -> None:
         from transformers import AutoProcessor
         from vllm import LLM
@@ -47,6 +52,8 @@ class Qwen25VLCaptioner(BaseCaptioner):
         self.default_max_tokens = default_max_tokens
         self.image_min_pixels = image_min_pixels
         self.image_max_pixels = image_max_pixels
+        self.mm_processor_cache_gb = float(mm_processor_cache_gb)
+        self.enable_prefix_caching = bool(enable_prefix_caching)
 
         self.processor = AutoProcessor.from_pretrained(self.model_path)
         self.llm = LLM(
@@ -58,6 +65,13 @@ class Qwen25VLCaptioner(BaseCaptioner):
             limit_mm_per_prompt={"image": max_images_per_prompt},
             seed=seed,
             trust_remote_code=True,
+            # vLLM 0.11.x keeps separate metadata and EngineCore feature LRU
+            # caches. Long-lived multimodal workers can evict an EngineCore
+            # item while the metadata side still reports a hit, causing an
+            # unrecoverable ``Expected a cached item for mm_hash`` assertion.
+            # Disable both reuse paths so every request carries its images.
+            mm_processor_cache_gb=self.mm_processor_cache_gb,
+            enable_prefix_caching=self.enable_prefix_caching,
         )
 
     def _image_item(self, image) -> dict:

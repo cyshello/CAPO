@@ -24,13 +24,14 @@ from surrogate_rollout.prompt_routing.schemas import (
 from surrogate_rollout.schemas import sha256_json
 
 
-COMPACT_SUMMARY_SCHEMA_VERSION = "property_compact_summary_v2"
+COMPACT_SUMMARY_SCHEMA_VERSION = "property_compact_summary_v3_runtime_validity"
 PROPERTY_MEMORY_SCHEMA_VERSION = "property_memory_v1"
 PROPERTY_MEMORY_MANIFEST_SCHEMA_VERSION = "property_memory_manifest_v1"
 SELECTION_POLICY_VERSION = "property_memory_selection_v1"
 TRANSITIONS = (
     "wrong_to_correct", "correct_to_wrong",
     "correct_to_correct", "wrong_to_wrong",
+    "runtime_failure", "intervention_failure",
 )
 
 
@@ -232,15 +233,24 @@ def _effect_from_counts(counts: Mapping[str, Any]) -> str:
         return "positive"
     if negative:
         return "negative"
+    valid_outcomes = sum(int(counts.get(label, 0)) for label in (
+        "wrong_to_correct", "correct_to_wrong", "correct_to_correct",
+        "wrong_to_wrong"))
+    if not valid_outcomes and (int(counts.get("runtime_failure", 0)) or
+                               int(counts.get("intervention_failure", 0))):
+        return "unavailable"
     return "no_effect"
 
 
 def _effect_summary(effect: str, counts: Mapping[str, int]) -> str:
     return (
-        f"The intervention had {effect.replace('_', ' ')} effect across three QAs: "
+        f"The intervention had {effect.replace('_', ' ')} semantic effect: "
         f"{counts['wrong_to_correct']} improved, {counts['correct_to_wrong']} regressed, "
         f"{counts['correct_to_correct']} stayed correct, and "
-        f"{counts['wrong_to_wrong']} stayed incorrect."
+        f"{counts['wrong_to_wrong']} stayed incorrect; "
+        f"{counts['runtime_failure']} QA runtime failures and "
+        f"{counts['intervention_failure']} intervention failures were excluded "
+        "from semantic transition counts."
     )
 
 
@@ -619,10 +629,39 @@ class CompactPropertyMemoryRunner:
             manifest = _read_json(manifest_path)
             for item in manifest.get("results") or ():
                 result_path = item.get("result_path")
-                if not result_path:
-                    raise PropertyMemoryError("intervention result lacks result_path")
-                result = _read_json(result_path)
+                result = (_read_json(result_path) if result_path and
+                          os.path.exists(result_path) else as_json_dict(item))
                 if result.get("status") != "completed":
+                    counts = {label: 0 for label in TRANSITIONS}
+                    counts["intervention_failure"] = 1
+                    identity = {
+                        "schema_version": COMPACT_SUMMARY_SCHEMA_VERSION,
+                        "kind": "intervention_effect", "iteration_id": iteration_id,
+                        "candidate_property_id": str(
+                            result.get("candidate_property_id") or
+                            item.get("candidate_property_id") or ""),
+                        "video_id": str(result.get("source_video_id") or
+                                        item.get("source_video_id") or
+                                        manifest.get("source_video_id") or ""),
+                        "effect": "unavailable", "transition_counts": counts,
+                        "evidence_reliability": "intervention_failure",
+                    }
+                    refs = [_artifact_ref(manifest_path, "intervention_manifest")]
+                    if result_path and os.path.exists(result_path):
+                        refs.append(_artifact_ref(result_path, "intervention_result"))
+                    summaries.append({
+                        **identity, "summary_id": "effect_" + sha256_json(identity)[:24],
+                        "one_sentence_summary": _effect_summary("unavailable", counts),
+                        "failure_type": result.get("failure_type") or
+                            item.get("failure_type"),
+                        "failure_reason": result.get("failure_reason") or
+                            item.get("failure_reason"),
+                        "original_proposal": result.get("original_proposal") or {},
+                        "source_question_ids": (),
+                        "source_qa_baseline_correct": None,
+                        "qa_transitions": (), "artifact_refs": tuple(refs),
+                        "iteration_ordinal": iteration_ordinal,
+                    })
                     continue
                 transitions_path = result.get("transitions_path")
                 if not transitions_path:
@@ -631,26 +670,40 @@ class CompactPropertyMemoryRunner:
                 original_proposal = (
                     transitions.get("original_proposal")
                     or result.get("original_proposal") or {})
-                raw_counts = transitions.get("transition_counts") or {}
-                counts = {label: int(raw_counts.get(label, 0)) for label in TRANSITIONS}
+                qa_transitions_list = []
+                counts = {label: 0 for label in TRANSITIONS}
+                for row in transitions.get("qas") or ():
+                    runtime_valid = bool(row.get(
+                        "runtime_valid", not bool(row.get("errors")))) and \
+                        row.get("candidate_prediction") is not None
+                    transition = (str(row.get("transition") or "")
+                                  if runtime_valid else "runtime_failure")
+                    if transition not in TRANSITIONS or transition == "intervention_failure":
+                        raise PropertyMemoryError("invalid intervention QA transition")
+                    counts[transition] += 1
+                    qa_transitions_list.append({
+                        "question_id": str(row.get("question_id") or ""),
+                        "baseline_prediction": row.get("baseline_prediction"),
+                        "candidate_prediction": row.get("candidate_prediction"),
+                        "baseline_correct": bool(row.get("baseline_correct")),
+                        "candidate_correct": (
+                            bool(row.get("candidate_correct")) if runtime_valid else None),
+                        "transition": transition, "runtime_valid": runtime_valid,
+                        "errors": tuple(row.get("errors") or ()),
+                    })
                 if sum(counts.values()) != len(transitions.get("qas") or ()):
                     raise PropertyMemoryError("intervention transition counts conflict with QAs")
                 effect = _effect_from_counts(counts)
-                qa_transitions = tuple({
-                    "question_id": str(row.get("question_id") or ""),
-                    "baseline_prediction": row.get("baseline_prediction"),
-                    "candidate_prediction": row.get("candidate_prediction"),
-                    "baseline_correct": bool(row.get("baseline_correct")),
-                    "candidate_correct": bool(row.get("candidate_correct")),
-                    "transition": str(row.get("transition") or ""),
-                    "runtime_valid": not bool(row.get("errors")),
-                } for row in transitions.get("qas") or ())
+                qa_transitions = tuple(qa_transitions_list)
+                reliability = ("partial_runtime_failure" if counts["runtime_failure"]
+                               else "runtime_valid")
                 identity = {
                     "schema_version": COMPACT_SUMMARY_SCHEMA_VERSION,
                     "kind": "intervention_effect", "iteration_id": iteration_id,
                     "candidate_property_id": str(result["candidate_property_id"]),
                     "video_id": str(result["source_video_id"]),
                     "effect": effect, "transition_counts": counts,
+                    "evidence_reliability": reliability,
                     "original_proposal_hash": (
                         sha256_json(original_proposal) if original_proposal else None),
                 }
@@ -665,6 +718,8 @@ class CompactPropertyMemoryRunner:
                         "source_qa_baseline_correct",
                         original_proposal.get("source_qa_baseline_correct")),
                     "qa_transitions": qa_transitions,
+                    "runtime_failure_count": counts["runtime_failure"],
+                    "intervention_failure_count": counts["intervention_failure"],
                     "artifact_refs": (
                         _artifact_ref(manifest_path, "intervention_manifest"),
                         _artifact_ref(result_path, "intervention_result"),
@@ -781,6 +836,11 @@ class CompactPropertyMemoryRunner:
                 "example_id": _example_id(effect), "effect": effect["effect"],
                 "video_id": effect["video_id"],
                 "transition_counts": effect["transition_counts"],
+                "evidence_reliability": effect.get("evidence_reliability"),
+                "runtime_failure_count": int(
+                    effect["transition_counts"].get("runtime_failure", 0)),
+                "intervention_failure_count": int(
+                    effect["transition_counts"].get("intervention_failure", 0)),
                 "source_question_ids": effect.get("source_question_ids") or (),
                 "source_qa_baseline_correct": effect.get(
                     "source_qa_baseline_correct"),
@@ -963,7 +1023,8 @@ class CompactPropertyMemoryRunner:
                 *candidate.get("positive_examples", ()),
                 *candidate.get("negative_examples", ()),
                 *candidate.get("mixed_examples", ()),
-                *candidate.get("no_effect_examples", ()), *prior,
+                *candidate.get("no_effect_examples", ()),
+                *candidate.get("failure_examples", ()), *prior,
             )}.values())
             categories = {
                 "positive": ("positive_examples", self.bounds.strong_positive),
@@ -971,13 +1032,15 @@ class CompactPropertyMemoryRunner:
                 "mixed": ("mixed_examples", min(
                     self.bounds.strong_positive, self.bounds.harmful)),
                 "no_effect": ("no_effect_examples", self.bounds.no_effect),
+                "unavailable": ("failure_examples", self.bounds.no_effect),
             }
             for effect, (field, limit) in categories.items():
                 selected, decisions = _select_examples(
                     tuple(item for item in all_examples if item.get("effect") == effect),
                     limit=limit,
                     category=("negative" if effect == "negative" else
-                              "no_effect" if effect == "no_effect" else "positive"))
+                              "no_effect" if effect in ("no_effect", "unavailable")
+                              else "positive"))
                 candidate[field] = list(selected)
                 audit.extend({"candidate_key": candidate_key, **item}
                              for item in decisions)

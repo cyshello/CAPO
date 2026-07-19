@@ -22,12 +22,11 @@ from surrogate_rollout.prompt_routing.schemas import (
     dumps_canonical,
 )
 from surrogate_rollout.prompt_routing.structured_router_policy import (
-    NEGATIVE_EXAMPLE_LIMIT,
-    POSITIVE_EXAMPLE_LIMIT,
     RENDERED_ROUTER_PROMPT_SCHEMA_VERSION,
     ROUTER_PROMPT_RENDERER_VERSION,
     STRUCTURED_ROUTER_POLICY_SCHEMA_VERSION,
     bootstrap_structured_router_policy,
+    compress_router_examples,
     install_structured_router_policy,
     remap_structured_router_policy,
     render_router_prompt,
@@ -37,17 +36,21 @@ from surrogate_rollout.prompt_routing.structured_router_policy import (
 )
 from surrogate_rollout.prompt_routing.validators import validate_router_against_bank
 from surrogate_rollout.schemas import sha256_json, sha256_text
+from surrogate_rollout.optimization.llm_codebook_updater import (
+    CANDIDATE_CODEBOOK_SCHEMA_VERSION,
+    ID_MAPPING_SCHEMA_VERSION,
+)
 
 
-SYSTEM_PROMPT_VERSION = "memory_router_updater_prompt_v1"
-ROUTER_UPDATER_REQUEST_SCHEMA_VERSION = "memory_router_updater_request_v1"
+SYSTEM_PROMPT_VERSION = "memory_router_updater_prompt_v2_semantic_llm"
+ROUTER_UPDATER_REQUEST_SCHEMA_VERSION = "memory_router_updater_request_v2"
 ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION = "memory_router_updater_response_v1"
 ROUTER_UPDATER_PLAN_SCHEMA_VERSION = "memory_router_updater_plan_v1"
-ROUTER_VALIDATION_SCHEMA_VERSION = "memory_router_validation_report_v1"
-ROUTER_APPLIED_PLAN_SCHEMA_VERSION = "memory_router_applied_plan_v1"
-ROUTER_UPDATER_MANIFEST_SCHEMA_VERSION = "memory_router_updater_manifest_v2"
-ROUTER_EXECUTION_SCHEMA_VERSION = "memory_router_updater_execution_v2"
-ROUTER_EXECUTION_POLICY_VERSION = "no_routing_evidence_empty_plan_v1"
+ROUTER_VALIDATION_SCHEMA_VERSION = "memory_router_structural_validation_v2"
+ROUTER_APPLIED_PLAN_SCHEMA_VERSION = "memory_router_applied_plan_v2"
+ROUTER_UPDATER_MANIFEST_SCHEMA_VERSION = "memory_router_updater_manifest_v3"
+ROUTER_EXECUTION_SCHEMA_VERSION = "memory_router_updater_execution_v3"
+ROUTER_EXECUTION_POLICY_VERSION = "explicit_empty_evidence_optimization_v2"
 ROUTER_INPUT_IDENTITY_SCHEMA_VERSION = "memory_router_updater_input_identity_v1"
 ROUTER_ATTEMPTS_SCHEMA_VERSION = "memory_router_updater_attempts_v1"
 ACTION_TYPES = (
@@ -192,28 +195,26 @@ def parse_router_updater_plan(
     return tuple(output)
 
 
-_LEAKAGE_PATTERNS = (
-    r"\bquestion\b", r"\banswer\b", r"\bgold(?:en)? label\b",
-    r"\bground[ -]?truth\b", r"\bprediction\b", r"\breasoning\b",
-    r"\bquestion[-_ ]?id\b", r"\bvideo[-_ ]?id\b", r"\bsegment[-_ ]?id\b",
-)
-
-
-def _leaks_downstream_data(value: str) -> bool:
-    lowered = value.casefold()
-    return any(re.search(pattern, lowered) for pattern in _LEAKAGE_PATTERNS)
+def _contains_placeholder(value: str) -> bool:
+    normalized = " ".join(str(value or "").split())
+    return bool(re.search(
+        r"\{\{[^{}]+\}\}|\$\{[^{}]+\}|\[(?:placeholder|todo|tbd)\]",
+        normalized, re.IGNORECASE)) or normalized.casefold() in {
+            "todo", "tbd", "placeholder", "guidance", "example"}
 
 
 class MemoryConditionedLLMRouterUpdater:
-    policy_version = "memory_conditioned_llm_router_updater_v3_strict_retry"
+    policy_version = "memory_conditioned_llm_router_updater_v4_structural_only"
 
     def __init__(
         self, *, response_provider: Callable[[str, str], str],
         bounds: RouterUpdaterBounds | None = None,
         system_prompt_path: str = PROMPT_PATH,
+        skip_llm_when_no_evidence: bool = False,
     ) -> None:
         self.response_provider = response_provider
         self.bounds = bounds or RouterUpdaterBounds()
+        self.skip_llm_when_no_evidence = bool(skip_llm_when_no_evidence)
         self.system_prompt_path = os.path.abspath(system_prompt_path)
         with open(self.system_prompt_path) as handle:
             self.system_prompt = handle.read()
@@ -230,6 +231,7 @@ class MemoryConditionedLLMRouterUpdater:
             "system_prompt_version": SYSTEM_PROMPT_VERSION,
             "system_prompt_sha256": sha256_text(self.system_prompt),
             "execution_policy_version": ROUTER_EXECUTION_POLICY_VERSION,
+            "skip_llm_when_no_evidence": self.skip_llm_when_no_evidence,
             "bounds": as_json_dict(self.bounds),
             "provider": _provider_identity(response_provider),
         }
@@ -243,14 +245,14 @@ class MemoryConditionedLLMRouterUpdater:
         output_dir = os.path.abspath(output_dir)
         manifest_path = os.path.join(output_dir, "manifest.json")
         wrapper = _read_json(candidate_codebook_path)
-        if wrapper.get("schema_version") != "memory_candidate_codebook_v1":
+        if wrapper.get("schema_version") != CANDIDATE_CODEBOOK_SCHEMA_VERSION:
             raise LLMRouterUpdaterConflictError("incompatible candidate-codebook schema")
         candidate_bank = prompt_bank_from_json(wrapper["candidate_bank"])
         if wrapper.get("candidate_codebook_hash") != sha256_json(
                 as_json_dict(candidate_bank)):
             raise LLMRouterUpdaterConflictError("candidate-codebook hash mismatch")
         mapping_artifact = _read_json(property_id_mapping_path)
-        if mapping_artifact.get("schema_version") != "property_id_mapping_v1":
+        if mapping_artifact.get("schema_version") != ID_MAPPING_SCHEMA_VERSION:
             raise LLMRouterUpdaterConflictError("incompatible property-ID mapping schema")
         mapping = mapping_artifact.get("old_to_new_property_ids") or {}
         promotions = mapping_artifact.get("candidate_promotions") or {}
@@ -362,16 +364,17 @@ class MemoryConditionedLLMRouterUpdater:
         prompt_path = _write_text_immutable(
             os.path.join(output_dir, "system_prompt.txt"), self.system_prompt)
         request_path = _write_immutable(os.path.join(output_dir, "request.json"), request)
-        if evidence:
-            execution_mode = "llm_provider"
+        if evidence or not self.skip_llm_when_no_evidence:
+            execution_mode = (
+                "llm_provider" if evidence else "llm_provider_no_evidence")
             provider_called = True
             deterministic_reason = None
             raw, actions, attempts_path = self._load_or_generate_plan(
                 output_dir=output_dir, request=request)
         else:
-            execution_mode = "deterministic_empty_plan"
+            execution_mode = "configured_empty_evidence_skip"
             provider_called = False
-            deterministic_reason = "no_routing_evidence"
+            deterministic_reason = "explicit_skip_llm_when_no_evidence"
             raw = dumps_canonical({
                 "schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
                 "actions": (),
@@ -396,32 +399,52 @@ class MemoryConditionedLLMRouterUpdater:
                 "deterministic_reason": deterministic_reason,
             })
         raw_path = _write_text_immutable(os.path.join(output_dir, "raw_response.txt"), raw)
-        parsed_path = _write_immutable(os.path.join(output_dir, "parsed_plan.json"), {
+        proposed_plan = {
             "schema_version": ROUTER_UPDATER_PLAN_SCHEMA_VERSION,
             "response_schema_version": ROUTER_UPDATER_RESPONSE_SCHEMA_VERSION,
-            "actions": actions})
-        accepted, rejected = self._validate_actions(
+            "actions": actions}
+        parsed_path = _write_immutable(
+            os.path.join(output_dir, "parsed_plan.json"), proposed_plan)
+        proposed_plan_path = _write_immutable(
+            os.path.join(output_dir, "llm_proposed_plan.json"), proposed_plan)
+        accepted, rejected, warnings = self._validate_actions(
             actions, candidate_bank=candidate_bank, examples=examples,
-            evidence=evidence)
+            evidence=evidence, policy=remapped)
+        validation_payload = {
+            "schema_version": ROUTER_VALIDATION_SCHEMA_VERSION,
+            "status": ("invalid_with_structural_errors" if rejected else "valid"),
+            "accepted_action_ids": tuple(item["action_id"] for item in accepted),
+            "rejected_actions": rejected, "structural_errors": rejected,
+            "non_blocking_warnings": warnings,
+            "execution_mode": execution_mode, "fixed_protocol_unchanged": True}
         validation_path = _write_immutable(
-            os.path.join(output_dir, "validation_report.json"), {
-                "schema_version": ROUTER_VALIDATION_SCHEMA_VERSION,
-                "accepted_action_ids": tuple(item["action_id"] for item in accepted),
-                "rejected_actions": rejected,
-                "execution_mode": execution_mode,
-                "fixed_protocol_unchanged": True})
+            os.path.join(output_dir, "validation_report.json"), validation_payload)
+        structural_validation_path = _write_immutable(
+            os.path.join(output_dir, "structural_validation_result.json"),
+            validation_payload)
+        rejected_payload = {
+            "schema_version": ROUTER_VALIDATION_SCHEMA_VERSION,
+            "actions": rejected}
         rejected_path = _write_immutable(
-            os.path.join(output_dir, "rejected_actions.json"), {
+            os.path.join(output_dir, "rejected_actions.json"), rejected_payload)
+        structural_errors_path = _write_immutable(
+            os.path.join(output_dir, "structural_errors.json"), rejected_payload)
+        warnings_path = _write_immutable(
+            os.path.join(output_dir, "non_blocking_warnings.json"), {
                 "schema_version": ROUTER_VALIDATION_SCHEMA_VERSION,
-                "actions": rejected})
+                "warnings": warnings})
         updated = self._apply_actions(remapped, accepted)
         validate_structured_router_policy(updated, candidate_bank)
-        applied_path = _write_immutable(os.path.join(output_dir, "applied_plan.json"), {
+        applied_payload = {
             "schema_version": ROUTER_APPLIED_PLAN_SCHEMA_VERSION,
             "actions": accepted,
             "deterministic_id_remapping": mapping,
             "retired_guidance_removed": tuple(
-                key for key, value in mapping.items() if value is None)})
+                key for key, value in mapping.items() if value is None)}
+        applied_path = _write_immutable(
+            os.path.join(output_dir, "applied_plan.json"), applied_payload)
+        final_applied_path = _write_immutable(
+            os.path.join(output_dir, "final_applied_plan.json"), applied_payload)
         structured_path = _write_immutable(
             os.path.join(output_dir, "structured_router_policy.json"), updated)
         rendered = rendered_prompt_artifact(updated)
@@ -456,8 +479,13 @@ class MemoryConditionedLLMRouterUpdater:
             "response_attempts": attempts_path,
             "execution": execution_path,
             "raw_response": raw_path, "parsed_plan": parsed_path,
+            "llm_proposed_plan": proposed_plan_path,
             "validation_report": validation_path,
             "rejected_actions": rejected_path, "applied_plan": applied_path,
+            "structural_validation_result": structural_validation_path,
+            "structural_errors": structural_errors_path,
+            "non_blocking_warnings": warnings_path,
+            "final_applied_plan": final_applied_path,
             "structured_router_policy": structured_path,
             "rendered_router_prompt": rendered_path,
             "rendered_router_prompt_text": prompt_text_path,
@@ -573,7 +601,7 @@ class MemoryConditionedLLMRouterUpdater:
             if name == "revise":
                 target = (action.get("target_property_ids") or [None])[0]
             elif name == "merge":
-                target = action.get("proposed_property_id")
+                target = (action.get("target_property_ids") or [None])[0]
             else:
                 target = None
             if target:
@@ -585,8 +613,13 @@ class MemoryConditionedLLMRouterUpdater:
                 candidate.get("promoted_to_property_id")
             if not target:
                 continue
-            for polarity, field in (("positive", "positive_examples"),
-                                    ("negative", "negative_examples")):
+            for polarity, field in (
+                    ("positive", "positive_examples"),
+                    ("negative", "negative_examples"),
+                    ("mixed", "mixed_examples"),
+                    ("no_effect", "no_effect_examples"),
+                    ("unavailable", "failure_examples"),
+                    ("unclassified", "intervention_examples")):
                 for value in candidate.get(field) or ():
                     example = as_json_dict(value)
                     example_id = str(example.get("example_id") or "")
@@ -594,7 +627,11 @@ class MemoryConditionedLLMRouterUpdater:
                         continue
                     row = {
                         "evidence_id": example_id, "property_id": target,
-                        "polarity": polarity, "example": example,
+                        "polarity": str(example.get("effect") or polarity),
+                        "runtime_valid": not bool(
+                            example.get("runtime_failure_count") or
+                            example.get("intervention_failure_count")),
+                        "example": example,
                         "source_kind": "candidate_intervention_effect",
                     }
                     rows.append(row)
@@ -620,6 +657,14 @@ class MemoryConditionedLLMRouterUpdater:
             "remapped_structured_router_policy": remapped_structured,
             "routing_memory_examples": evidence,
             "current_compact_routing_evidence": evidence,
+            "evidence_status_contract": {
+                "semantic_transitions": (
+                    "wrong_to_correct", "correct_to_wrong",
+                    "correct_to_correct", "wrong_to_wrong"),
+                "reliability_only": ("runtime_failure", "intervention_failure"),
+                "rule": ("Reliability-only failures remain visible but must not be "
+                         "treated as positive or negative answer evidence."),
+            },
             "validated_codebook_actions": tuple(codebook_plan.get("actions") or ()),
             "fixed_protocol": remapped_structured["protocol"],
             "output_schema": {
@@ -645,12 +690,16 @@ class MemoryConditionedLLMRouterUpdater:
         candidate_bank: PromptBankSnapshot,
         examples: Mapping[str, Mapping[str, Any]],
         evidence: tuple[Mapping[str, Any], ...],
-    ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+        policy: Mapping[str, Any],
+    ) -> tuple[
+            tuple[dict[str, Any], ...], tuple[dict[str, Any], ...],
+            tuple[dict[str, Any], ...]]:
         active = {entry.prompt_id for entry in candidate_bank.entries
                   if entry.status == "active"}
         evidence_ids = {row["evidence_id"] for row in evidence}
-        accepted, rejected, claimed = [], [], set()
-        example_polarities: dict[tuple[str, str], str] = {}
+        policy_rows = {row["property_id"]: row
+                       for row in policy.get("properties") or ()}
+        accepted, rejected, warnings, claimed = [], [], [], set()
         for action in actions:
             reasons = []
             action_type = action["action_type"]
@@ -674,31 +723,37 @@ class MemoryConditionedLLMRouterUpdater:
                          else self.bounds.max_guidance_chars)
                 if len(value) > limit:
                     reasons.append("proposed routing text exceeds configured bound")
-                if _leaks_downstream_data(value):
-                    reasons.append("routing text leaks downstream QA information")
-            required_polarity = None
-            if action_type in ("set_selection_guidance", "add_positive_example"):
-                required_polarity = "positive"
-            elif action_type in ("set_avoidance_guidance", "add_negative_example"):
-                required_polarity = "negative"
-            if required_polarity:
-                if not memory_ids and not cited_evidence:
-                    reasons.append("router mutation lacks demonstrated effect support")
-                cited = tuple(examples[item] for item in memory_ids if item in examples)
-                if not cited or any(row["polarity"] != required_polarity or
-                                    row["property_id"] != target for row in cited):
-                    reasons.append(
-                        f"router action lacks supported {required_polarity} effect")
+                if _contains_placeholder(value):
+                    reasons.append("routing text contains an unresolved placeholder")
+            if action_type not in ("preserve", "no_op") and not (
+                    memory_ids or cited_evidence):
+                reasons.append("router mutation must cite bounded provenance")
             conflict_key = (target, action_type)
             if action_type.startswith("set_") and conflict_key in claimed:
                 reasons.append("router actions conflict on one guidance field")
+            if action_type.startswith("set_") and value:
+                field = ("selection_guidance" if action_type ==
+                         "set_selection_guidance" else "avoidance_guidance")
+                if str(policy_rows.get(target, {}).get(field) or "").casefold().strip() == \
+                        value.casefold().strip():
+                    reasons.append(f"exact duplicate {field} update")
+                if any(item["target_property_id"] == target and
+                       item["action_type"] == action_type and
+                       str(item.get("proposed_value") or "").casefold().strip() ==
+                       value.casefold().strip() for item in accepted):
+                    reasons.append(f"exact duplicate {field} update")
             if action_type in ("add_positive_example", "add_negative_example") and value:
-                polarity = "positive" if action_type == "add_positive_example" \
-                    else "negative"
-                example_key = (target, value.casefold().strip())
-                if example_key in example_polarities and \
-                        example_polarities[example_key] != polarity:
-                    reasons.append("same routing example has conflicting polarity")
+                existing_examples = tuple(
+                    policy_rows.get(target, {}).get("positive_examples") or ()) + tuple(
+                    policy_rows.get(target, {}).get("negative_examples") or ())
+                if value.casefold().strip() in {
+                        str(item).casefold().strip() for item in existing_examples}:
+                    reasons.append("exact duplicate routing example")
+                if any(item["target_property_id"] == target and
+                       "example" in item["action_type"] and
+                       str(item.get("proposed_value") or "").casefold().strip() ==
+                       value.casefold().strip() for item in accepted):
+                    reasons.append("exact duplicate routing example")
             if reasons:
                 rejected.append({"action_id": action["action_id"],
                                  "action_type": action_type,
@@ -707,10 +762,7 @@ class MemoryConditionedLLMRouterUpdater:
             accepted.append(action)
             if action_type.startswith("set_"):
                 claimed.add(conflict_key)
-            if action_type in ("add_positive_example", "add_negative_example"):
-                example_polarities[(target, value.casefold().strip())] = (
-                    "positive" if action_type == "add_positive_example" else "negative")
-        return tuple(accepted), tuple(rejected)
+        return tuple(accepted), tuple(rejected), tuple(warnings)
 
     @staticmethod
     def _apply_actions(
@@ -727,10 +779,14 @@ class MemoryConditionedLLMRouterUpdater:
                 row["avoidance_guidance"] = proposed
             elif kind == "add_positive_example":
                 row["positive_examples"] = list(dict.fromkeys((
-                    *row["positive_examples"], proposed)))[-POSITIVE_EXAMPLE_LIMIT:]
+                    *row["positive_examples"], proposed)))
             elif kind == "add_negative_example":
                 row["negative_examples"] = list(dict.fromkeys((
-                    *row["negative_examples"], proposed)))[-NEGATIVE_EXAMPLE_LIMIT:]
+                    *row["negative_examples"], proposed)))
+            positive, negative = compress_router_examples(
+                row["positive_examples"], row["negative_examples"])
+            row["positive_examples"] = list(positive)
+            row["negative_examples"] = list(negative)
         return value
 
     @staticmethod

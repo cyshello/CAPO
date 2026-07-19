@@ -158,6 +158,17 @@ worker-private manifest discipline and merge completed registrations in the
 parent. Only the explicit run boundary shuts down the vLLM EngineCore and joins
 the workers; a bounded smoke performs this cleanup in `finally`.
 
+The persistent Qwen backend disables vLLM's multimodal processor LRU and
+prefix cache (`mm_processor_cache_gb=0`, `enable_prefix_caching=False`). In
+vLLM 0.11.x the frontend metadata LRU and EngineCore multimodal-feature LRU can
+evict at different rates during hundreds of unique image requests. A later
+metadata hit can then send no image payload for an EngineCore miss and kill the
+EngineCore input thread with `Expected a cached item for mm_hash`. Disabling
+both reuse paths makes every request carry its images. Policy
+`qwen25_vl_mm_cache_disabled_v1`, both values, and the versioned backend ID are
+part of caption/router/run identity; pre-policy incomplete runs fail closed and
+must use new output/state roots.
+
 DVD `frame_inspect_tool` vision calls are raw-VLM tasks on this same pool. While
 the pool is active, the parent installs a lightweight `dvd_backend` captioner
 proxy and must never lazily initialize another local Qwen/vLLM engine. Without
@@ -377,8 +388,9 @@ initial and retry calls.
 The tested canonical property is not generalized or rewritten before selective
 re-captioning. `work_item.json`, `transitions.json`, and `result.json` retain the
 original proposal, source QA lineage, baseline correctness, candidate QA outputs,
-and all four correctness transitions. `property_compact_summary_v2` carries this
-bounded provenance into candidate memory and `memory_codebook_updater_request_v2`.
+the four semantic correctness transitions, and explicit `runtime_failure` status.
+`property_compact_summary_v3_runtime_validity` carries this bounded provenance
+into candidate memory and `memory_codebook_updater_request_v4`.
 Only the updater may promote a tested candidate into the active codebook.
 Applicability and `failure_analysis` persist through proposal
 artifacts and resume, feedback requests, candidate memory, the bounded codebook-
@@ -752,11 +764,15 @@ routed segment, property-to-caption content overlap, and caption-to-reasoning
 content reuse. Exact caption reuse or at least two reused content tokens is
 strong; one is weak; all other cases are none.
 
-Every completed candidate intervention receives a deterministic effect summary
-from all four transition counts. Any `wrong_to_correct` without a regression is
+Every candidate intervention receives a deterministic effect summary from the
+four semantic transition counts. Any `wrong_to_correct` without a regression is
 `positive`; any `correct_to_wrong` without an improvement is `negative`; both
-is `mixed`; no flip is `no_effect`. This summary does not change current
-intervention or feedback semantics.
+is `mixed`; no flip is `no_effect`. QA runtime failures and intervention
+execution failures are instead counted as `runtime_failure` and
+`intervention_failure`, retained for reliability review, and never converted
+to `wrong_to_wrong`, harmful evidence, or any other semantic effect. A summary
+with failures but no valid semantic transition is `unavailable`. This summary
+does not change current feedback triggering semantics.
 
 One active-property record contains its ID/text, creation reason, intended
 behavior, positive/harmful/no-effect examples, positive/negative routing
@@ -827,20 +843,27 @@ the candidate codebook and ID mapping before any atomic pair commit.
 
 The centralized system prompt is
 `optimization/prompts/codebook_updater_v1.txt`, version
-`memory_codebook_updater_prompt_v1`. Its request schema is
-`memory_codebook_updater_request_v2` and contains only the current codebook,
+`memory_codebook_updater_prompt_v3_deterministic_ids`. Its request schema is
+`memory_codebook_updater_request_v4` and contains only the current codebook,
 bounded active-property memories, bounded candidate memories, current compact
 intervention summaries, recent no-op/rejection summaries, and audit artifact
 references. It never contains raw frames, unbounded captions, or full reasoning
-histories.
+histories. The prompt explicitly makes the LLM the semantic decision-maker:
+correctness flips are important but not exclusive evidence, and grounding,
+temporal coherence, caption improvements without flips, robustness, harmful
+side effects, and evidence reliability must be considered holistically.
 
-The strict `memory_codebook_updater_response_v1` response contains zero or more
+The strict `memory_codebook_updater_response_v2` response contains zero or more
 `add`, `revise`, `merge`, `preserve`, `retire`, or `no_op` actions. Every action
-names target property/candidate IDs, optional proposed ID/text, concise
+names target property/candidate IDs, optional proposed text, concise
 reasoning, supporting memory-example/evidence IDs, behaviors to preserve, and
-confidence. The LLM never edits a snapshot directly.
+confidence. It never proposes a new active property ID. A validated `add`
+receives `pe_<20-hex-hash>` deterministically from the candidate identity and
+normalized proposed text under `deterministic_candidate_property_id_v1`.
+`revise` preserves its sole target identity, and the first target of a `merge`
+is canonical. The LLM never edits a snapshot directly.
 
-The real provider uses `openai_strict_component_update_v2`: an updater-specific
+The real provider uses `openai_strict_component_update_v3`: an updater-specific
 strict JSON Schema constrains the complete response envelope and every action,
 rather than merely requesting a syntactically valid JSON object. The codebook
 updater preserves each raw response beneath `attempts/attempt_NNN/` and retries
@@ -850,17 +873,21 @@ interrupted retry exactly resumable: an already persisted raw attempt is parsed
 again but never sent to the provider again. Older incomplete directories that
 predate this identity fail closed and are not reinterpreted.
 
-Deterministic validation rejects actions independently when they cite unknown
-properties, candidates, examples, or evidence; add without a completed positive
-intervention; non-reusable or instance/non-visual knowledge text; revise/merge
-that fails to cite and preserve existing positive behavior; invalid merge
-lineage or canonical ID; retirement without harmful support across at least two
-distinct video-or-iteration groups; conflicting mutations; ID/text collisions;
-or malformed schema. Rejections are explicit and do not invalidate otherwise
-independent valid actions.
+`memory_codebook_structural_validation_v2` asks only whether a plan is
+well-formed, properly referenced, internally consistent, and executable. It
+rejects malformed schema/IDs, unknown properties/candidates/examples/evidence,
+missing mutation provenance, impossible action shapes or merge lineage,
+conflicting mutations, placeholders, bounds violations, and exact ID/text
+collisions. It does not decide whether an intervention is positive enough,
+require a correctness flip or a particular evidence polarity, compare token
+overlap, require verbatim preservation language, or impose a multi-video retire
+threshold. Former semantic text/support heuristics are non-blocking warnings.
+Per-action structural errors do not invalidate otherwise independent valid
+actions, and the immutable audit records separate the LLM plan, structural
+errors, warnings, and final applied plan.
 
-Validated actions materialize `memory_candidate_codebook_v1` and
-`property_id_mapping_v1`. The mapping contains every old property ID, mapping
+Validated actions materialize `memory_candidate_codebook_v2` and
+`property_id_mapping_v2`. The mapping contains every old property ID, mapping
 unchanged entries to themselves, merged entries to the canonical ID, and
 retired entries to null; candidate promotions are recorded separately. Merge
 keeps source IDs and texts as aliases and combines bounded compatible memories.
@@ -891,10 +918,10 @@ and validated codebook actions:
 
 ```text
 candidate codebook + ID mapping + bounded routing evidence
-→ memory_router_updater_prompt_v1
+→ memory_router_updater_prompt_v2_semantic_llm
 → strict memory_router_updater_response_v1
-→ deterministic action validation
-→ structured_router_policy_v1
+→ structural action validation
+→ structured_router_policy_v2_total_examples
 → rendered_router_prompt_v1
 → atomic_provisional_policy_pair_v1
 ```
@@ -903,9 +930,11 @@ The protocol scaffold remains fixed: routing is query-independent; inputs are
 current frames and bounded preceding caption history; only active property IDs
 may be returned; the selection limit, strict one-key JSON schema, fail-closed
 parser, and no-fallback behavior remain unchanged. Editable per-property state
-contains `selection_guidance`, `avoidance_guidance`, up to two demonstrated
-positive examples, up to two demonstrated negative examples, aliases, and
-remapped source IDs. `prompt_routing/structured_router_policy.py` renders this
+contains `selection_guidance`, `avoidance_guidance`, demonstrated examples,
+aliases, and remapped source IDs. The implementation enforces one total budget
+of four examples across both stored labels; this is a prompt-size constraint,
+not a semantic polarity rule, and deterministic compression balances labels
+where possible. `prompt_routing/structured_router_policy.py` renders this
 state deterministically. The resulting text is stored in the candidate
 `RouterPolicySnapshot.configuration`, and `HistoryAwareVLMRouter` uses that
 exact text in later calls. Its schema/renderer versions and SHA-256 enter the
@@ -914,32 +943,36 @@ therefore routing-dependent resume/cache identity.
 
 The centralized router-updater prompt is
 `optimization/prompts/router_updater_v1.txt`, version
-`memory_router_updater_prompt_v1`. Actions may set selection or avoidance
+`memory_router_updater_prompt_v2_semantic_llm`. Actions may set selection or avoidance
 guidance, add bounded positive or negative examples, preserve, or no-op. The
-validator rejects unknown candidate-codebook IDs, unknown memory/evidence IDs,
-polarity-inconsistent examples, unsupported mutations, downstream QA leakage,
-conflicting guidance writes, stale mappings, or prompt/protocol changes.
+LLM interprets complete bounded routing/intervention evidence and makes the
+semantic decision. The structural validator rejects unknown candidate-codebook
+IDs, unknown memory/evidence IDs, unsupported or conflicting mutations,
+empty/placeholder/bounded text, exact duplicates, stale mappings, or
+prompt/protocol changes. It does not enforce evidence polarity,
+target/evidence semantic equivalence, or reject guidance merely because
+ordinary words such as `question` or `answer` appear.
 Codebook merges remap old guidance and aliases to one canonical ID;
 retirements remove obsolete guidance before LLM actions.
 
 The router provider uses the corresponding updater-specific strict JSON Schema
 and the same three-attempt parse-retry boundary. A missing or null
 `target_property_id`, missing response version, extra field, or malformed action
-is therefore rejected before deterministic semantic validation. Every raw
+is therefore rejected before structural validation. Every raw
 attempt and parse error is immutable and exact resume skips already completed
-provider calls. The deterministic no-routing-evidence branch still performs no
-provider call and records attempt index zero.
+provider calls. By default, zero routing evidence still reaches the LLM so its
+explicit no-op judgment is recorded.
 
-`memory_conditioned_llm_router_updater_v3_strict_retry` has a deterministic no-evidence
-boundary. When the bounded property memory and promoted-candidate mapping
-produce zero routing-evidence rows, no router mutation can be validated. The
-stage therefore does not call the LLM provider and materializes the strict
-empty response `{"actions": []}` under
-`no_routing_evidence_empty_plan_v1`. It still validates the empty plan,
-applies deterministic ID remapping, renders and hashes the actual router
-prompt, and participates in the atomic provisional pair. A non-empty routing
-evidence set follows the existing LLM path, and empty or stale target IDs
-remain parser/validator errors rather than being normalized.
+`memory_conditioned_llm_router_updater_v4_structural_only` makes the former
+zero-evidence shortcut an explicit configuration rather than a hidden semantic
+conclusion. The default uses `llm_provider_no_evidence`; an empty action list is
+the expected conservative response but is chosen by the LLM. A caller may opt
+into `skip_llm_when_no_evidence=True` for cost or legacy compatibility; that
+path records `configured_empty_evidence_skip` and
+`explicit_skip_llm_when_no_evidence`, then still validates the empty plan,
+applies deterministic ID remapping, renders/hashes the prompt, and participates
+in the atomic provisional pair. Empty or stale target IDs remain parser or
+structural-validator errors rather than being normalized.
 
 Persistence is two-phase. Router request/response/validation/rendering
 artifacts may exist without a committed pair, but a codebook is not made active

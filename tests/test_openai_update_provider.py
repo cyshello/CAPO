@@ -6,7 +6,7 @@ def test_openai_update_provider_uses_strict_json_schema(monkeypatch):
 
     def fake_chat(prompt, **kwargs):
         captured.update(kwargs)
-        return '{"schema_version":"memory_codebook_updater_response_v1","actions":[]}'
+        return '{"schema_version":"memory_codebook_updater_response_v2","actions":[]}'
 
     monkeypatch.setattr(openai_update, "_openai_chat", fake_chat)
     schema = openai_update.codebook_updater_response_schema(max_actions=7)
@@ -21,6 +21,8 @@ def test_openai_update_provider_uses_strict_json_schema(monkeypatch):
     assert response_format["json_schema"]["schema"] == schema
     assert schema["properties"]["actions"]["maxItems"] == 7
     assert set(schema["required"]) == {"schema_version", "actions"}
+    assert "proposed_property_id" not in schema["properties"]["actions"][
+        "items"]["properties"]
 
 
 def test_router_schema_requires_target_and_envelope():

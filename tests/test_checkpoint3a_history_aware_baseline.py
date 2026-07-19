@@ -1,4 +1,5 @@
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -214,6 +215,37 @@ def test_qwen_sampling_remains_unconstrained_without_schema():
     assert sampling.structured_outputs is None
 
 
+def test_qwen_disables_vllm_multimodal_and_prefix_caches(monkeypatch):
+    from surrogate_rollout.captioning.qwen25_vl import (
+        Qwen25VLCaptioner,
+        VLLM_MM_CACHE_POLICY_VERSION,
+    )
+
+    calls = []
+
+    class FakeProcessorFactory:
+        @staticmethod
+        def from_pretrained(model_path):
+            return {"model_path": model_path}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules, "transformers",
+        SimpleNamespace(AutoProcessor=FakeProcessorFactory))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=FakeLLM))
+
+    captioner = Qwen25VLCaptioner(model_path="/fixture/qwen")
+
+    assert calls[0]["mm_processor_cache_gb"] == 0.0
+    assert calls[0]["enable_prefix_caching"] is False
+    assert captioner.mm_processor_cache_gb == 0.0
+    assert captioner.enable_prefix_caching is False
+    assert VLLM_MM_CACHE_POLICY_VERSION == "qwen25_vl_mm_cache_disabled_v1"
+
+
 def test_empty_property_ids_uses_only_base_caption_prompt():
     bank, policy, scaffold_policy, contract = components()
     decision = HistoryAwareVLMRouter(
@@ -364,6 +396,10 @@ def test_sequential_history_is_shared_persisted_cached_and_resumable(tmp_path):
         CAPTION_PARSE_NORMALIZATION_VERSION
     assert identity["caption_parse_max_retries"] == 5
     assert identity["subject_registry_mode"] == "empty"
+    assert identity["vllm_multimodal_cache_policy_version"] == \
+        "qwen25_vl_mm_cache_disabled_v1"
+    assert identity["vllm_mm_processor_cache_gb"] == 0.0
+    assert identity["vllm_enable_prefix_caching"] is False
 
     before = len(vlm.calls)
     resumed = builder.build(
@@ -780,3 +816,76 @@ def test_persistent_pool_demultiplexes_concurrent_video_requests():
         builder._pool_result_queue.put({"request_id": "__parent_stop__"})
         builder._pool_result_thread.join(timeout=2.0)
         builder._pool_processes.clear()
+
+
+def test_persistent_pool_close_releases_queue_feeder_resources():
+    import threading
+
+    class Channel:
+        def __init__(self):
+            self.values = []
+            self.closed = False
+            self.joined = False
+
+        def put(self, value):
+            self.values.append(value)
+
+        def close(self):
+            self.closed = True
+
+        def join_thread(self):
+            self.joined = True
+
+    class Process:
+        def __init__(self):
+            self.alive = True
+            self.joins = []
+
+        def join(self, timeout=None):
+            self.joins.append(timeout)
+            self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.alive = False
+
+    class ResultThread:
+        def __init__(self):
+            self.joined = False
+
+        def join(self, timeout=None):
+            self.joined = True
+
+        def is_alive(self):
+            return False
+
+    builder = object.__new__(HistoryAwareBaselineCaptionViewBuilder)
+    command = Channel()
+    result = Channel()
+    process = Process()
+    result_thread = ResultThread()
+    builder._pool_lock = threading.RLock()
+    builder._pool_processes = {"7": process}
+    builder._pool_command_queues = {"7": command}
+    builder._pool_result_queue = result
+    builder._pool_result_thread = result_thread
+    builder._pool_pending = {}
+    builder._pool_registered_with_atexit = False
+    builder._parent_dvd_backend = None
+    builder._parent_previous_captioner = None
+    builder._register_pool_request = lambda _kind: "shutdown-1"
+    builder._wait_pool_result = lambda _request_id, timeout_seconds: {
+        "gpu": "7", "cleanup_warning": None}
+
+    builder.close_worker_pool()
+
+    assert command.values == [{
+        "request_id": "shutdown-1", "type": "shutdown"}]
+    assert result.values == [{"request_id": "__parent_stop__"}]
+    assert command.closed and command.joined
+    assert result.closed and result.joined
+    assert result_thread.joined
+    assert builder._pool_processes == {}
+    assert builder._pool_result_queue is None

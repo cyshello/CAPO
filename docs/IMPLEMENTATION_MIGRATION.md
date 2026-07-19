@@ -134,6 +134,15 @@ explicit worker shutdown, call the vLLM EngineCore shutdown path, then join with
 a bounded termination fallback. A worker task failure fails that task without
 silently loading a second parent-process Qwen instance.
 
+Persistent multimodal workers use `qwen25_vl_mm_cache_disabled_v1`:
+`Qwen25VLCaptioner` passes `mm_processor_cache_gb=0` and
+`enable_prefix_caching=False` to vLLM. This prevents the frontend metadata cache
+from reporting a hit after the independently sized EngineCore feature cache has
+evicted the same image hash. The cache policy and values are included in the
+history-aware component identity and `LOCAL_QWEN_BACKEND_ID`, so an incomplete
+run made with the former vLLM defaults cannot be resumed under the new worker
+semantics. Standalone Qwen construction uses the same safe defaults.
+
 Route DVD `frame_inspect_tool` raw vision requests through the same pool by
 installing a parent-process captioner proxy only while the pool is active.
 Preserve standalone lazy Qwen initialization when no pool exists. Baseline QA
@@ -245,9 +254,10 @@ the exact source QA, and baseline correctness;
 legacy failure fields are accepted only by artifact loader/constructor adapters
 and are never serialized by the new provider contract. Applicability and
 `failure_analysis` are retained in proposal, feedback, intervention, property-
-memory, and codebook-updater artifacts. `property_intervention_transitions_v2`
+memory, and codebook-updater artifacts. `property_intervention_transitions_v3`
 retains the original proposal plus candidate QA outcomes and transitions;
-`property_compact_summary_v2` and `memory_codebook_updater_request_v2` carry the
+`property_compact_summary_v3_runtime_validity` and
+`memory_codebook_updater_request_v4` carry the
 bounded provenance to the updater. Router interpretation remains out of scope.
 
 `multi_property_proposer_v10` adds `missing_qa_slot_retry_v1`. A structurally
@@ -567,13 +577,15 @@ Files and interfaces changed:
 - `optimization/llm_codebook_updater.py`: strict request/response parsing,
   bounded request building, action-by-action deterministic validation,
   candidate bank application, ID mapping, memory promotion, artifact identity,
-  and exact resume. The real provider now uses updater-specific strict JSON
-  Schema output (`openai_strict_component_update_v2`) and the updater preserves
+  and exact resume. New active IDs are assigned as deterministic opaque
+  `pe_<hash>` values from candidate identity/text; the LLM no longer names
+  them. The real provider uses updater-specific strict JSON Schema output
+  (`openai_strict_component_update_v3`) and the updater preserves
   up to three immutable parse attempts. `input_identity.json` permits an
   interrupted attempt sequence to resume without repeating saved provider
   calls; pre-identity partial directories fail closed.
 - `optimization/prompts/codebook_updater_v1.txt`: centralized tunable system
-  prompt, version `memory_codebook_updater_prompt_v1`.
+  prompt, version `memory_codebook_updater_prompt_v3_deterministic_ids`.
 - `optimization/final_iteration.py`: optional memory/updater stage injection and
   `run_memory_conditioned_codebook_checkpoint()` orchestration boundary.
 - `optimization/property_memory.py`: preserves categorized candidate examples
@@ -585,13 +597,14 @@ Files and interfaces changed:
 
 Artifacts use these schemas:
 
-- request: `memory_codebook_updater_request_v2`;
-- response: `memory_codebook_updater_response_v1`;
-- validation: `memory_codebook_validation_report_v1`;
-- applied plan: `memory_codebook_applied_plan_v1`;
-- candidate codebook: `memory_candidate_codebook_v1`;
-- ID mapping: `property_id_mapping_v1`;
-- updater manifest: `memory_codebook_checkpoint_manifest_v2`;
+- request: `memory_codebook_updater_request_v4`;
+- response: `memory_codebook_updater_response_v2`;
+- validation: `memory_codebook_structural_validation_v2`;
+- applied plan: `memory_codebook_applied_plan_v3`;
+- candidate codebook: `memory_candidate_codebook_v2`;
+- ID mapping: `property_id_mapping_v2`;
+- updater manifest: `memory_codebook_checkpoint_manifest_v4`;
+- active-property ID derivation: `deterministic_candidate_property_id_v1`;
 - retry audit: `memory_codebook_updater_attempts_v1`;
 - partial-resume identity: `memory_codebook_updater_input_identity_v1`;
 - orchestration manifest: `memory_conditioned_codebook_iteration_v1`;
@@ -618,14 +631,16 @@ codebook actions to `optimization/prompts/router_updater_v1.txt`. Strict JSON
 actions are individually validated. The LLM never writes a prompt or router
 snapshot directly.
 
-`structured_router_policy_v1` keeps the immutable protocol separately from
-per-property selection/avoidance guidance, two positive/two negative examples,
-aliases, and remapped IDs. `history_aware_router_prompt_renderer_v1` produces
+`structured_router_policy_v2_total_examples` keeps the immutable protocol
+separately from per-property selection/avoidance guidance, a total bounded
+budget of four examples across both stored labels,
+aliases, and remapped IDs. `history_aware_router_prompt_renderer_v2` produces
 `rendered_router_prompt_v1`; the exact text and hash are installed in the
 candidate `RouterPolicySnapshot` and consumed by the real history-aware VLM
-router. Invalid/stale IDs, unsupported example polarity, question/answer/gold/
-prediction/reasoning leakage, conflicts, retired guidance, protocol changes,
-and hash mismatch fail closed.
+router. Invalid/stale IDs, unknown evidence, malformed or conflicting actions,
+retired guidance, protocol changes, and hash mismatch fail closed. Evidence
+polarity, token overlap, and ordinary `question`/`answer` words are no longer
+semantic rejection gates.
 
 `Checkpoint3EOrchestrator.run_memory_conditioned_router_checkpoint()` validates
 the complete Checkpoint 2 artifact closure and creates
@@ -658,24 +673,25 @@ Files and interfaces changed:
   rendered-prompt consumption probe, confirmed-pointer guard, exact resume,
   and worker-cleanup audit. Legacy fixture callers remain deterministic.
 
-Schemas/versions are `memory_router_updater_request_v1`,
+Schemas/versions are `memory_router_updater_request_v2`,
 `memory_router_updater_response_v1`, `memory_router_updater_plan_v1`,
-`memory_router_validation_report_v1`, `memory_router_applied_plan_v1`,
-`memory_router_updater_manifest_v2`, `memory_router_updater_attempts_v1`,
-`memory_router_updater_input_identity_v1`, `structured_router_policy_v1`,
+`memory_router_structural_validation_v2`, `memory_router_applied_plan_v2`,
+`memory_router_updater_manifest_v3`, `memory_router_updater_attempts_v1`,
+`memory_router_updater_input_identity_v1`, `structured_router_policy_v2_total_examples`,
 `rendered_router_prompt_v1`, `atomic_provisional_policy_pair_v1`, and
 `memory_conditioned_atomic_policy_pair_v1`; the system prompt is
-`memory_router_updater_prompt_v1`.
+`memory_router_updater_prompt_v2_semantic_llm`.
 
 The router updater execution policy is
-`no_routing_evidence_empty_plan_v1`. Previously, an iteration whose codebook
+`explicit_empty_evidence_optimization_v2`. Previously, an iteration whose codebook
 plan contained only target-free candidate `no_op` decisions could lead the LLM
 to copy those decisions into router actions with `target_property_id: ""`; the
 strict parser correctly rejected the response and prevented the atomic pair.
-Now zero routing evidence deterministically produces an empty router plan
-without a provider call. `execution.json`, the updater manifest, the atomic
-pair, and the operational log record the execution mode and provider-call
-flag. Target validation is unchanged for every LLM-generated action.
+The current default lets the LLM see an empty bounded evidence set and return a
+semantic no-op. A provider-free empty plan is available only through the
+explicit `skip_llm_when_no_evidence=True` optimization. `execution.json`, the
+updater manifest, the atomic pair, and the operational log record the mode and
+provider-call flag. Target validation is unchanged for every generated action.
 
 Intentionally deferred: confirmation of this provisional pair, promotion to a
 confirmed production pointer, and any regular production or real-model run.
@@ -689,15 +705,58 @@ target. The first strict parser error terminated the iteration and only one
 top-level `raw_response.txt` remained.
 
 Now `optimization/policies/openai_update.py` supplies separate strict response
-schemas for the codebook and router planners. The unchanged canonical response
-schemas remain `memory_codebook_updater_response_v1` and
-`memory_router_updater_response_v1`; provider enforcement and execution
+schemas for the codebook and router planners. The codebook response is
+`memory_codebook_updater_response_v2` after removing LLM-generated property
+IDs; the router response remains `memory_router_updater_response_v1`.
+Provider enforcement and execution
 semantics are versioned separately. Both updaters retain raw/result artifacts
 for attempts 1 through 3, write a response-attempt summary, and use an immutable
 input fingerprint to continue a partial attempt sequence. They never inject a
 missing version, repair model JSON locally, retry runtime/API failures, or
 reinterpret a completed legacy artifact. The codebook candidate, router
 validation, rendering, and atomic-pair semantics are unchanged.
+
+### 3.17.2 Semantic LLM decision and structural-only validation
+
+Previous behavior: after an LLM emitted a syntactically valid plan, the
+codebook validator independently required positive/flip evidence for `add`,
+textual preservation and token overlap for `revise`/`merge`, and harmful
+support across two video-or-iteration groups for `retire`. The router validator
+enforced evidence polarity by guidance field, target/evidence property
+agreement, and broad question/answer regexes. Empty routing evidence silently
+forced a provider-free plan. These rules could replace the LLM's semantic
+judgment with deterministic heuristics.
+
+Current behavior: `MemoryConditionedLLMCodebookUpdater` and
+`MemoryConditionedLLMRouterUpdater` make the semantic decision from bounded
+memory and intervention evidence. Their validators check only strict schema,
+references, action shape, conflicts, exact duplicates, bounds/placeholders,
+ID-space consistency, and deterministic executability. Evidence citations
+remain mandatory for mutations and are checked for existence, but polarity,
+semantic sufficiency, token overlap, and retirement thresholds are not
+application gates. Former support and text heuristics are retained only as
+`non_blocking_warnings` where useful.
+
+Candidate QA runtime errors are recorded as `runtime_failure`; failed
+interventions are recorded as `intervention_failure`. Both remain in compact
+memory and updater requests for reliability assessment but are excluded from
+the four semantic transition counts and positive/negative memory. The compact
+summary contract is `property_compact_summary_v3_runtime_validity`.
+
+Both updater directories now preserve five explicit audit views in addition to
+the backward-compatible artifact names: `llm_proposed_plan.json`,
+`structural_validation_result.json`, `structural_errors.json`,
+`non_blocking_warnings.json`, and `final_applied_plan.json`. The structural
+result status is only `valid` or `invalid_with_structural_errors`; rejected
+actions are never silently converted to no-op.
+
+The router's four-example total budget is an engineering size constraint and
+is applied by deterministic compression rather than polarity-based rejection.
+Zero-evidence LLM skipping is now the explicit
+`skip_llm_when_no_evidence=True` optimization and defaults to false. Exact
+resume includes this setting and all new prompt/schema versions in identity.
+Legacy completed artifacts remain immutable and incompatible partial outputs
+fail closed.
 
 ### 3.18 Production memory-conditioned iteration launcher
 

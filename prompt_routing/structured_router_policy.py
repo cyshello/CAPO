@@ -16,12 +16,11 @@ from surrogate_rollout.prompt_routing.schemas import (
 from surrogate_rollout.schemas import sha256_json, sha256_text
 
 
-STRUCTURED_ROUTER_POLICY_SCHEMA_VERSION = "structured_router_policy_v1"
-ROUTER_PROMPT_RENDERER_VERSION = "history_aware_router_prompt_renderer_v1"
+STRUCTURED_ROUTER_POLICY_SCHEMA_VERSION = "structured_router_policy_v2_total_examples"
+ROUTER_PROMPT_RENDERER_VERSION = "history_aware_router_prompt_renderer_v2"
 RENDERED_ROUTER_PROMPT_SCHEMA_VERSION = "rendered_router_prompt_v1"
 ROUTER_PROTOCOL_VERSION = "history_aware_router_protocol_v1"
-POSITIVE_EXAMPLE_LIMIT = 2
-NEGATIVE_EXAMPLE_LIMIT = 2
+ROUTING_EXAMPLE_TOTAL_LIMIT = 4
 
 FIXED_ROUTER_PROTOCOL = {
     "version": ROUTER_PROTOCOL_VERSION,
@@ -50,6 +49,37 @@ def _property_row(entry: Any) -> dict[str, Any]:
         "aliases": aliases,
         "remapped_from_property_ids": (),
     }
+
+
+def compress_router_examples(
+    positive: tuple[str, ...] | list[str],
+    negative: tuple[str, ...] | list[str],
+    *, limit: int = ROUTING_EXAMPLE_TOTAL_LIMIT,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Bound total prompt size without assigning semantic validity by polarity."""
+    positive_values = tuple(dict.fromkeys(str(item) for item in positive))
+    negative_values = tuple(dict.fromkeys(str(item) for item in negative))
+    if len(positive_values) + len(negative_values) <= limit:
+        return positive_values, negative_values
+    selected: set[tuple[str, str]] = set()
+    reversed_groups = (
+        ("positive", tuple(reversed(positive_values))),
+        ("negative", tuple(reversed(negative_values))),
+    )
+    offset = 0
+    while len(selected) < limit:
+        added = False
+        for polarity, values in reversed_groups:
+            if offset < len(values) and len(selected) < limit:
+                selected.add((polarity, values[offset]))
+                added = True
+        if not added:
+            break
+        offset += 1
+    return (
+        tuple(item for item in positive_values if ("positive", item) in selected),
+        tuple(item for item in negative_values if ("negative", item) in selected),
+    )
 
 
 def bootstrap_structured_router_policy(
@@ -108,12 +138,14 @@ def validate_structured_router_policy(
         if any(not isinstance(row[field], str)
                for field in ("property_id", "selection_guidance", "avoidance_guidance")):
             raise StructuredRouterPolicyError("guidance fields must be strings")
-        for field, bound in (("positive_examples", POSITIVE_EXAMPLE_LIMIT),
-                             ("negative_examples", NEGATIVE_EXAMPLE_LIMIT)):
+        for field in ("positive_examples", "negative_examples"):
             values = row[field]
-            if not isinstance(values, (list, tuple)) or len(values) > bound or any(
+            if not isinstance(values, (list, tuple)) or any(
                     not isinstance(item, str) or not item for item in values):
                 raise StructuredRouterPolicyError(f"invalid bounded {field}")
+        if len(row["positive_examples"]) + len(row["negative_examples"]) > \
+                ROUTING_EXAMPLE_TOTAL_LIMIT:
+            raise StructuredRouterPolicyError("router examples exceed total size budget")
         for field in ("aliases", "remapped_from_property_ids"):
             values = row[field]
             if not isinstance(values, (list, tuple)) or any(
@@ -155,12 +187,13 @@ def remap_structured_router_policy(
             *(str(item) for item in entry.provenance.get("aliases") or ()),
             *source_ids,
         )))
+        positive, negative = compress_router_examples(positive, negative)
         rows.append({
             "property_id": entry.prompt_id,
             "selection_guidance": selection,
             "avoidance_guidance": avoidance,
-            "positive_examples": positive[:POSITIVE_EXAMPLE_LIMIT],
-            "negative_examples": negative[:NEGATIVE_EXAMPLE_LIMIT],
+            "positive_examples": positive,
+            "negative_examples": negative,
             "aliases": aliases,
             "remapped_from_property_ids": source_ids,
         })
