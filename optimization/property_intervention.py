@@ -14,6 +14,7 @@ from surrogate_rollout.captioning.history_aware_baseline import (
     CAPTION_OUTPUT_CONTRACT_VERSION,
     CAPTION_PARSE_NORMALIZATION_VERSION,
     CAPTION_PARSE_SCHEMA_VERSION,
+    CAPTION_REPETITION_POLICY_VERSION,
 )
 from surrogate_rollout.evaluation.dvd_qa import (
     dvd_qa_execution_identity,
@@ -737,12 +738,15 @@ class PropertyInterventionBatchRunner:
             "model_id": self.segment_captioner.caption_model_id,
             "backend_id": self.segment_captioner.backend_id,
             "decoding_hash": config.decoding_hash(),
+            "caption_decoding_policy_version":
+                config.CAPTION_DECODING_POLICY_VERSION,
             "caption_output_contract_version":
                 CAPTION_OUTPUT_CONTRACT_VERSION,
             "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
             "caption_parse_normalization_version":
                 CAPTION_PARSE_NORMALIZATION_VERSION,
-            "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
+            "caption_repetition_policy_version":
+                CAPTION_REPETITION_POLICY_VERSION,
         }
 
     def _qa_configuration(self, dvd_max_iterations: int) -> dict[str, Any]:

@@ -71,13 +71,17 @@ def preload_dvd_embedder() -> None:
 
 def dvd_qa_execution_identity(max_iterations: int) -> dict[str, object]:
     return {
-        "policy_version": "dvd_qa_execution_v3",
+        "policy_version": "dvd_qa_execution_v4_strict_frame_inspect",
         "dvd_max_iterations": int(max_iterations),
         "clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
         "clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
         "embedding_preload_policy_version":
             DVD_EMBEDDER_PRELOAD_POLICY_VERSION,
         "qa_concurrency_policy_version": DVD_QA_CONCURRENCY_POLICY_VERSION,
+        "frame_inspect_tool_contract_version":
+            config.DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION,
+        "frame_inspect_corrective_retry_limit":
+            config.DVD_FRAME_INSPECT_CORRECTIVE_RETRY_LIMIT,
     }
 
 
@@ -98,6 +102,41 @@ def _constrain_clip_search_schema(agent: object, top_k: int) -> None:
             f"Fixed by the execution policy. Always use {top_k}.")
         return
     raise RuntimeError("DVD clip_search_tool schema is missing")
+
+
+def _constrain_frame_inspect_schema(agent: object) -> None:
+    """Match the provider tool contract to DVD's string-only implementation."""
+    schemas = getattr(agent, "function_schemas", ())
+    for schema in schemas:
+        function = schema.get("function") or {}
+        if function.get("name") != "frame_inspect_tool":
+            continue
+        parameters = function.get("parameters") or {}
+        properties = parameters.get("properties") or {}
+        field = properties.get("time_ranges_hhmmss")
+        if not isinstance(field, dict):
+            raise RuntimeError(
+                "DVD frame_inspect_tool schema is missing time ranges")
+        field.clear()
+        field.update({
+            "type": "array", "minItems": 1,
+            "description": (
+                "One or more [start, end] pairs. Every endpoint must be an "
+                "HH:MM:SS string, for example [[\"00:00:10\", "
+                "\"00:00:20\"]]. Numeric seconds are invalid."),
+            "items": {
+                "type": "array", "minItems": 2, "maxItems": 2,
+                "items": {
+                    "type": "string",
+                    "pattern":
+                        r"^[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$",
+                },
+            },
+        })
+        parameters["additionalProperties"] = False
+        function["strict"] = True
+        return
+    raise RuntimeError("DVD frame_inspect_tool schema is missing")
 
 
 def ensure_backend(
@@ -257,6 +296,7 @@ def run_dvd_qa(
                     "DVD database FPS identity mismatch: "
                     f"expected={effective_fps!r}, stored={stored_fps!r}")
             _constrain_clip_search_schema(agent, config.DVD_CLIP_SEARCH_TOP_K)
+            _constrain_frame_inspect_schema(agent)
             messages = agent.run(question)
         except Exception as e:
             import traceback

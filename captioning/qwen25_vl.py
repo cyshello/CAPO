@@ -118,6 +118,7 @@ class Qwen25VLCaptioner(BaseCaptioner):
         temperature: float,
         top_p: float,
         *,
+        repetition_penalty: float = 1.0,
         json_schema: Mapping[str, Any] | None = None,
     ):
         from vllm import SamplingParams
@@ -135,6 +136,7 @@ class Qwen25VLCaptioner(BaseCaptioner):
             max_tokens=max_tokens or self.default_max_tokens,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=repetition_penalty,
             structured_outputs=structured_outputs,
         )
 
@@ -146,6 +148,7 @@ class Qwen25VLCaptioner(BaseCaptioner):
         max_tokens: int | None = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
         json_schema: Mapping[str, Any] | None = None,
         **kwargs,
     ) -> list[str]:
@@ -160,6 +163,7 @@ class Qwen25VLCaptioner(BaseCaptioner):
                 max_tokens,
                 temperature,
                 top_p,
+                repetition_penalty=repetition_penalty,
                 json_schema=json_schema,
             ),
         )

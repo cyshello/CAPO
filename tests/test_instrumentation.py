@@ -10,12 +10,14 @@ from typing import Annotated
 import pytest
 
 from surrogate_rollout.instrumentation import (
+    FrameInspectArgumentValidationError,
     RunRecorder,
     _wrap_frame_inspect,
     _wrap_retrieval_tool,
 )
 from surrogate_rollout.evaluation.dvd_qa import (
     _constrain_clip_search_schema,
+    _constrain_frame_inspect_schema,
     dvd_qa_execution_identity,
     serialized_dvd_qa_execution,
 )
@@ -98,6 +100,31 @@ def test_clip_search_schema_and_execution_identity_are_fixed_to_16():
         "dvd_bge_parent_preload_v1"
     assert identity["qa_concurrency_policy_version"] == \
         "serialized_dvd_qa_execution_v1"
+    assert identity["frame_inspect_tool_contract_version"] == \
+        "strict_hhmmss_pair_with_one_corrective_retry_v1"
+    assert identity["frame_inspect_corrective_retry_limit"] == 1
+
+
+def test_frame_inspect_schema_requires_hhmmss_string_pairs():
+    class Agent:
+        function_schemas = [{
+            "function": {
+                "name": "frame_inspect_tool",
+                "parameters": {"properties": {"time_ranges_hhmmss": {
+                    "type": "array", "items": {"items": {}},
+                }}},
+            },
+        }]
+
+    agent = Agent()
+    _constrain_frame_inspect_schema(agent)
+    function = agent.function_schemas[0]["function"]
+    field = function["parameters"]["properties"]["time_ranges_hhmmss"]
+    assert function["strict"] is True
+    assert function["parameters"]["additionalProperties"] is False
+    assert field["items"]["minItems"] == field["items"]["maxItems"] == 2
+    assert field["items"]["items"]["type"] == "string"
+    assert "pattern" in field["items"]["items"]
 
 
 def test_dvd_qa_global_state_guard_serializes_parallel_callers():
@@ -167,6 +194,42 @@ def test_frame_inspect_args_recorded():
     assert out == "answer"
     ev = rec.tool_events[0]
     assert ev["args"]["time_ranges_hhmmss"] == [("00:00:10", "00:00:20")]
+    assert ev["status"] == "completed"
+    assert ev["execution_performed"] is True
+
+
+def test_frame_inspect_invalid_numeric_args_get_one_corrective_retry():
+    calls = []
+
+    def frame_inspect_tool(database, question, time_ranges_hhmmss):
+        calls.append(time_ranges_hhmmss)
+        return "answer"
+
+    rec = RunRecorder()
+    wrapped = _wrap_frame_inspect(frame_inspect_tool, rec)
+    error = wrapped(database=object(), question="q?",
+                    time_ranges_hhmmss=[[0, 10]])
+    assert "Correct the arguments" in error
+    assert calls == []
+    assert rec.tool_events[0]["status"] == "argument_validation_error"
+    assert rec.tool_events[0]["execution_performed"] is False
+    assert rec.tool_events[0]["corrective_retry_index"] == 1
+
+    assert wrapped(database=object(), question="q?",
+                   time_ranges_hhmmss=[["00:00:00", "00:00:10"]]) == "answer"
+    assert calls == [[["00:00:00", "00:00:10"]]]
+
+
+def test_frame_inspect_second_invalid_args_fail_closed():
+    rec = RunRecorder()
+    wrapped = _wrap_frame_inspect(lambda **_kwargs: "unreached", rec)
+    wrapped(database=object(), question="q?", time_ranges_hhmmss=[[0, 10]])
+    with pytest.raises(FrameInspectArgumentValidationError,
+                       match="single corrective retry"):
+        wrapped(database=object(), question="q?",
+                time_ranges_hhmmss=[[30, 50]])
+    assert len(rec.tool_events) == 2
+    assert all(not row["execution_performed"] for row in rec.tool_events)
 
 
 def test_token_usage_summary_null_when_unexposed():

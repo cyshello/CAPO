@@ -93,46 +93,42 @@ c_{i,t}
 C(s_{i,t},h_{i,t},\theta_{i,t}).
 \]
 
-History-aware caption output uses `caption_output_contract_v2`. The model is
-asked for exactly one JSON object with a non-empty `clip_description`.
-The default `subject_registry` mode is `empty`, which asks the current local
-model to return `{}`. The versioned `optional` mode allows a larger model to
-populate it. In both modes a valid populated object is preserved, while a
-missing, null, or non-object registry is normalized to `{}`. A one-element
-array containing exactly one otherwise-valid caption
-object is conservatively unwrapped for local-model compatibility. Empty or
-multi-element arrays and missing/blank descriptions fail closed. The complete
-raw response remains immutable; `caption_parse_result_v2` records every
-normalization or rejection reason next to the parsed value.
+History-aware caption output uses `caption_plain_text_output_contract_v2`.
+Qwen is asked for only a non-empty plain-text visual description without a
+sentence-count limit. It does not generate the persistent JSON envelope. The harness
+validates the exact raw text and deterministically serializes it as
+`{"clip_description": text}`. JSON-looking text is not interpreted or repaired;
+if non-empty and otherwise valid, it remains literal caption text. Blank text
+and deterministic degeneration fail closed.
 
-The caption-output contract and parser versions participate in segment-state,
+The output contract text/hash, plain-text parser/normalization version,
+repetition-guard version, and decoding policy/hash participate in segment-state,
 caption-cache, baseline, intervention, and confirmation identities. Completed
-legacy cache artifacts are never reinterpreted under the new parser. Larger
-caption models may populate `subject_registry` without changing downstream
-interfaces; descriptions remain the only required per-segment semantic field.
+legacy JSON cache artifacts are never reinterpreted or overwritten.
 
-Caption parsing uses `caption_parse_retry_v2_percent_escape`. Before strict JSON
-loading, `caption_parse_normalization_v2_percent_escape` removes only an
-unescaped invalid `\%` sequence; valid JSON escapes and every other invalid
-escape remain unchanged. The raw response is never modified, and the applied
-normalization is recorded as `replace_invalid_percent_escape`. A model call whose raw response
-parses as invalid is followed by at most five retries with identical frames,
+Caption parsing uses `caption_plain_text_parse_result_v2` and
+`caption_repetition_guard_v1`. Three consecutive canonically identical
+sentences are rejected. For outputs of at least 48 word tokens, at least four
+occurrences of an eight-token n-gram covering 80 percent or more of all word
+tokens are rejected as majority repetition. These thresholds deliberately
+avoid rejecting ordinary local repetition. A model call whose raw response is
+invalid is followed by at most five retries with identical frames,
 transcript, composed property instruction, frozen history, decoding, and
 output contract. Thus one segment has at most six generation calls: the
 initial attempt plus five retries. Runtime/backend exceptions still propagate
 immediately. Every attempt retains its raw output, parse classification,
-elapsed time, and attempt index in `history_aware_caption_cache_v4`. The first
+elapsed time, and attempt index in `history_aware_caption_cache_v5`. The first
 valid parse ends the loop; five exhausted retries leave `parsed={}` and the
 existing baseline/intervention fail-closed behavior applies.
 
-Compatible valid v2/v3 caption caches remain reusable because the narrow
-normalization does not change already-valid output. An immutable earlier
-invalid cache is not overwritten: its raw response is reparsed beneath
-`parse_retries/caption_parse_retry_v2_percent_escape/caption.json`, with the
-cached invalid response retained as attempt one. If `\%` was the only defect,
-this recovery performs no model call. The retry/normalization policies are part
-of captioner configuration and run/intervention identity, and model-call
-telemetry counts every actual retry.
+Caption decoding is `temperature=0`, `max_tokens=1024` newly generated tokens,
+and `repetition_penalty=1.05` under
+`qwen_caption_plain_text_decoding_v2`. The changed decoding and contract hashes
+force a new cache directory, so earlier invalid or valid JSON-caption caches do
+not alias the plain-text path. Baseline, selective intervention, and paired
+confirmation use the same policy. Only immutable frame/transcript preprocessing
+may be shared across the old and new runs; prompts, captions, histories, and DVD
+QA evidence are recomputed under the new identity.
 
 History is restricted to configured temporal blocks. Different blocks may be
 processed independently, while segments within one block use preceding
@@ -175,12 +171,45 @@ proxy and must never lazily initialize another local Qwen/vLLM engine. Without
 an active pool, the original standalone `dvd_backend.get_captioner()` behavior
 is unchanged.
 
+The DVD tool-calling boundary publishes an exact nested JSON schema for
+`time_ranges_hhmmss`: a non-empty array of two-item arrays whose endpoints are
+`HH:MM:SS` strings. Numeric seconds are never passed to the vendored DVD
+implementation. If a backend nevertheless emits invalid arguments, the
+instrumentation boundary records the rejected, non-executed call and returns
+one deterministic correction message to the agent. A second invalid call fails
+closed; there is no argument coercion, broad QA retry, JSON repair, or fallback.
+The contract and one-retry limit are part of downstream QA execution identity.
+
 Downstream DVD caption-database retrieval is also fixed across policies.
 Every `clip_search_tool` call executes with `top_k=16`, even if the tool-calling
 model supplies another value or omits it. The raw requested arguments remain
 in the trajectory, while `tool_events.jsonl` records the normalized executed
 arguments and the override policy. This setting is separate from Phase 4
 property-frame retrieval and is part of QA cache/resume identity.
+
+The parallel fresh prompt-delta proposer uses
+`trajectory_grounded_normalized_catalog_v3_localized_inspection`. Prompt-delta
+proposals are grounded only in video segments localized by assistant timestamp
+citations or non-global frame-inspection calls. A frame-inspection call whose
+start and end are within the configured boundary tolerance of the video start
+and end is classified as global at the call level; its segments remain audit
+provenance but do not enter proposal/intervention scope. These segments indicate
+evidence exposure and localization, not causal attribution. The proposer never
+uses legacy `explicitly_cited_segments`, `used_segments`, consumed, retrieved,
+or returned segments as selection scope. Included histories are
+represented losslessly by content-addressed snapshot and history-item catalogs;
+segments appear once and QAs retain their ordered
+`intervention_candidate_segment_refs` plus stored semantic trajectory evidence.
+A QA without localized evidence is recorded as `no_localized_evidence` and does
+not trigger a proposal call. The whole-video normalized request is used only
+when exact provider token preflight fits. Otherwise it splits deterministically
+into one complete request per eligible QA. A single-QA overflow records that QA
+as `context_ineligible`, makes no provider call for it, and continues with other
+eligible QAs. If none remain, the proposal stage ends normally with
+`no_eligible_proposal_evidence`. No caption, history, trajectory, or segment is
+truncated or sampled to fit context.
+Rejected frame-inspection calls remain in the selection audit as
+`invalid_not_executed` and do not localize any segment.
 
 ## 3. One optimization iteration
 

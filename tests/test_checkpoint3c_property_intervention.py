@@ -10,7 +10,10 @@ from surrogate_rollout.cache.caption_cache import (
     key_as_dict,
     new_history_aware_cache_dir,
 )
-from surrogate_rollout.captioning.history_aware_baseline import build_history_snapshot
+from surrogate_rollout.captioning.history_aware_baseline import (
+    HistoryAwareSegmentCaptioner,
+    build_history_snapshot,
+)
 from surrogate_rollout.mixed_views.builder import MixedViewBuilder
 from surrogate_rollout.optimization.property_intervention import (
     PropertyInterventionBatchRunner,
@@ -315,6 +318,25 @@ def test_intervention_cache_identity_preserves_baseline_path(tmp_path):
     assert key_as_dict(candidate_key)["intervention_identity_hash"] == "i" * 64
     assert f"_i{'i' * 12}_" in candidate_path
     assert candidate_path != baseline_path
+
+
+def test_baseline_and_intervention_share_plain_caption_policy_identity():
+    captioner = HistoryAwareSegmentCaptioner(
+        object(), caption_model_id="fixture-qwen", backend_id="fixture-backend")
+    runner = PropertyInterventionBatchRunner(segment_captioner=captioner)
+
+    baseline = captioner.configuration_identity
+    intervention = runner._caption_configuration()
+    for key in (
+            "caption_decoding_policy_version",
+            "caption_output_contract_version",
+            "caption_parse_schema_version",
+            "caption_parse_normalization_version",
+            "caption_repetition_policy_version"):
+        assert intervention[key] == baseline[key]
+    assert baseline["decoding"]["max_tokens"] == 1024
+    assert baseline["decoding"]["temperature"] == 0.0
+    assert baseline["decoding"]["repetition_penalty"] == 1.05
 
 
 def test_independent_selected_only_interventions_history_mixed_view_and_resume(tmp_path):

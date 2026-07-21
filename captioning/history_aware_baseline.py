@@ -8,6 +8,7 @@ import contextlib
 import multiprocessing
 import os
 import queue
+import re
 import threading
 import time
 import traceback
@@ -58,33 +59,26 @@ PARALLEL_GROUP_SCHEDULER_VERSION = "history_block_gpu_scheduler_v1"
 LOCAL_QWEN_BACKEND_ID = (
     "captioning.qwen25_vl.Qwen25VLCaptioner:"
     + VLLM_MM_CACHE_POLICY_VERSION)
-CAPTION_OUTPUT_CONTRACT_VERSION = "caption_output_contract_v2"
-CAPTION_PARSE_SCHEMA_VERSION = "caption_parse_result_v2"
-CAPTION_PARSE_NORMALIZATION_VERSION = (
-    "caption_parse_normalization_v2_percent_escape")
-CAPTION_CACHE_SCHEMA_VERSION = "history_aware_caption_cache_v4"
-CAPTION_RETRY_POLICY_VERSION = "caption_parse_retry_v2_percent_escape"
-CAPTION_ATTEMPT_SCHEMA_VERSION = "caption_generation_attempt_v1"
+CAPTION_OUTPUT_CONTRACT_VERSION = "caption_plain_text_output_contract_v2"
+CAPTION_PARSE_SCHEMA_VERSION = "caption_plain_text_parse_result_v2"
+CAPTION_PARSE_NORMALIZATION_VERSION = "caption_plain_text_strip_v1"
+CAPTION_REPETITION_POLICY_VERSION = "caption_repetition_guard_v1"
+CAPTION_CACHE_SCHEMA_VERSION = "history_aware_caption_cache_v5"
+CAPTION_RETRY_POLICY_VERSION = "caption_plain_text_retry_v1"
+CAPTION_ATTEMPT_SCHEMA_VERSION = "caption_generation_attempt_v2"
 
 
 def build_caption_output_contract(subject_registry_mode: str) -> str:
-    if subject_registry_mode == "empty":
-        registry_contract = (
-            '- Set "subject_registry" to an empty object {}. Do not create '
-            'registry entries.')
-    elif subject_registry_mode == "optional":
-        registry_contract = (
-            '- "subject_registry" is optional. If reliable subject entries '
-            'are unavailable, omit it or return an empty object {} rather '
-            'than inventing entries. A valid populated registry is allowed.')
-    else:
+    # Retain the argument for call-site compatibility while making both former
+    # registry modes use the same global plain-text contract.
+    if subject_registry_mode not in {"empty", "optional"}:
         raise ValueError("subject_registry_mode must be 'empty' or 'optional'")
-    return f"""
+    return """
 
 CAPTION_OUTPUT_CONTRACT (this supersedes any earlier output-format wording):
-- Return exactly one JSON object. Do not wrap it in an array.
-- "clip_description" is required and must be a non-empty visual description.
-{registry_contract}
+- Return only a plain-text visual description of the current clip.
+- Do not emit JSON, keys, markdown fences, timestamps, or a subject registry.
+- Do not repeat a sentence or phrase to fill the response.
 """.rstrip()
 
 
@@ -172,102 +166,72 @@ def build_history_snapshot(
     }
 
 
+def _sentence_chunks(text: str) -> tuple[str, ...]:
+    return tuple(
+        chunk.strip() for chunk in re.split(r"(?<=[.!?])\s+", text)
+        if chunk.strip())
+
+
+def _repetition_error(text: str) -> str | None:
+    """Conservatively reject deterministic degeneration, not ordinary reuse."""
+    sentences = _sentence_chunks(text)
+    normalized = tuple(
+        " ".join(re.findall(r"[\w'-]+", item.casefold()))
+        for item in sentences)
+    run = 1
+    for index in range(1, len(normalized)):
+        if normalized[index] and normalized[index] == normalized[index - 1]:
+            run += 1
+            if run >= 3:
+                return "repeated_sentence"
+        else:
+            run = 1
+
+    tokens = re.findall(r"[\w'-]+", text.casefold())
+    ngram_size = 8
+    if len(tokens) < 48:
+        return None
+    starts: dict[tuple[str, ...], list[int]] = {}
+    for index in range(len(tokens) - ngram_size + 1):
+        starts.setdefault(tuple(tokens[index:index + ngram_size]), []).append(index)
+    covered: set[int] = set()
+    for positions in starts.values():
+        if len(positions) < 4:
+            continue
+        for start in positions:
+            covered.update(range(start, start + ngram_size))
+    if len(covered) / len(tokens) >= 0.80:
+        return "repeated_ngram_majority"
+    return None
+
+
 def _parse_caption_output_with_metadata(
     raw: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Parse the DVD caption contract and record every safe normalization."""
+    """Validate plain model text and wrap it in the canonical artifact shape."""
+    if not isinstance(raw, str):
+        return {}, {
+            "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
+            "status": "invalid", "error": "invalid_output_type",
+            "normalizations": [],
+            "repetition_policy_version": CAPTION_REPETITION_POLICY_VERSION,
+        }
     text = raw.strip()
-    normalizations: list[str] = []
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-        normalizations.append("strip_markdown_fence")
-    normalized = []
-    percent_escape_replaced = False
-    index = 0
-    while index < len(text):
-        if text[index] != "\\":
-            normalized.append(text[index])
-            index += 1
-            continue
-        end = index
-        while end < len(text) and text[end] == "\\":
-            end += 1
-        slash_count = end - index
-        if end < len(text) and text[end] == "%" and slash_count % 2 == 1:
-            normalized.append("\\" * (slash_count - 1))
-            normalized.append("%")
-            percent_escape_replaced = True
-            index = end + 1
-            continue
-        normalized.append("\\" * slash_count)
-        index = end
-    if percent_escape_replaced:
-        text = "".join(normalized)
-        normalizations.append("replace_invalid_percent_escape")
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end < start:
-            return {}, {
-                "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
-                "status": "invalid", "error": "invalid_json",
-                "normalizations": normalizations,
-            }
-        try:
-            value = json.loads(text[start:end + 1])
-        except json.JSONDecodeError:
-            return {}, {
-                "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
-                "status": "invalid", "error": "invalid_json",
-                "normalizations": normalizations,
-            }
-        normalizations.append("extract_embedded_object")
-
-    original_top_level_type = type(value).__name__
-    if isinstance(value, list):
-        if len(value) != 1 or not isinstance(value[0], dict):
-            return {}, {
-                "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
-                "status": "invalid", "error": "invalid_top_level_array",
-                "original_top_level_type": original_top_level_type,
-                "normalizations": normalizations,
-            }
-        value = value[0]
-        normalizations.append("unwrap_singleton_object_array")
-    if not isinstance(value, dict):
-        return {}, {
-            "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
-            "status": "invalid", "error": "invalid_top_level_type",
-            "original_top_level_type": original_top_level_type,
-            "normalizations": normalizations,
-        }
-
-    description = value.get("clip_description")
-    if not isinstance(description, str) or not description.strip():
-        return {}, {
-            "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
-            "status": "invalid", "error": "missing_clip_description",
-            "original_top_level_type": original_top_level_type,
-            "normalizations": normalizations,
-        }
-    parsed = dict(value)
-    parsed["clip_description"] = description.strip()
-    registry = parsed.get("subject_registry")
-    if not isinstance(registry, dict):
-        parsed["subject_registry"] = {}
-        normalizations.append("default_empty_subject_registry")
-    return parsed, {
+    normalizations = ([] if text == raw
+                      else ["strip_surrounding_whitespace"])
+    base = {
         "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
-        "status": "valid", "error": None,
-        "original_top_level_type": original_top_level_type,
         "normalizations": normalizations,
-        "subject_registry_populated": bool(parsed["subject_registry"]),
+        "repetition_policy_version": CAPTION_REPETITION_POLICY_VERSION,
+    }
+    if not text:
+        return {}, {**base, "status": "invalid", "error": "empty_output"}
+    repetition_error = _repetition_error(text)
+    if repetition_error is not None:
+        return {}, {**base, "status": "invalid", "error": repetition_error}
+    return {"clip_description": text}, {
+        **base, "status": "valid", "error": None,
+        "sentence_count": len(_sentence_chunks(text)),
     }
 
 
@@ -310,6 +274,16 @@ def _seed_manifest_fragment(source: str | None, target: str) -> None:
     _atomic_write_text(target, payload)
 
 
+def _append_worker_event(path: str | None, value: Mapping[str, Any]) -> None:
+    """Append one worker-owned diagnostic event without affecting artifacts."""
+    if path is None:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    record = {"unix_time": time.time(), **dict(value)}
+    with open(path, "a", encoding="utf-8", buffering=1) as handle:
+        handle.write(dumps_canonical(record) + "\n")
+
+
 def _parallel_history_worker(
     gpu: str,
     command_queue: Any,
@@ -317,8 +291,12 @@ def _parallel_history_worker(
     text_backend: str,
     use_openai_tools: bool,
     routing_mode: str = "property_bank",
+    worker_log_path: str | None = None,
 ) -> None:
     """Own one GPU/model instance and serve caption tasks until shutdown."""
+    _append_worker_event(worker_log_path, {
+        "event": "process_start", "gpu": gpu, "pid": os.getpid(),
+        "routing_mode": routing_mode})
     try:
         from surrogate_rollout.evaluation.dvd_qa import ensure_backend
         from surrogate_rollout.prompt_routing.persistence import (
@@ -333,11 +311,16 @@ def _parallel_history_worker(
             text_backend=text_backend,
             use_openai_tools=use_openai_tools,
         )
+        _append_worker_event(worker_log_path, {
+            "event": "backend_ready", "gpu": gpu, "pid": os.getpid()})
         builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen(
             routing_mode=routing_mode)
         while True:
             command = command_queue.get()
             request_id = command["request_id"]
+            _append_worker_event(worker_log_path, {
+                "event": "request_start", "gpu": gpu,
+                "request_id": request_id, "request_type": command["type"]})
             try:
                 if command["type"] == "shutdown":
                     engine = getattr(builder.router.vlm, "llm", None)
@@ -355,9 +338,29 @@ def _parallel_history_worker(
                         "status": "shutdown_acknowledged",
                         "cleanup_warning": cleanup_warning,
                     })
+                    _append_worker_event(worker_log_path, {
+                        "event": "process_shutdown", "gpu": gpu,
+                        "request_id": request_id})
                     return
                 if command["type"] == "build_blocks":
                     common = command["common"]
+                    generator_configuration = common.get(
+                        "free_form_generator_configuration")
+                    if generator_configuration is not None:
+                        from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
+                            VLMFreeFormInstructionGenerator,
+                        )
+
+                        builder.free_form_generator = (
+                            VLMFreeFormInstructionGenerator(
+                                builder.router.vlm,
+                                max_tokens=generator_configuration["max_tokens"],
+                                template_text=generator_configuration["template_text"],
+                                meta_prompt_id=generator_configuration[
+                                    "meta_prompt_id"],
+                                model_id=generator_configuration["model_id"],
+                                backend_id=generator_configuration["backend_id"],
+                            ))
                     prompt_bank = prompt_bank_from_json(common["prompt_bank"])
                     router_policy = router_policy_from_json(common["router_policy"])
                     scaffold_policy = scaffold_policy_from_json(
@@ -367,6 +370,12 @@ def _parallel_history_worker(
                     completed = []
                     for block_index, block_clips, block_root, fragment_path in \
                             command["jobs"]:
+                        _append_worker_event(worker_log_path, {
+                            "event": "block_start", "gpu": gpu,
+                            "request_id": request_id,
+                            "block_index": block_index,
+                            "segment_count": len(block_clips),
+                            "block_root": os.path.abspath(block_root)})
                         artifact = builder.build(
                             sample=common["sample"], clip_index=list(block_clips),
                             prompt_bank=prompt_bank, router_policy=router_policy,
@@ -384,6 +393,12 @@ def _parallel_history_worker(
                         )
                         completed.append(
                             (block_index, artifact.routing_manifest_path))
+                        _append_worker_event(worker_log_path, {
+                            "event": "block_complete", "gpu": gpu,
+                            "request_id": request_id,
+                            "block_index": block_index,
+                            "routing_manifest_path":
+                                artifact.routing_manifest_path})
                     payload = {"completed": completed}
                 elif command["type"] == "caption_segment":
                     payload = command["payload"]
@@ -424,18 +439,28 @@ def _parallel_history_worker(
                 result_queue.put({
                     "request_id": request_id, "gpu": gpu, **payload,
                 })
+                _append_worker_event(worker_log_path, {
+                    "event": "request_complete", "gpu": gpu,
+                    "request_id": request_id,
+                    "request_type": command["type"]})
             except BaseException as exc:
-                result_queue.put({
+                failure = {
                     "request_id": request_id, "gpu": gpu,
                     "error_type": type(exc).__name__, "error": str(exc),
                     "traceback": traceback.format_exc(),
-                })
+                }
+                _append_worker_event(worker_log_path, {
+                    "event": "request_error", **failure})
+                result_queue.put(failure)
     except BaseException as exc:
-        result_queue.put({
+        failure = {
             "request_id": "startup", "gpu": gpu,
             "error_type": type(exc).__name__,
             "error": str(exc), "traceback": traceback.format_exc(),
-        })
+        }
+        _append_worker_event(worker_log_path, {
+            "event": "startup_error", **failure})
+        result_queue.put(failure)
 
 
 @dataclass(frozen=True)
@@ -469,13 +494,20 @@ class HistoryAwareSegmentCaptioner:
             "model": self.caption_model_id,
             "backend": self.backend_id,
             "decoding": as_json_dict(config.CAPTION_DECODING),
+            "caption_decoding_policy_version":
+                config.CAPTION_DECODING_POLICY_VERSION,
+            "caption_decoding_hash": config.decoding_hash(),
             "caption_output_contract_version": CAPTION_OUTPUT_CONTRACT_VERSION,
+            "caption_output_contract_hash": sha256_text(
+                CAPTION_OUTPUT_CONTRACT),
             "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
             "caption_parse_normalization_version":
                 CAPTION_PARSE_NORMALIZATION_VERSION,
+            "caption_repetition_policy_version":
+                CAPTION_REPETITION_POLICY_VERSION,
             "caption_retry_policy_version": CAPTION_RETRY_POLICY_VERSION,
             "caption_parse_max_retries": config.CAPTION_PARSE_MAX_RETRIES,
-            "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
+            "caption_artifact_shape": {"clip_description": "string"},
             "vllm_multimodal_cache_policy_version":
                 VLLM_MM_CACHE_POLICY_VERSION,
             "vllm_mm_processor_cache_gb": VLLM_MM_PROCESSOR_CACHE_GB,
@@ -530,10 +562,14 @@ class HistoryAwareSegmentCaptioner:
                     CAPTION_OUTPUT_CONTRACT_VERSION,
                 "caption_output_contract_hash":
                     sha256_text(CAPTION_OUTPUT_CONTRACT),
+                "caption_decoding_policy_version":
+                    config.CAPTION_DECODING_POLICY_VERSION,
+                "caption_decoding_hash": config.decoding_hash(),
                 "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
                 "caption_parse_normalization_version":
                     CAPTION_PARSE_NORMALIZATION_VERSION,
-                "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
+                "caption_repetition_policy_version":
+                    CAPTION_REPETITION_POLICY_VERSION,
             })),
             caption_model_id=self.caption_model_id,
             intervention_identity_hash=intervention_identity_hash,
@@ -631,6 +667,10 @@ class HistoryAwareSegmentCaptioner:
             raw = self.vlm.caption(
                 frame_paths, prompt,
                 max_tokens=int(config.CAPTION_DECODING["max_tokens"]),
+                temperature=float(config.CAPTION_DECODING["temperature"]),
+                top_p=float(config.CAPTION_DECODING["top_p"]),
+                repetition_penalty=float(
+                    config.CAPTION_DECODING["repetition_penalty"]),
             )
             attempt_seconds = time.monotonic() - t0
             elapsed += attempt_seconds
@@ -649,11 +689,6 @@ class HistoryAwareSegmentCaptioner:
             if parsed:
                 break
         retry_count = max(0, len(attempts) - 1)
-        if parsed:
-            parsed["clip_description"] = (
-                str(parsed["clip_description"])
-                + f"\n\nTranscript during this video clip: {transcript}."
-            )
         payload = {
             "schema_version": CAPTION_CACHE_SCHEMA_VERSION,
             "cache_key": key_as_dict(key),
@@ -661,8 +696,16 @@ class HistoryAwareSegmentCaptioner:
             "rendered_prompt_hash": sha256_text(prompt),
             "caption_output_contract_version":
                 CAPTION_OUTPUT_CONTRACT_VERSION,
+            "caption_output_contract_hash": sha256_text(
+                CAPTION_OUTPUT_CONTRACT),
+            "caption_decoding_policy_version":
+                config.CAPTION_DECODING_POLICY_VERSION,
+            "caption_decoding_hash": config.decoding_hash(),
+            "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
             "caption_parse_normalization_version":
                 CAPTION_PARSE_NORMALIZATION_VERSION,
+            "caption_repetition_policy_version":
+                CAPTION_REPETITION_POLICY_VERSION,
             "caption_retry_policy_version": CAPTION_RETRY_POLICY_VERSION,
             "caption_parse_max_retries": config.CAPTION_PARSE_MAX_RETRIES,
             "attempt_count": len(attempts),
@@ -719,11 +762,16 @@ class HistoryAwareBaselineCaptionViewBuilder:
         worker_text_backend: str = config.DVD_TEXT_BACKEND,
         worker_use_openai_tools: bool = config.DVD_USE_OPENAI_TOOLS,
         free_form_generator: Any | None = None,
+        worker_result_timeout_seconds: float = 86400.0,
+        worker_health_poll_seconds: float = 1.0,
+        worker_log_directory: str | None = None,
     ) -> None:
         normalized_gpus = tuple(str(value).strip() for value in parallel_gpus)
         if any(not value for value in normalized_gpus) or \
                 len(normalized_gpus) != len(set(normalized_gpus)):
             raise ValueError("parallel_gpus must contain unique non-empty GPU IDs")
+        if worker_result_timeout_seconds <= 0 or worker_health_poll_seconds <= 0:
+            raise ValueError("worker timeout and health poll must be positive")
         self.router = router
         self.segment_captioner = segment_captioner
         # Opt-in free-form baseline (ablation): when set, the per-segment
@@ -737,6 +785,10 @@ class HistoryAwareBaselineCaptionViewBuilder:
         self.parallel_executor = parallel_executor
         self.worker_text_backend = worker_text_backend
         self.worker_use_openai_tools = worker_use_openai_tools
+        self.worker_result_timeout_seconds = float(worker_result_timeout_seconds)
+        self.worker_health_poll_seconds = float(worker_health_poll_seconds)
+        self.worker_log_directory = (os.path.abspath(worker_log_directory)
+                                     if worker_log_directory else None)
         self._pool_lock = threading.RLock()
         self._pool_context: Any | None = None
         self._pool_result_queue: Any | None = None
@@ -753,8 +805,13 @@ class HistoryAwareBaselineCaptionViewBuilder:
         self._parent_previous_captioner: Any | None = None
 
     @classmethod
-    def from_local_qwen(cls, *, parallel_gpus: tuple[str, ...] = (),
-                        routing_mode: str = "property_bank"):
+    def from_local_qwen(
+        cls, *, parallel_gpus: tuple[str, ...] = (),
+        routing_mode: str = "property_bank",
+        worker_result_timeout_seconds: float = 86400.0,
+        worker_health_poll_seconds: float = 1.0,
+        worker_log_directory: str | None = None,
+    ):
         from surrogate_rollout.prompt_routing.policies.history_aware_vlm_router import (
             HistoryAwareVLMRouter,
             get_local_qwen_backend,
@@ -780,6 +837,9 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 vlm, backend_id=LOCAL_QWEN_BACKEND_ID),
             parallel_gpus=parallel_gpus,
             free_form_generator=free_form_generator,
+            worker_result_timeout_seconds=worker_result_timeout_seconds,
+            worker_health_poll_seconds=worker_health_poll_seconds,
+            worker_log_directory=worker_log_directory,
         )
         if parallel_gpus:
             builder.segment_captioner.remote_dispatcher = builder
@@ -906,12 +966,17 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 "caption_model_id": self.segment_captioner.caption_model_id,
                 "caption_backend_id": self.segment_captioner.backend_id,
                 "caption_decoding_hash": config.decoding_hash(),
+                "caption_decoding_policy_version":
+                    config.CAPTION_DECODING_POLICY_VERSION,
                 "caption_output_contract_version":
                     CAPTION_OUTPUT_CONTRACT_VERSION,
+                "caption_output_contract_hash": sha256_text(
+                    CAPTION_OUTPUT_CONTRACT),
                 "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
                 "caption_parse_normalization_version":
                     CAPTION_PARSE_NORMALIZATION_VERSION,
-                "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
+                "caption_repetition_policy_version":
+                    CAPTION_REPETITION_POLICY_VERSION,
                 "caption_run_identity_hash": caption_run_identity_hash,
                 "history_configuration": {
                     "schema_version": HISTORY_SCHEMA_VERSION,
@@ -1169,6 +1234,18 @@ class HistoryAwareBaselineCaptionViewBuilder:
             "text_backend": self.worker_text_backend,
             "use_openai_tools": self.worker_use_openai_tools,
         }
+        if self.free_form_generator is not None:
+            # Persistent workers must receive the exact parent/candidate
+            # meta-prompt for every build request.  The worker process is
+            # intentionally long-lived, so startup-time routing_mode alone is
+            # not sufficient when a paired confirmation switches policies.
+            common["free_form_generator_configuration"] = {
+                "template_text": self.free_form_generator.template,
+                "meta_prompt_id": self.free_form_generator.meta_prompt_id,
+                "max_tokens": self.free_form_generator.max_tokens,
+                "model_id": self.free_form_generator.model_id,
+                "backend_id": self.free_form_generator.backend_id,
+            }
         assignments = tuple((gpu, tuple(assigned[gpu])) for gpu in active_gpus)
         if self.parallel_executor is not None:
             manifest_paths = tuple(self.parallel_executor(assignments, common))
@@ -1240,18 +1317,45 @@ class HistoryAwareBaselineCaptionViewBuilder:
         with self._pool_lock:
             self._pool_pending.pop(request_id, None)
 
+    def _pool_process_diagnostics(self) -> dict[str, Mapping[str, Any]]:
+        return {str(gpu): {
+            "pid": getattr(process, "pid", None),
+            "alive": bool(process.is_alive()),
+            "exitcode": getattr(process, "exitcode", None),
+        } for gpu, process in self._pool_processes.items()}
+
     def _wait_pool_result(
-        self, request_id: str, *, timeout_seconds: float = 86400.0,
+        self, request_id: str, *, timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         with self._pool_lock:
             waiter = self._pool_pending.get(request_id)
         if waiter is None:
             raise RuntimeError(f"unknown persistent-pool request: {request_id}")
+        limit = (self.worker_result_timeout_seconds
+                 if timeout_seconds is None else float(timeout_seconds))
+        deadline = time.monotonic() + limit
         try:
-            item = waiter.get(timeout=timeout_seconds)
-        except queue.Empty as exc:
-            raise RuntimeError(
-                f"persistent caption worker timed out: {request_id}") from exc
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "persistent caption worker timed out with no truncation "
+                        f"or retry: request={request_id}, limit_seconds={limit}, "
+                        "processes=" + dumps_canonical(
+                            self._pool_process_diagnostics()))
+                try:
+                    item = waiter.get(timeout=min(
+                        self.worker_health_poll_seconds, remaining))
+                    break
+                except queue.Empty:
+                    diagnostics = self._pool_process_diagnostics()
+                    dead = {gpu: value for gpu, value in diagnostics.items()
+                            if not value["alive"]}
+                    if dead:
+                        raise RuntimeError(
+                            "persistent caption worker died while waiting: "
+                            f"request={request_id}, dead=" +
+                            dumps_canonical(dead))
         finally:
             self._discard_pool_request(request_id)
         if item.get("request_id") == "startup" or item.get("error"):
@@ -1296,7 +1400,10 @@ class HistoryAwareBaselineCaptionViewBuilder:
                       self.worker_text_backend, self.worker_use_openai_tools,
                       ("free_form_generator"
                        if self.free_form_generator is not None
-                       else "property_bank")),
+                       else "property_bank"),
+                      (os.path.join(self.worker_log_directory,
+                                    f"worker_gpu_{gpu}.jsonl")
+                       if self.worker_log_directory else None)),
                 name=f"history-caption-gpu-{gpu}",
             )
             process.start()

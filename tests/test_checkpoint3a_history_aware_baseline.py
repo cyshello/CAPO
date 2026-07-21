@@ -6,12 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from surrogate_rollout import config
 from surrogate_rollout.captioning.history_aware_baseline import (
     CAPTION_CACHE_SCHEMA_VERSION,
     CAPTION_OUTPUT_CONTRACT,
     CAPTION_OUTPUT_CONTRACT_VERSION,
     CAPTION_PARSE_NORMALIZATION_VERSION,
     CAPTION_PARSE_SCHEMA_VERSION,
+    CAPTION_REPETITION_POLICY_VERSION,
     CAPTION_RETRY_POLICY_VERSION,
     HistoryAwareBaselineCaptionViewBuilder,
     HistoryAwareSegmentCaptioner,
@@ -39,88 +41,57 @@ from surrogate_rollout.prompt_routing.schemas import SegmentContext
 ROOT = Path(__file__).parents[1]
 
 
-def test_caption_parser_accepts_description_without_subject_registry():
-    parsed, result = _parse_caption_output_with_metadata(json.dumps({
-        "clip_description": "A person demonstrates an action."
-    }))
+def test_caption_parser_wraps_nonempty_plain_text():
+    parsed, result = _parse_caption_output_with_metadata(
+        "  A person demonstrates an action.  ")
 
-    assert parsed == {
-        "clip_description": "A person demonstrates an action.",
-        "subject_registry": {},
-    }
+    assert parsed == {"clip_description": "A person demonstrates an action."}
     assert result["status"] == "valid"
-    assert result["subject_registry_populated"] is False
-    assert "default_empty_subject_registry" in result["normalizations"]
+    assert result["sentence_count"] == 1
+    assert result["repetition_policy_version"] == \
+        CAPTION_REPETITION_POLICY_VERSION
+    assert result["normalizations"] == ["strip_surrounding_whitespace"]
 
 
-def test_default_caption_contract_requests_an_empty_registry():
-    assert 'Set "subject_registry" to an empty object {}' in \
-        CAPTION_OUTPUT_CONTRACT
+def test_caption_contract_requires_plain_text_not_json_without_sentence_limit():
+    assert "plain-text visual description" in CAPTION_OUTPUT_CONTRACT
+    assert "at most two" not in CAPTION_OUTPUT_CONTRACT
+    assert "Do not emit JSON" in CAPTION_OUTPUT_CONTRACT
 
 
-def test_optional_caption_contract_allows_larger_model_registry():
+def test_former_registry_modes_share_the_same_plain_text_contract():
     contract = build_caption_output_contract("optional")
-
-    assert '"subject_registry" is optional' in contract
-    assert "A valid populated registry is allowed" in contract
+    assert contract == CAPTION_OUTPUT_CONTRACT
 
 
-def test_caption_parser_preserves_populated_registry_for_larger_models():
-    registry = {"person_1": {"name": "demonstrator"}}
-    parsed, result = _parse_caption_output_with_metadata(json.dumps({
-        "clip_description": "A person demonstrates an action.",
-        "subject_registry": registry,
-    }))
+def test_json_looking_plain_text_is_preserved_as_literal_description():
+    raw = '{"clip_description": "A map appears on screen."}'
+    parsed, result = _parse_caption_output_with_metadata(raw)
 
-    assert parsed["subject_registry"] == registry
-    assert result["subject_registry_populated"] is True
-    assert "default_empty_subject_registry" not in result["normalizations"]
-
-
-def test_caption_parser_safely_unwraps_one_object_array():
-    parsed, result = _parse_caption_output_with_metadata(
-        "```json\n" + json.dumps([{
-            "clip_description": "A map appears on screen."
-        }]) + "\n```")
-
-    assert parsed["clip_description"] == "A map appears on screen."
-    assert parsed["subject_registry"] == {}
-    assert result["original_top_level_type"] == "list"
-    assert "unwrap_singleton_object_array" in result["normalizations"]
-
-
-def test_caption_parser_normalizes_only_invalid_percent_escape():
-    parsed, result = _parse_caption_output_with_metadata(
-        r'{"clip_description":"A percentage symbol (\%) is visible."}')
-    assert parsed["clip_description"] == "A percentage symbol (%) is visible."
+    assert parsed == {"clip_description": raw}
     assert result["status"] == "valid"
-    assert "replace_invalid_percent_escape" in result["normalizations"]
-
-    escaped, escaped_result = _parse_caption_output_with_metadata(
-        r'{"clip_description":"A literal backslash (\\%) is visible."}')
-    assert escaped["clip_description"] == r"A literal backslash (\%) is visible."
-    assert "replace_invalid_percent_escape" not in \
-        escaped_result["normalizations"]
-
-    invalid, invalid_result = _parse_caption_output_with_metadata(
-        r'{"clip_description":"An unrelated invalid escape \q remains."}')
-    assert invalid == {}
-    assert invalid_result["error"] == "invalid_json"
 
 
-@pytest.mark.parametrize("value,error", [
-    ([], "invalid_top_level_array"),
-    ([{"clip_description": "one"}, {"clip_description": "two"}],
-     "invalid_top_level_array"),
-    ({"subject_registry": {}}, "missing_clip_description"),
-    ({"clip_description": "   "}, "missing_clip_description"),
+def test_caption_parser_rejects_empty_but_accepts_more_than_two_sentences():
+    assert _parse_caption_output_with_metadata(" \n ")[1]["error"] == \
+        "empty_output"
+    parsed, result = _parse_caption_output_with_metadata(
+        "One action occurs. A second follows. A third appears.")
+    assert parsed == {"clip_description": (
+        "One action occurs. A second follows. A third appears.")}
+    assert result["status"] == "valid"
+    assert result["sentence_count"] == 3
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("A person walks. A person walks. A person walks.", "repeated_sentence"),
+    (("the same eight word phrase repeats without meaningful variation " * 8),
+     "repeated_ngram_majority"),
 ])
-def test_caption_parser_rejects_ambiguous_or_descriptionless_output(value, error):
-    parsed, result = _parse_caption_output_with_metadata(json.dumps(value))
-
+def test_caption_parser_rejects_deterministic_repetition(raw, expected):
+    parsed, result = _parse_caption_output_with_metadata(raw)
     assert parsed == {}
-    assert result["status"] == "invalid"
-    assert result["error"] == error
+    assert result["error"] == expected
 
 
 def components():
@@ -212,6 +183,23 @@ def test_qwen_sampling_remains_unconstrained_without_schema():
     captioner.default_max_tokens = 256
     sampling = captioner._sampling(64, 0.0, 1.0)
 
+    assert sampling.structured_outputs is None
+
+
+def test_qwen_plain_caption_sampling_uses_explicit_bounded_decoding():
+    from surrogate_rollout.captioning.qwen25_vl import Qwen25VLCaptioner
+
+    captioner = object.__new__(Qwen25VLCaptioner)
+    captioner.default_max_tokens = 256
+    sampling = captioner._sampling(
+        config.CAPTION_DECODING["max_tokens"],
+        config.CAPTION_DECODING["temperature"],
+        config.CAPTION_DECODING["top_p"],
+        repetition_penalty=config.CAPTION_DECODING["repetition_penalty"])
+
+    assert sampling.max_tokens == 1024
+    assert sampling.temperature == 0.0
+    assert sampling.repetition_penalty == 1.05
     assert sampling.structured_outputs is None
 
 
@@ -315,10 +303,7 @@ class SharedMockVLM:
         if kind == "router":
             return json.dumps({"property_ids": ["pe_temporal"]})
         self.caption_number += 1
-        return json.dumps({
-            "clip_description": f"generated caption {self.caption_number}",
-            "subject_registry": {"S1": f"subject {self.caption_number}"},
-        })
+        return f"Generated caption {self.caption_number}."
 
 
 def test_sequential_history_is_shared_persisted_cached_and_resumable(tmp_path):
@@ -375,7 +360,7 @@ def test_sequential_history_is_shared_persisted_cached_and_resumable(tmp_path):
     assert Path(artifact.routing_manifest_path).exists()
     assert Path(artifact.routed_view_path).exists()
     captions = json.loads(Path(artifact.captions_path).read_text())
-    assert captions["subject_registry"] == {"merged_count": 3}
+    assert captions["subject_registry"] == {"merged_count": 0}
     routing_manifest = json.loads(Path(
         artifact.routing_manifest_path).read_text())
     first_cache = json.loads(Path(json.loads(
@@ -395,7 +380,13 @@ def test_sequential_history_is_shared_persisted_cached_and_resumable(tmp_path):
     assert identity["caption_parse_normalization_version"] == \
         CAPTION_PARSE_NORMALIZATION_VERSION
     assert identity["caption_parse_max_retries"] == 5
-    assert identity["subject_registry_mode"] == "empty"
+    assert identity["caption_artifact_shape"] == {
+        "clip_description": "string"}
+    assert identity["caption_decoding_policy_version"] == \
+        "qwen_caption_plain_text_decoding_v2"
+    assert identity["decoding"]["temperature"] == 0.0
+    assert identity["decoding"]["max_tokens"] == 1024
+    assert identity["decoding"]["repetition_penalty"] == 1.05
     assert identity["vllm_multimodal_cache_policy_version"] == \
         "qwen25_vl_mm_cache_disabled_v1"
     assert identity["vllm_mm_processor_cache_gb"] == 0.0
@@ -501,7 +492,7 @@ def test_parallel_captioning_schedules_history_blocks_and_merges_deterministical
     assert manifest["router_calls"] == manifest["caption_calls"] == 4
     assert len(Path(tmp_path / "cache_manifest.jsonl").read_text().splitlines()) == 4
     captions = json.loads(Path(artifact.captions_path).read_text())
-    assert captions["subject_registry"] == {"merged_count": 4}
+    assert captions["subject_registry"] == {"merged_count": 0}
 
     reassigned = HistoryAwareBaselineCaptionViewBuilder(
         router=HistoryAwareVLMRouter(parent_vlm),
@@ -599,21 +590,27 @@ def test_caption_parse_failure_retries_until_valid(tmp_path):
     class RetryVLM:
         def __init__(self):
             self.calls = 0
+            self.kwargs = []
 
-        def caption(self, *_args, **_kwargs):
+        def caption(self, *_args, **kwargs):
             self.calls += 1
+            self.kwargs.append(kwargs)
             if self.calls == 1:
-                return '{"clip_description": "unterminated'
-            return json.dumps({
-                "clip_description": "valid retry", "subject_registry": {}})
+                return "   "
+            return "A valid retry describes the visible action."
 
     vlm = RetryVLM()
     result, _ = _caption_once(tmp_path, vlm, tmp_path / "cache")
     assert vlm.calls == 2
     assert result.model_call_count == 2
     assert result.retry_count == 1
-    assert result.parsed["clip_description"].startswith("valid retry")
+    assert result.parsed == {
+        "clip_description": "A valid retry describes the visible action."}
+    assert all(item == {
+        "max_tokens": 1024, "temperature": 0.0, "top_p": 1.0,
+        "repetition_penalty": 1.05} for item in vlm.kwargs)
     artifact = json.loads(Path(result.result_path).read_text())
+    assert artifact["parsed"] == result.parsed
     assert artifact["attempt_count"] == 2
     assert artifact["retry_count"] == 1
     assert artifact["retry_exhausted"] is False
@@ -628,7 +625,7 @@ def test_caption_parse_failure_stops_after_five_retries(tmp_path):
 
         def caption(self, *_args, **_kwargs):
             self.calls += 1
-            return '{"clip_description": "unterminated'
+            return "A loop repeats. A loop repeats. A loop repeats."
 
     vlm = InvalidVLM()
     result, _ = _caption_once(tmp_path, vlm, tmp_path / "cache")
@@ -639,7 +636,7 @@ def test_caption_parse_failure_stops_after_five_retries(tmp_path):
     artifact = json.loads(Path(result.result_path).read_text())
     assert artifact["attempt_count"] == 6
     assert artifact["retry_exhausted"] is True
-    assert all(row["parse_result"]["error"] == "invalid_json"
+    assert all(row["parse_result"]["error"] == "repeated_sentence"
                for row in artifact["attempts"])
 
     class ForbiddenVLM:
@@ -653,7 +650,8 @@ def test_caption_parse_failure_stops_after_five_retries(tmp_path):
     assert resumed.parsed == {}
 
 
-def test_legacy_invalid_cache_is_immutable_and_retried_in_sidecar(tmp_path):
+def test_old_invalid_json_cache_identity_is_not_reused(
+        tmp_path, monkeypatch):
     class MutableVLM:
         def __init__(self, output):
             self.output = output
@@ -663,85 +661,33 @@ def test_legacy_invalid_cache_is_immutable_and_retried_in_sidecar(tmp_path):
             self.calls += 1
             return self.output
 
-    invalid_vlm = MutableVLM('{"clip_description": "unterminated')
+    current_decoding = dict(config.CAPTION_DECODING)
+    current_policy = config.CAPTION_DECODING_POLICY_VERSION
+    monkeypatch.setattr(config, "CAPTION_DECODING", {
+        **current_decoding, "max_tokens": 1024,
+        "repetition_penalty": 1.0})
+    monkeypatch.setattr(
+        config, "CAPTION_DECODING_POLICY_VERSION",
+        "legacy_json_caption_decoding_v1")
+    invalid_vlm = MutableVLM(
+        "A loop repeats. A loop repeats. A loop repeats.")
     first, _ = _caption_once(tmp_path, invalid_vlm, tmp_path / "cache")
     base_path = Path(first.result_path)
-    legacy = json.loads(base_path.read_text())
-    legacy["schema_version"] = "history_aware_caption_cache_v2"
-    for field in (
-            "caption_retry_policy_version", "caption_parse_max_retries",
-            "attempt_count", "retry_count", "retry_exhausted", "attempts"):
-        legacy.pop(field, None)
-    base_path.write_text(json.dumps(legacy, sort_keys=True))
-    immutable_legacy_text = base_path.read_text()
+    immutable_legacy_bytes = base_path.read_bytes()
 
-    valid_vlm = MutableVLM(json.dumps({
-        "clip_description": "recovered", "subject_registry": {}}))
-    retried, _ = _caption_once(tmp_path, valid_vlm, tmp_path / "cache")
+    monkeypatch.setattr(config, "CAPTION_DECODING", current_decoding)
+    monkeypatch.setattr(
+        config, "CAPTION_DECODING_POLICY_VERSION", current_policy)
+    valid_vlm = MutableVLM("A newly generated plain-text caption.")
+    regenerated, _ = _caption_once(tmp_path, valid_vlm, tmp_path / "cache")
     assert valid_vlm.calls == 1
-    assert retried.retry_count == 1
-    assert retried.result_path != str(base_path)
-    assert f"/parse_retries/{CAPTION_RETRY_POLICY_VERSION}/" in \
-        retried.result_path
-    assert base_path.read_text() == immutable_legacy_text
-    retry_artifact = json.loads(Path(retried.result_path).read_text())
-    assert retry_artifact["attempts"][0]["source"] == \
-        "immutable_cached_initial_attempt"
-
-    no_call_vlm = MutableVLM("must not be called")
-    resumed, _ = _caption_once(tmp_path, no_call_vlm, tmp_path / "cache")
-    assert no_call_vlm.calls == 0
-    assert resumed.cache_hit is True
-    assert resumed.result_path == retried.result_path
-
-
-def test_cached_percent_escape_is_reparsed_in_new_sidecar_without_model_call(
-        tmp_path):
-    class VLM:
-        def __init__(self, output):
-            self.output = output
-            self.calls = 0
-
-        def caption(self, *_args, **_kwargs):
-            self.calls += 1
-            return self.output
-
-    first, _ = _caption_once(
-        tmp_path, VLM('{"clip_description":"unterminated'), tmp_path / "cache")
-    base_path = Path(first.result_path)
-    legacy = json.loads(base_path.read_text())
-    percent_raw = r'{"clip_description":"A percentage symbol (\%) is visible."}'
-    legacy.update({
-        "caption_retry_policy_version": "caption_parse_retry_v1",
-        "raw_output": percent_raw,
-        "parsed": {},
-        "parse_result": {
-            "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
-            "status": "invalid", "error": "invalid_json",
-            "normalizations": [],
-        },
-    })
-    legacy.pop("caption_parse_normalization_version", None)
-    base_path.write_text(json.dumps(legacy, sort_keys=True))
-    immutable_legacy = base_path.read_text()
-
-    forbidden = VLM("must not be called")
-    recovered, _ = _caption_once(tmp_path, forbidden, tmp_path / "cache")
-
-    assert forbidden.calls == 0
-    assert recovered.model_call_count == 0
-    assert recovered.parsed["clip_description"].startswith(
-        "A percentage symbol (%) is visible.")
-    assert recovered.result_path != str(base_path)
-    assert f"/parse_retries/{CAPTION_RETRY_POLICY_VERSION}/" in \
-        recovered.result_path
-    assert base_path.read_text() == immutable_legacy
-    sidecar = json.loads(Path(recovered.result_path).read_text())
-    assert sidecar["caption_parse_normalization_version"] == \
-        CAPTION_PARSE_NORMALIZATION_VERSION
-    assert sidecar["attempts"][0]["source"] == \
-        "immutable_cached_initial_attempt"
-    assert sidecar["attempts"][0]["parsed_valid"] is True
+    assert regenerated.result_path != str(base_path)
+    assert regenerated.parsed["clip_description"].startswith(
+        "A newly generated plain-text caption.")
+    assert base_path.read_bytes() == immutable_legacy_bytes
+    old_key = json.loads(base_path.read_text())["cache_key"]
+    new_key = json.loads(Path(regenerated.result_path).read_text())["cache_key"]
+    assert old_key["decoding_hash"] != new_key["decoding_hash"]
 
 
 def test_dvd_raw_frame_inspection_uses_pool_proxy_and_standalone_is_preserved():
@@ -816,6 +762,51 @@ def test_persistent_pool_demultiplexes_concurrent_video_requests():
         builder._pool_result_queue.put({"request_id": "__parent_stop__"})
         builder._pool_result_thread.join(timeout=2.0)
         builder._pool_processes.clear()
+
+
+def test_persistent_pool_wait_fails_fast_when_worker_dies():
+    import queue
+
+    class DeadProcess:
+        pid = 1234
+        exitcode = -9
+
+        def is_alive(self):
+            return False
+
+    builder = HistoryAwareBaselineCaptionViewBuilder(
+        router=object(), segment_captioner=object(), parallel_gpus=("4",),
+        worker_result_timeout_seconds=30,
+        worker_health_poll_seconds=0.01)
+    builder._pool_processes = {"4": DeadProcess()}
+    builder._pool_pending = {"blocks-1": queue.Queue(maxsize=1)}
+
+    with pytest.raises(RuntimeError, match=r'worker died.*"exitcode":-9'):
+        builder._wait_pool_result("blocks-1")
+    assert "blocks-1" not in builder._pool_pending
+
+
+def test_persistent_pool_wait_uses_explicit_bounded_timeout():
+    import queue
+
+    class AliveProcess:
+        pid = 5678
+        exitcode = None
+
+        def is_alive(self):
+            return True
+
+    builder = HistoryAwareBaselineCaptionViewBuilder(
+        router=object(), segment_captioner=object(), parallel_gpus=("4",),
+        worker_result_timeout_seconds=0.03,
+        worker_health_poll_seconds=0.01)
+    builder._pool_processes = {"4": AliveProcess()}
+    builder._pool_pending = {"blocks-2": queue.Queue(maxsize=1)}
+
+    with pytest.raises(RuntimeError, match=(
+            r"timed out with no truncation or retry.*limit_seconds=0.03")):
+        builder._wait_pool_result("blocks-2")
+    assert "blocks-2" not in builder._pool_pending
 
 
 def test_persistent_pool_close_releases_queue_feeder_resources():

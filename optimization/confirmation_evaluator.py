@@ -14,6 +14,7 @@ from surrogate_rollout.captioning.history_aware_baseline import (
     CAPTION_OUTPUT_CONTRACT_VERSION,
     CAPTION_PARSE_NORMALIZATION_VERSION,
     CAPTION_PARSE_SCHEMA_VERSION,
+    CAPTION_REPETITION_POLICY_VERSION,
     DEFAULT_HISTORY_BLOCK_SECONDS,
     DEFAULT_MAX_HISTORY_CAPTIONS,
     HISTORY_SCHEMA_VERSION,
@@ -21,6 +22,9 @@ from surrogate_rollout.captioning.history_aware_baseline import (
 )
 from surrogate_rollout.evaluation.dvd_qa import run_dvd_qa
 from surrogate_rollout.prompt_routing.persistence import _atomic_write_text
+from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
+    free_form_router_version,
+)
 from surrogate_rollout.prompt_routing.schemas import (
     PromptBankSnapshot,
     RouterPolicySnapshot,
@@ -38,6 +42,9 @@ class ConfirmationEvaluationError(RuntimeError):
 
 class ConfirmationEvaluationConflictError(ConfirmationEvaluationError):
     pass
+
+
+_FREE_FORM_GENERATOR_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -202,6 +209,10 @@ class HistoryAwareDVDConfirmationEvaluator:
             "use_transcript": config.USE_TRANSCRIPT,
             "clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
             "clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
+            "frame_inspect_tool_contract_version":
+                config.DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION,
+            "frame_inspect_corrective_retry_limit":
+                config.DVD_FRAME_INSPECT_CORRECTIVE_RETRY_LIMIT,
         }
         downstream_extra = as_json_dict(downstream_qa_configuration or {})
         conflicting = {
@@ -242,10 +253,13 @@ class HistoryAwareDVDConfirmationEvaluator:
             "caption_decoding": self._caption_decoding,
             "caption_output_contract_version":
                 CAPTION_OUTPUT_CONTRACT_VERSION,
+            "caption_decoding_policy_version":
+                config.CAPTION_DECODING_POLICY_VERSION,
             "caption_parse_schema_version": CAPTION_PARSE_SCHEMA_VERSION,
             "caption_parse_normalization_version":
                 CAPTION_PARSE_NORMALIZATION_VERSION,
-            "subject_registry_mode": config.CAPTION_SUBJECT_REGISTRY_MODE,
+            "caption_repetition_policy_version":
+                CAPTION_REPETITION_POLICY_VERSION,
             "frame_sampling": self._frame_sampling,
             "history": {
                 "schema_version": HISTORY_SCHEMA_VERSION,
@@ -285,6 +299,10 @@ class HistoryAwareDVDConfirmationEvaluator:
             "use_transcript": config.USE_TRANSCRIPT,
             "clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
             "clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
+            "frame_inspect_tool_contract_version":
+                config.DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION,
+            "frame_inspect_corrective_retry_limit":
+                config.DVD_FRAME_INSPECT_CORRECTIVE_RETRY_LIMIT,
         }
         if live_dvd != self._dvd_runtime_defaults:
             raise ConfirmationEvaluationConflictError(
@@ -431,6 +449,7 @@ class HistoryAwareDVDConfirmationEvaluator:
         bank: PromptBankSnapshot, router: RouterPolicySnapshot,
         scaffold: ScaffoldPolicySnapshot, contract: ScaffoldContract,
         output_dir: str,
+        free_form_generator: Any = _FREE_FORM_GENERATOR_UNSET,
     ) -> Mapping[str, Any]:
         self._validate_live_runtime()
         self._validate_bundle(bundle)
@@ -438,18 +457,26 @@ class HistoryAwareDVDConfirmationEvaluator:
         for video in bundle["videos"]:
             work_root = os.path.join(
                 output_dir, state_name, "videos", video["video_id"])
-            view = self.builder.build(
-                sample=dict(video["qas"][0]["sample"]),
-                clip_index=self._clip_index(video),
-                prompt_bank=bank, router_policy=router,
-                scaffold_policy=scaffold, scaffold_contract=contract,
-                base_prompt_template=self.base_prompt_template,
-                merge_prompt=self.merge_prompt, work_root=work_root,
-                history_block_seconds=self.history_block_seconds,
-                max_history_captions=self.max_history_captions,
-                candidate_cache_root=self.cache_root,
-                cache_manifest_path=self.cache_manifest_path,
-                caption_run_identity_hash=bundle["bundle_hash"])
+            previous_generator = self.builder.free_form_generator
+            active_generator = (
+                previous_generator if free_form_generator is
+                _FREE_FORM_GENERATOR_UNSET else free_form_generator)
+            self.builder.free_form_generator = active_generator
+            try:
+                view = self.builder.build(
+                    sample=dict(video["qas"][0]["sample"]),
+                    clip_index=self._clip_index(video),
+                    prompt_bank=bank, router_policy=router,
+                    scaffold_policy=scaffold, scaffold_contract=contract,
+                    base_prompt_template=self.base_prompt_template,
+                    merge_prompt=self.merge_prompt, work_root=work_root,
+                    history_block_seconds=self.history_block_seconds,
+                    max_history_captions=self.max_history_captions,
+                    candidate_cache_root=self.cache_root,
+                    cache_manifest_path=self.cache_manifest_path,
+                    caption_run_identity_hash=bundle["bundle_hash"])
+            finally:
+                self.builder.free_form_generator = previous_generator
             routing = _read_json(view.routing_manifest_path)
             cache_rows = _read_jsonl(routing["caption_cache_keys_path"])
             histories = _read_jsonl(routing["frozen_histories_path"])
@@ -476,8 +503,12 @@ class HistoryAwareDVDConfirmationEvaluator:
                 if any(not key.get(name) for name in required):
                     raise ConfirmationEvaluationError(
                         "incomplete history-aware confirmation cache identity")
+                expected_router_version = (
+                    free_form_router_version(active_generator.identity_hash)
+                    if active_generator is not None else
+                    router.router_version)
                 if key["bank_version"] != bank.bank_version or \
-                        key["router_version"] != router.router_version or \
+                        key["router_version"] != expected_router_version or \
                         key["scaffold_version"] != scaffold.scaffold_version or \
                         key["contract_version"] != contract.contract_version or \
                         key["caption_model_id"] != self._caption_model_id or \
@@ -523,6 +554,9 @@ class HistoryAwareDVDConfirmationEvaluator:
             "bank_hash": sha256_json(as_json_dict(bank)),
             "router_version": router.router_version,
             "router_hash": sha256_json(as_json_dict(router)),
+            "prompt_generator": (
+                as_json_dict(active_generator.configuration_identity)
+                if active_generator is not None else None),
             "videos": videos,
         }
         path = _write_immutable(

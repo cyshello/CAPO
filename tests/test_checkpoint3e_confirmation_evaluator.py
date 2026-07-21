@@ -86,10 +86,7 @@ class CaptionVLM:
             "history": history, "policy": policy, "kwargs": kwargs,
         })
         index = len(history["preceding_captions"])
-        return json.dumps({
-            "clip_description": f"{policy} caption {index}",
-            "subject_registry": {"S1": policy},
-        })
+        return f"{policy} caption {index}."
 
 
 class QASpy:

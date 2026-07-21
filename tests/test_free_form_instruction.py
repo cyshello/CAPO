@@ -156,10 +156,7 @@ class FreeFormMockVLM:
                 "caption_instruction":
                     f"Generated instruction {len(self.calls)}"})
         self.caption_number += 1
-        return json.dumps({
-            "clip_description": f"generated caption {self.caption_number}",
-            "subject_registry": {},
-        })
+        return f"Generated caption {self.caption_number}."
 
 
 # --------------------------------------------------------------------------- #
@@ -423,8 +420,7 @@ def test_property_bank_mode_still_routes_through_router(tmp_path):
             self.calls.append({"kind": kind})
             if kind == "router":
                 return json.dumps({"property_ids": ["pe_temporal"]})
-            return json.dumps({"clip_description": "caption",
-                               "subject_registry": {}})
+            return "A concise clip caption."
 
     vlm = PropertyMockVLM()
     builder = HistoryAwareBaselineCaptionViewBuilder(

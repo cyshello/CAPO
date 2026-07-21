@@ -71,12 +71,15 @@ DVD_USE_OPENAI_TOOLS = os.environ.get(
     "SR_DVD_USE_OPENAI_TOOLS", "1") not in ("0", "false", "False", "")
 EMBEDDING_MODEL_ID = "BAAI/bge-small-en-v1.5"
 
-# Decoding configuration used for clip captioning (mirrors dvd_captioning +
-# captioning.Qwen25VLCaptioner defaults). Part of the strong cache key.
+# Decoding configuration used for clip captioning. The vLLM ``max_tokens``
+# value is the maximum number of newly generated tokens. This versioned,
+# deterministic plain-text policy is part of every strong caption-cache key.
+CAPTION_DECODING_POLICY_VERSION = "qwen_caption_plain_text_decoding_v2"
 CAPTION_DECODING = {
     "temperature": 0.0,
     "top_p": 1.0,
     "max_tokens": 1024,
+    "repetition_penalty": 1.05,
     "max_frames_per_clip": None,  # run_dvd derives sample_fps * clip_secs
     "image_max_pixels": 200704,
 }
@@ -173,6 +176,9 @@ PROPERTY_RETRIEVAL_TOP_K = 5
 # every clip_search_tool call with this value.
 DVD_CLIP_SEARCH_TOP_K = 16
 DVD_CLIP_SEARCH_POLICY_VERSION = "fixed_clip_search_top_k_v1"
+DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION = (
+    "strict_hhmmss_pair_with_one_corrective_retry_v1")
+DVD_FRAME_INSPECT_CORRECTIVE_RETRY_LIMIT = 1
 
 # CLIP retrieval defaults (PHASE2_3 §9-10)
 RETRIEVAL_TOP_K = 8

@@ -1,5 +1,717 @@
 # Phase 4 Runbook
 
+## Prompt-delta Checkpoint A: documentation and schemas
+
+Checkpoint A adds only the frozen prompt-delta data contracts in
+`optimization/schemas.py` and fixture-only schema tests. It does not add a
+runtime mode, persistence store, adapter, feedback generator, updater, CLI, or
+model call. No environment variables are required and no run, state, cache, or
+other artifact path is created. Re-running either command is side-effect free.
+
+Focused verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py
+```
+
+Related legacy schema, persistence, router, feedback, free-form generator, and
+Phase 2–3 prompt-delta retrieval regression verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_phase4_schemas.py \
+  tests/test_phase4_persistence.py \
+  tests/test_prompt_router.py \
+  tests/test_feedback_generator.py \
+  tests/test_free_form_instruction.py \
+  tests/test_prompt_delta_query_cache.py
+```
+
+Success requires every test to pass. These commands must not create or modify
+legacy codebook/router snapshots, caption caches, or experiment artifacts.
+Checkpoint A itself contains no adapter or later-stage behavior; the separate
+Checkpoint B adapter is documented below.
+
+## Prompt-delta Checkpoint B: read-only legacy adapter
+
+Checkpoint B adds only the read-only
+`legacy_property_intervention_to_episode(...)` Python adapter. It reads one
+completed legacy property-intervention `result.json` plus its exact baseline
+`video_complete.json` and returns an in-memory `InterventionEpisode`. It writes
+no episode artifact, codebook state, cache, pointer, or runtime configuration.
+No environment variables, model credentials, GPU, or output directory are
+required.
+
+Focused verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_legacy_intervention_adapter.py
+```
+
+Checkpoint A and related legacy property regression verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_checkpoint3b_property_proposal.py \
+  tests/test_checkpoint3c_property_intervention.py \
+  tests/test_checkpoint1_property_memory.py
+```
+
+The repository-local read-only smoke used the following existing saved v1
+intervention. It prints only a bounded conversion summary and creates no file:
+
+```bash
+PYTHONPATH=/home/intern/youngseo \
+conda run -n local_llm_vllm python -c \
+'import json; from surrogate_rollout.optimization.legacy_intervention_adapter import legacy_property_intervention_to_episode; episode=legacy_property_intervention_to_episode(intervention_result_path="runs/phase4_memory_k4_isolated_001_output/interventions/7D-gxaie6UI/7D-gxaie6UI/candidate_284d53fde9070f949063_pbad21bc654ed/result.json", baseline_video_manifest_path="runs/phase4_memory_k4_isolated_001_output/baseline_videos/7D-gxaie6UI/baseline/7D-gxaie6UI/video_complete.json", parent_meta_prompt_id="legacy-read-only-smoke-parent"); print(json.dumps({"episode_id": episode.episode_id, "video_id": episode.video_id, "delta_id": episode.prompt_delta.delta_id, "clip_count": len(episode.clips), "qa_count": len(episode.qa_outcomes)}, sort_keys=True))'
+```
+
+There is no prompt-delta CLI mode or prompt-delta persistence namespace at
+this checkpoint. Checkpoint C's separate in-memory mock path is documented
+below.
+
+## Prompt-delta Checkpoint C: deterministic mock feedback
+
+Checkpoint C adds only the in-memory
+`DeterministicMockEpisodeFeedbackGenerator`. It accepts an
+`InterventionEpisode`, reports deterministic caption-string and QA-correctness
+facts, validates every supporting ID against that episode, and returns an
+`EpisodeFeedback`. It does not load trajectory payloads or frames, call a
+model, propose a meta-prompt change, persist feedback, or modify runtime state.
+
+Focused verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_episode_feedback.py
+```
+
+Checkpoint A/B, legacy feedback, and related schema/persistence regression
+verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_legacy_intervention_adapter.py \
+  tests/test_feedback_generator.py \
+  tests/test_checkpoint3d_interventional_feedback.py \
+  tests/test_phase4_schemas.py \
+  tests/test_phase4_persistence.py
+```
+
+The model-free repository test suite can be checked with:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q
+```
+
+The repository-local read-only smoke used the existing Checkpoint B saved v1
+bundle below. The two path variables are inputs, not output locations. The
+command hashes every file under both source artifact directories before and
+after conversion, asserts equality, and prints only an in-memory summary:
+
+```bash
+LEGACY_INTERVENTION_RESULT=runs/phase4_memory_k4_isolated_001_output/interventions/7D-gxaie6UI/7D-gxaie6UI/candidate_284d53fde9070f949063_pbad21bc654ed/result.json
+LEGACY_BASELINE_MANIFEST=runs/phase4_memory_k4_isolated_001_output/baseline_videos/7D-gxaie6UI/baseline/7D-gxaie6UI/video_complete.json
+PYTHONPATH=/home/intern/youngseo \
+conda run -n local_llm_vllm python -c \
+'import hashlib,json,sys; from pathlib import Path; from surrogate_rollout.optimization.episode_feedback import DeterministicMockEpisodeFeedbackGenerator; from surrogate_rollout.optimization.legacy_intervention_adapter import legacy_property_intervention_to_episode; result=Path(sys.argv[1]).resolve(); baseline=Path(sys.argv[2]).resolve(); files=sorted({path.resolve() for root in (result.parent, baseline.parent) for path in root.rglob("*") if path.is_file()}, key=str); aggregate=lambda: hashlib.sha256("".join(str(path)+":"+hashlib.sha256(path.read_bytes()).hexdigest()+"\n" for path in files).encode()).hexdigest(); before=aggregate(); episode=legacy_property_intervention_to_episode(intervention_result_path=str(result), baseline_video_manifest_path=str(baseline), parent_meta_prompt_id="legacy-read-only-smoke-parent"); feedback=DeterministicMockEpisodeFeedbackGenerator().generate(episode); after=aggregate(); assert before == after; print(json.dumps({"aggregate_sha256_before": before, "aggregate_sha256_after": after, "episode_id": episode.episode_id, "feedback_id": feedback.feedback_id, "observation_count": len(feedback.observations), "counterevidence_count": len(feedback.counterevidence)}, sort_keys=True))' \
+"$LEGACY_INTERVENTION_RESULT" "$LEGACY_BASELINE_MANIFEST"
+```
+
+Success requires equal before/after hashes and stable episode/feedback IDs.
+Checkpoint C has no feedback artifact path, resume state, updater, real
+feedback provider, or runtime/CLI integration.
+
+## Prompt-delta Checkpoint D1: complete request and LLM policy boundary
+
+Checkpoint D1 resolves the complete saved baseline/intervention QA and
+trajectory evidence for one `InterventionEpisode`, constructs one deterministic
+text-only request, and exposes a strict one-call Python policy boundary for an
+explicitly injected backend. Tests use only a deterministic fake backend. No
+real model/API is called, and no request, response, feedback, state, cache, or
+run artifact is written.
+
+Focused verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_llm_episode_feedback.py
+```
+
+Checkpoint A–C and related legacy feedback/schema/persistence regression:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_legacy_intervention_adapter.py \
+  tests/test_episode_feedback.py \
+  tests/test_llm_episode_feedback.py \
+  tests/test_feedback_generator.py \
+  tests/test_checkpoint3d_interventional_feedback.py \
+  tests/test_phase4_schemas.py \
+  tests/test_phase4_persistence.py
+```
+
+Complete model-free suite:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q
+```
+
+The following read-only request-building smoke uses an existing saved v1
+intervention. The two variables identify source inputs. The command hashes all
+files below both source directories before and after, builds the complete
+request in memory, prints bounded statistics, and performs no backend call:
+
+```bash
+LEGACY_INTERVENTION_RESULT=runs/phase4_memory_k4_isolated_001_output/interventions/7D-gxaie6UI/7D-gxaie6UI/candidate_284d53fde9070f949063_pbad21bc654ed/result.json
+LEGACY_BASELINE_MANIFEST=runs/phase4_memory_k4_isolated_001_output/baseline_videos/7D-gxaie6UI/baseline/7D-gxaie6UI/video_complete.json
+PYTHONPATH=/home/intern/youngseo \
+conda run -n local_llm_vllm python -c \
+'import hashlib,json,sys; from pathlib import Path; from surrogate_rollout.optimization.legacy_intervention_adapter import legacy_property_intervention_to_episode; from surrogate_rollout.optimization.llm_episode_feedback import LegacyEpisodeFeedbackArtifactResolver,build_episode_feedback_request; result=Path(sys.argv[1]).resolve(); baseline=Path(sys.argv[2]).resolve(); files=sorted({path.resolve() for root in (result.parent,baseline.parent) for path in root.rglob("*") if path.is_file()},key=str); aggregate=lambda: hashlib.sha256("".join(str(path)+":"+hashlib.sha256(path.read_bytes()).hexdigest()+"\n" for path in files).encode()).hexdigest(); before=aggregate(); episode=legacy_property_intervention_to_episode(intervention_result_path=str(result),baseline_video_manifest_path=str(baseline),parent_meta_prompt_id="legacy-read-only-smoke-parent"); request=build_episode_feedback_request(episode,artifact_resolver=LegacyEpisodeFeedbackArtifactResolver()); after=aggregate(); assert before==after; stats=request.size_statistics; print(json.dumps({"aggregate_sha256_before":before,"aggregate_sha256_after":after,"episode_id":episode.episode_id,"clip_count":stats.clip_count,"qa_count":stats.qa_count,"history_count":stats.total_history_item_count,"total_request_characters":stats.serialized_request_character_count,"trajectory_characters":stats.trajectory_character_count,"request_payload_hash":request.payload_hash,"unresolved_references":stats.unresolved_reference_count,"context_limit_checked":stats.context_limit_checked},sort_keys=True))' \
+"$LEGACY_INTERVENTION_RESULT" "$LEGACY_BASELINE_MANIFEST"
+```
+
+No actual LLM invocation, persistence/resume path, updater, or prompt-delta
+runtime/CLI mode exists at Checkpoint D1. A backend with a known token context
+limit must inject its exact token counter; overflow fails before its callable
+is invoked and no truncation is performed. A backend that explicitly reports
+an unknown limit (`null`) produces the complete request with
+`context_limit_checked=false`.
+
+## Prompt-delta Checkpoint D1.5: compact request representation
+
+Checkpoint D1.5 adds an explicit parallel
+`build_compact_episode_feedback_request(...)` representation. The D1 complete
+builder remains unchanged and remains opt-in under its existing name. The
+compact view catalogs exact history items once, replaces clip-level history
+copies with ordered IDs, removes the validated clip-level delta duplicate, and
+projects raw trajectory wrappers into executed tool events, retained evidence,
+assistant-authored steps, final responses, references, and audit hashes. It
+does not truncate, summarize, sample, filter QAs, call a backend, or write an
+artifact.
+
+Focused verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_compact_episode_feedback.py
+```
+
+Checkpoint A–D1.5 and legacy feedback/schema/persistence regression:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_legacy_intervention_adapter.py \
+  tests/test_episode_feedback.py \
+  tests/test_llm_episode_feedback.py \
+  tests/test_compact_episode_feedback.py \
+  tests/test_feedback_generator.py \
+  tests/test_checkpoint3d_interventional_feedback.py \
+  tests/test_phase4_schemas.py \
+  tests/test_phase4_persistence.py
+```
+
+Complete model-free suite:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q
+```
+
+The following read-only comparison uses the same saved v1 bundle as D1. It
+builds both representations in memory, reconstructs every history snapshot,
+hashes all files below both source directories before and after, and performs
+no backend call:
+
+```bash
+LEGACY_INTERVENTION_RESULT=runs/phase4_memory_k4_isolated_001_output/interventions/7D-gxaie6UI/7D-gxaie6UI/candidate_284d53fde9070f949063_pbad21bc654ed/result.json
+LEGACY_BASELINE_MANIFEST=runs/phase4_memory_k4_isolated_001_output/baseline_videos/7D-gxaie6UI/baseline/7D-gxaie6UI/video_complete.json
+PYTHONPATH=/home/intern/youngseo \
+conda run -n local_llm_vllm python -c \
+'import hashlib,json,sys; from pathlib import Path; from surrogate_rollout.optimization.legacy_intervention_adapter import legacy_property_intervention_to_episode; from surrogate_rollout.optimization.llm_episode_feedback import LegacyEpisodeFeedbackArtifactResolver,build_episode_feedback_request,build_compact_episode_feedback_request,reconstruct_compact_history_snapshots; from surrogate_rollout.prompt_routing.schemas import dumps_canonical; result=Path(sys.argv[1]).resolve(); baseline=Path(sys.argv[2]).resolve(); files=sorted({path.resolve() for root in (result.parent,baseline.parent) for path in root.rglob("*") if path.is_file()},key=str); aggregate=lambda: hashlib.sha256("".join(str(path)+":"+hashlib.sha256(path.read_bytes()).hexdigest()+"\n" for path in files).encode()).hexdigest(); before=aggregate(); episode=legacy_property_intervention_to_episode(intervention_result_path=str(result),baseline_video_manifest_path=str(baseline),parent_meta_prompt_id="legacy-read-only-smoke-parent"); resolver=LegacyEpisodeFeedbackArtifactResolver(); complete=build_episode_feedback_request(episode,artifact_resolver=resolver); compact=build_compact_episode_feedback_request(episode,artifact_resolver=resolver); reconstructed=reconstruct_compact_history_snapshots(compact.user_payload); reconstruction_ok=[dumps_canonical(x) for x in reconstructed]==[dumps_canonical(x.history_snapshot) for x in episode.clips]; after=aggregate(); assert before==after and reconstruction_ok; stats=compact.size_statistics; print(json.dumps({"aggregate_sha256_before":before,"aggregate_sha256_after":after,"episode_id":episode.episode_id,"clip_count":stats.clip_count,"qa_count":stats.qa_count,"total_history_occurrences":stats.total_history_item_occurrences,"unique_history_items":stats.unique_history_item_count,"complete_request_characters":stats.complete_request_character_count,"compact_request_characters":stats.compact_request_character_count,"complete_trajectory_characters":complete.size_statistics.trajectory_character_count,"compact_trajectory_characters":stats.compact_trajectory_character_count,"complete_payload_hash":stats.complete_payload_hash,"compact_payload_hash":stats.compact_payload_hash,"unclassified_trajectory_messages":stats.unclassified_trajectory_message_count,"unresolved_references":stats.unresolved_reference_count,"history_reconstruction_success":reconstruction_ok},sort_keys=True))' \
+"$LEGACY_INTERVENTION_RESULT" "$LEGACY_BASELINE_MANIFEST"
+```
+
+The complete D1 trajectory metric counts serialized raw messages and tool
+events only. The D1.5 compact-trajectory metric counts the whole projected
+trajectory object, including audit source hashes and complete reference sets;
+therefore those two sub-metrics are not expected to be monotonically ordered.
+The complete/compact request-character metrics are directly comparable.
+
+## Prompt-delta Checkpoint D1.6: model/audit request separation
+
+Checkpoint D1.6 adds the explicit `request_representation="model_compact"`
+view. It retains all semantic clip, cataloged history, QA, executed-tool,
+returned-evidence, reference, final-response, and unknown-message content in
+`model_payload`; source paths/hashes, projection statistics, and lossless
+history-reconstruction metadata remain separately inspectable in
+`audit_metadata`. Only canonical `model_payload` is passed to the injected
+backend. The default remains `complete`, and D1.5 `compact` remains unchanged.
+DVD `references.json` is projected by type: segment-set fields remain ordered
+string arrays, while the structured `evidence` object array is preserved as
+`reference_evidence` in complete and compact trajectory views and in
+model-compact audit metadata. It is not duplicated into the model-facing v3
+payload because executed tool events, hits, and reference IDs already retain
+the semantic execution evidence. It is never stringified or silently
+discarded; its canonical hash is retained in compact audit metadata. For the
+same reason, the complete typed `reference_sets` object remains in model-compact
+audit metadata while the model-facing trajectory retains the exact referenced
+and retrieved segment-ID arrays plus executed tool events and returned evidence.
+No model/API call or artifact write is performed by these commands.
+
+Focused verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_model_compact_episode_feedback.py
+```
+
+Checkpoint A–D1.6 and related legacy regression:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_legacy_intervention_adapter.py \
+  tests/test_episode_feedback.py \
+  tests/test_llm_episode_feedback.py \
+  tests/test_compact_episode_feedback.py \
+  tests/test_model_compact_episode_feedback.py \
+  tests/test_feedback_generator.py \
+  tests/test_checkpoint3d_interventional_feedback.py \
+  tests/test_phase4_schemas.py \
+  tests/test_phase4_persistence.py
+```
+
+Complete model-free suite:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q
+```
+
+Read-only D1/D1.5/D1.6 comparison over the same saved bundle:
+
+```bash
+LEGACY_INTERVENTION_RESULT=runs/phase4_memory_k4_isolated_001_output/interventions/7D-gxaie6UI/7D-gxaie6UI/candidate_284d53fde9070f949063_pbad21bc654ed/result.json
+LEGACY_BASELINE_MANIFEST=runs/phase4_memory_k4_isolated_001_output/baseline_videos/7D-gxaie6UI/baseline/7D-gxaie6UI/video_complete.json
+PYTHONPATH=/home/intern/youngseo \
+conda run -n local_llm_vllm python -c \
+'import hashlib,json,sys; from pathlib import Path; from surrogate_rollout.optimization.legacy_intervention_adapter import legacy_property_intervention_to_episode; from surrogate_rollout.optimization.llm_episode_feedback import LegacyEpisodeFeedbackArtifactResolver,build_episode_feedback_request,build_compact_episode_feedback_request,build_model_compact_episode_feedback_request,reconstruct_compact_history_snapshots; from surrogate_rollout.prompt_routing.schemas import dumps_canonical; result=Path(sys.argv[1]).resolve(); baseline=Path(sys.argv[2]).resolve(); files=sorted({path.resolve() for root in (result.parent,baseline.parent) for path in root.rglob("*") if path.is_file()},key=str); aggregate=lambda: hashlib.sha256("".join(str(path)+":"+hashlib.sha256(path.read_bytes()).hexdigest()+"\n" for path in files).encode()).hexdigest(); before=aggregate(); episode=legacy_property_intervention_to_episode(intervention_result_path=str(result),baseline_video_manifest_path=str(baseline),parent_meta_prompt_id="legacy-read-only-smoke-parent"); resolver=LegacyEpisodeFeedbackArtifactResolver(); complete=build_episode_feedback_request(episode,artifact_resolver=resolver); compact=build_compact_episode_feedback_request(episode,artifact_resolver=resolver); model=build_model_compact_episode_feedback_request(episode,artifact_resolver=resolver); reconstructed=reconstruct_compact_history_snapshots(model.model_payload,model.audit_metadata); reconstruction_ok=[dumps_canonical(x) for x in reconstructed]==[dumps_canonical(x.history_snapshot) for x in episode.clips]; after=aggregate(); assert before==after and reconstruction_ok; stats=model.size_statistics; print(json.dumps({"aggregate_sha256_before":before,"aggregate_sha256_after":after,"episode_id":episode.episode_id,"clip_count":stats.clip_count,"qa_count":stats.qa_count,"total_history_occurrences":stats.total_history_item_occurrences,"unique_history_items":stats.unique_history_item_count,"complete_request_characters":stats.complete_request_character_count,"compact_request_characters":stats.compact_request_character_count,"model_compact_request_characters":stats.model_request_character_count,"complete_trajectory_characters":complete.size_statistics.trajectory_character_count,"compact_trajectory_characters":stats.compact_trajectory_character_count,"model_trajectory_characters":stats.model_trajectory_character_count,"complete_payload_hash":stats.complete_payload_hash,"compact_payload_hash":stats.compact_payload_hash,"model_payload_hash":stats.model_payload_hash,"audit_metadata_hash":stats.audit_metadata_hash,"unclassified_trajectory_messages":stats.unclassified_trajectory_message_count,"unresolved_references":stats.unresolved_reference_count,"history_reconstruction_success":reconstruction_ok},sort_keys=True))' \
+"$LEGACY_INTERVENTION_RESULT" "$LEGACY_BASELINE_MANIFEST"
+```
+
+## Prompt-delta Checkpoint D2: explicit provider and exact token inspection
+
+Checkpoint D2 adds an OpenAI-compatible strict-chat provider adapter without
+selecting or calling a provider. Provider identity, model ID, local tokenizer,
+tokenizer identity, context limit, output-token reservation, generation
+settings, feedback policy version, and response transport are all required.
+`prepare_and_measure(...)` builds the D1.6 `model_compact` request, formats the
+exact provider messages, and reports system-content, user-content, and complete
+chat-template token counts. A generation call is rejected before transport
+unless `total_input_tokens + maximum_output_tokens <= context_limit`.
+
+Focused verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_episode_feedback_provider.py
+```
+
+Checkpoint A–D2 and related legacy regression:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_legacy_intervention_adapter.py \
+  tests/test_episode_feedback.py \
+  tests/test_llm_episode_feedback.py \
+  tests/test_compact_episode_feedback.py \
+  tests/test_model_compact_episode_feedback.py \
+  tests/test_episode_feedback_provider.py \
+  tests/test_feedback_generator.py \
+  tests/test_checkpoint3d_interventional_feedback.py \
+  tests/test_phase4_schemas.py \
+  tests/test_phase4_persistence.py
+```
+
+Complete model-free suite:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q
+```
+
+No D2 model/tokenizer/context configuration is currently committed or present
+in the inspected environment. Set all of the following to reviewed exact
+values before inspection; the command fails on any missing value. The
+tokenizer must already exist locally and expose the exact model chat template.
+The script sets `local_files_only=True`, performs no download or provider call,
+and verifies the saved source aggregate hash before and after.
+
+```bash
+: "${PD_FEEDBACK_PROVIDER:?set exact provider identity}"
+: "${PD_FEEDBACK_MODEL_ID:?set exact model ID}"
+: "${PD_FEEDBACK_TOKENIZER_PATH:?set existing local tokenizer path}"
+: "${PD_FEEDBACK_TOKENIZER_IDENTITY:?set exact tokenizer identity/version}"
+: "${PD_FEEDBACK_CONTEXT_LIMIT:?set exact positive context limit}"
+: "${PD_FEEDBACK_MAX_OUTPUT_TOKENS:?set exact positive output reservation}"
+: "${PD_FEEDBACK_GENERATION_SETTINGS_JSON:?set non-empty JSON settings}"
+: "${PD_FEEDBACK_POLICY_VERSION:?set reviewed feedback policy version}"
+
+PYTHONPATH=/home/intern/youngseo \
+conda run -n local_llm_vllm python \
+  scripts/inspect_episode_feedback_request.py \
+  --intervention-result runs/phase4_memory_k4_isolated_001_output/interventions/7D-gxaie6UI/7D-gxaie6UI/candidate_284d53fde9070f949063_pbad21bc654ed/result.json \
+  --baseline-manifest runs/phase4_memory_k4_isolated_001_output/baseline_videos/7D-gxaie6UI/baseline/7D-gxaie6UI/video_complete.json \
+  --parent-meta-prompt-id legacy-read-only-smoke-parent \
+  --provider "$PD_FEEDBACK_PROVIDER" \
+  --model-id "$PD_FEEDBACK_MODEL_ID" \
+  --tokenizer-path "$PD_FEEDBACK_TOKENIZER_PATH" \
+  --tokenizer-identity "$PD_FEEDBACK_TOKENIZER_IDENTITY" \
+  --context-limit "$PD_FEEDBACK_CONTEXT_LIMIT" \
+  --maximum-output-tokens "$PD_FEEDBACK_MAX_OUTPUT_TOKENS" \
+  --generation-settings-json "$PD_FEEDBACK_GENERATION_SETTINGS_JSON" \
+  --feedback-policy-version "$PD_FEEDBACK_POLICY_VERSION"
+```
+
+### One explicitly operator-run episode-feedback call
+
+The command below is the standalone one-call path for the saved episode used
+by the D1–D2 inspections. It is not connected to optimization runtime, updater,
+or canonical persistence. It sends only the D1.6 system prompt and
+`model_compact` payload. The API key is read only from `OPENAI_API_KEY`.
+
+Choose a new local output directory. The command refuses to overwrite an
+existing directory. On success it writes `request.json`, `provider_response.json`,
+`raw_response.txt`, `parsed_feedback.json`, `usage.json`, and `manifest.json`
+there. On HTTP, transport, or strict-parse failure it performs no retry, repair,
+or fallback, returns non-zero, and preserves `raw_error.txt` plus
+`manifest.json`. Source artifacts are hashed before and after and are never
+written.
+
+```bash
+: "${OPENAI_API_KEY:?set the OpenAI API key in the environment}"
+: "${EPISODE_FEEDBACK_OUTPUT_DIR:?set a new local output directory}"
+
+PYTHONPATH=/home/intern/youngseo \
+conda run -n local_llm_vllm python \
+  scripts/run_episode_feedback_once.py \
+  --intervention-result runs/phase4_memory_k4_isolated_001_output/interventions/7D-gxaie6UI/7D-gxaie6UI/candidate_284d53fde9070f949063_pbad21bc654ed/result.json \
+  --baseline-manifest runs/phase4_memory_k4_isolated_001_output/baseline_videos/7D-gxaie6UI/baseline/7D-gxaie6UI/video_complete.json \
+  --parent-meta-prompt-id legacy-read-only-smoke-parent \
+  --output-dir "$EPISODE_FEEDBACK_OUTPUT_DIR" \
+  --provider openai_api \
+  --api-endpoint https://api.openai.com/v1/chat/completions \
+  --model-id gpt-4.1-mini-2025-04-14 \
+  --request-representation model_compact \
+  --context-limit 1047576 \
+  --maximum-output-tokens 4096 \
+  --temperature 0.0 \
+  --feedback-policy-version episode_feedback_request_v3_gpt41mini_v1 \
+  --timeout-seconds 600
+```
+
+Success requires exit code zero, `status="success"`, both call counts equal to
+one, equal source hashes, and a non-empty parsed feedback file. A failed command
+must be inspected in its selected output directory; do not rerun it against the
+same directory.
+
+## Prompt-delta Checkpoint E1: provisional meta-prompt updater boundary
+
+Checkpoint E1 consumes one immutable parent `MetaPromptVersion` and an ordered,
+non-empty sequence of validated `EpisodeFeedback` records. It builds a
+deterministic request and returns either a deterministic provisional candidate
+identity or an explicit `no_update`. It does not reload episodes, captions, or
+trajectories and does not persist, promote, confirm, or activate a candidate.
+
+The intended episode-feedback model is `gpt-4o`, supplied explicitly at the D
+provider boundary. E1 deliberately does not select or default an updater model;
+an updater backend remains a separate explicit injection.
+
+Focused verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_meta_prompt_updater.py
+```
+
+Checkpoint A–E1 regression verification:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_legacy_intervention_adapter.py \
+  tests/test_episode_feedback.py \
+  tests/test_llm_episode_feedback.py \
+  tests/test_compact_episode_feedback.py \
+  tests/test_model_compact_episode_feedback.py \
+  tests/test_episode_feedback_provider.py \
+  tests/test_meta_prompt_updater.py
+```
+
+Complete model-free suite:
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q
+```
+
+These commands make no model/API call and create no meta-prompt candidate file,
+pointer, updater state, confirmation artifact, or runtime configuration.
+
+## Prompt-delta Checkpoint E2: one-call provisional updater artifact
+
+Checkpoint E2 sends only the immutable parent `MetaPromptVersion` and the
+ordered, validated `EpisodeFeedback` JSON records to an explicitly selected
+updater backend. The updater model is independent of the `gpt-4o` episode-
+feedback model and has no repository default. The command makes exactly one
+strict-JSON provider attempt with no retry, repair, or fallback. It writes only
+to a new operator-selected directory and never changes a current/active
+pointer.
+
+Focused and A–E2 regression verification (no API calls):
+
+```bash
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_meta_prompt_update_execution.py \
+  tests/test_meta_prompt_updater.py
+
+conda run -n local_llm_vllm python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_legacy_intervention_adapter.py \
+  tests/test_episode_feedback.py \
+  tests/test_llm_episode_feedback.py \
+  tests/test_compact_episode_feedback.py \
+  tests/test_model_compact_episode_feedback.py \
+  tests/test_episode_feedback_provider.py \
+  tests/test_meta_prompt_updater.py \
+  tests/test_meta_prompt_update_execution.py
+
+conda run -n local_llm_vllm python -m pytest -q
+```
+
+Operator-run single updater call. Every environment variable below is required;
+in particular, no updater model, temperature, or output-token budget is
+inferred from the feedback generator or captioner. Repeat
+`--feedback-artifact "$EPISODE_FEEDBACK_ARTIFACT"` in the desired order when
+supplying more than one feedback record.
+
+```bash
+: "${OPENAI_API_KEY:?export OPENAI_API_KEY for the updater provider}"
+: "${PARENT_META_PROMPT_ARTIFACT:?absolute path to one MetaPromptVersion JSON}"
+: "${EPISODE_FEEDBACK_ARTIFACT:?absolute path to one validated EpisodeFeedback JSON}"
+: "${META_PROMPT_UPDATER_MODEL:?explicit updater model or snapshot ID}"
+: "${META_PROMPT_UPDATER_POLICY_VERSION:?reviewed updater policy version}"
+: "${META_PROMPT_UPDATER_TEMPERATURE:?explicit updater temperature}"
+: "${META_PROMPT_UPDATER_MAX_OUTPUT_TOKENS:?explicit positive output-token budget}"
+: "${META_PROMPT_UPDATE_OUTPUT_DIR:?new local output directory}"
+
+conda run --no-capture-output -n local_llm_vllm \
+  python scripts/run_meta_prompt_update_once.py \
+  --provider openai_api \
+  --api-endpoint https://api.openai.com/v1/chat/completions \
+  --model-id "$META_PROMPT_UPDATER_MODEL" \
+  --parent-meta-prompt "$PARENT_META_PROMPT_ARTIFACT" \
+  --feedback-artifact "$EPISODE_FEEDBACK_ARTIFACT" \
+  --updater-policy-version "$META_PROMPT_UPDATER_POLICY_VERSION" \
+  --temperature "$META_PROMPT_UPDATER_TEMPERATURE" \
+  --maximum-output-tokens "$META_PROMPT_UPDATER_MAX_OUTPUT_TOKENS" \
+  --candidate-created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --output-dir "$META_PROMPT_UPDATE_OUTPUT_DIR" \
+  --timeout-seconds 600
+```
+
+On `update`, the new directory contains `updater_request.json`,
+`provider_request.json`, `raw_response.txt`, `provider_response.json`,
+`parsed_meta_prompt_update_result.json`, `provisional_meta_prompt.json`,
+`usage.json`, `input_manifest.json`, and `run_manifest.json`. On `no_update`,
+`no_update.json` replaces `provisional_meta_prompt.json`. Success requires a
+zero exit, `run_manifest.json` with `status="succeeded"` and
+`provider_call_count=1`, equal before/after source hashes, and a provisional
+record whose parent is the input meta-prompt. Failure exits non-zero and writes
+`raw_error.txt` plus a failed run manifest when the output directory was
+created. Never reuse an existing output directory; inspect it and choose a new
+directory for a separately authorized call.
+
+### Grounded five-episode feedback regeneration
+
+The grounded response contract includes a deterministic
+`qa_transition_summary` in the model-facing request and requires every
+`qa_transition` evidence item to declare exactly one `transition_type`.
+Successful one-call runs also write `semantic_eligibility.json`. The updater
+batch verifies this sidecar against the canonical parsed-feedback hash, prints
+every ineligible input and reason, and refuses to call the updater when fewer
+than two eligible records remain. Neither script retries, repairs, falls back,
+promotes a candidate, or changes a runtime pointer.
+
+Offline verification (no API calls):
+
+```bash
+conda run --no-capture-output -n local_llm_vllm \
+  python -m pytest -q \
+  tests/test_prompt_delta_schemas.py \
+  tests/test_episode_feedback.py \
+  tests/test_llm_episode_feedback.py \
+  tests/test_compact_episode_feedback.py \
+  tests/test_model_compact_episode_feedback.py \
+  tests/test_episode_feedback_provider.py \
+  tests/test_meta_prompt_updater.py \
+  tests/test_meta_prompt_update_execution.py
+
+bash -n scripts/run_selected_episode_feedback_batch.sh
+bash -n scripts/run_selected_meta_prompt_update.sh
+```
+
+Operator-run commands (the first command performs five authorized provider
+calls, one per reviewed production episode; the second performs at most one
+updater call):
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+export SELECTED_FEEDBACK_BATCH_TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)" && bash /home/intern/youngseo/surrogate_rollout/scripts/run_selected_episode_feedback_batch.sh
+
+cd /home/intern/youngseo/surrogate_rollout
+bash /home/intern/youngseo/surrogate_rollout/scripts/run_selected_meta_prompt_update.sh "/home/intern/youngseo/surrogate_rollout/runs/selected_episode_feedback_$SELECTED_FEEDBACK_BATCH_TIMESTAMP"
+```
+
+Run both commands in the same shell so the explicit timestamp variable is
+preserved. An older ungrounded feedback root has no eligibility sidecars and
+is rejected before the updater transport.
+
+## Prompt-delta Checkpoint F: paired confirmation and atomic promotion
+
+`scripts/run_prompt_delta_iteration.py` connects grounded episode feedback,
+the ordered meta-prompt updater decision, an independent paired confirmation
+set, and atomic promotion/rollback. It does not select a model, decoding
+configuration, confirmation sample count, accuracy threshold, regression
+guard, cache-reset identity, or evaluator pipeline. Real components must be
+supplied together by one reviewed `module:callable` factory returning
+`(feedback_generator, updater, confirmation_evaluator)`. The repository does
+not currently declare such a real factory, so the command below is the fully
+bounded deterministic dry-run and performs no API/model call.
+
+The paired evaluator must echo the exact request identity, ordered cases,
+model identity, decoding settings, cache/reset identity, and pipeline identity.
+Update and confirmation video/QA identities must be disjoint. A QA flip with
+identical parent/candidate captions is recorded as attribution-uncertain no-op
+evidence and is neutralized for promotion scoring; it is never counted as
+caption-strategy benefit or regression.
+
+Focused and A–F regression tests:
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+PYTHONPATH=/home/intern/youngseo:/home/intern/youngseo/surrogate_rollout conda run --no-capture-output -n local_llm_vllm python -m pytest -q tests/test_prompt_delta_iteration.py tests/test_meta_prompt_updater.py
+
+cd /home/intern/youngseo/surrogate_rollout
+PYTHONPATH=/home/intern/youngseo:/home/intern/youngseo/surrogate_rollout conda run --no-capture-output -n local_llm_vllm python -m pytest -q tests/test_prompt_delta_schemas.py tests/test_legacy_intervention_adapter.py tests/test_episode_feedback.py tests/test_llm_episode_feedback.py tests/test_compact_episode_feedback.py tests/test_model_compact_episode_feedback.py tests/test_episode_feedback_provider.py tests/test_meta_prompt_updater.py tests/test_meta_prompt_update_execution.py tests/test_prompt_delta_iteration.py
+```
+
+Complete deterministic dry-run with explicit criteria and pair identity:
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+CHECKPOINT_F_TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+PYTHONPATH=/home/intern/youngseo:/home/intern/youngseo/surrogate_rollout conda run --no-capture-output -n local_llm_vllm python /home/intern/youngseo/surrogate_rollout/scripts/run_prompt_delta_iteration.py \
+  --iteration-id "checkpoint_f_dry_run_$CHECKPOINT_F_TIMESTAMP" \
+  --parent-meta-prompt /home/intern/youngseo/surrogate_rollout/tests/fixtures/prompt_delta_iteration/parent.json \
+  --update-episode /home/intern/youngseo/surrogate_rollout/tests/fixtures/prompt_delta_iteration/update_episode.json \
+  --confirmation-cases /home/intern/youngseo/surrogate_rollout/tests/fixtures/prompt_delta_iteration/confirmation_cases.json \
+  --output-dir "/tmp/prompt_delta_checkpoint_f_output_$CHECKPOINT_F_TIMESTAMP" \
+  --state-dir "/tmp/prompt_delta_checkpoint_f_state_$CHECKPOINT_F_TIMESTAMP" \
+  --candidate-created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --model-identity fixture-model-not-called \
+  --decoding-settings /home/intern/youngseo/surrogate_rollout/tests/fixtures/prompt_delta_iteration/decoding_settings.json \
+  --cache-reset-identity fixture-clean-cache-v1 \
+  --evaluation-pipeline-identity fixture-paired-pipeline-v1 \
+  --minimum-confirmation-samples 2 \
+  --minimum-accuracy-delta 0.0 \
+  --maximum-correct-to-wrong 0 \
+  --require-no-execution-failures true \
+  --initialize-parent-pointer \
+  --dry-run \
+  --mock-candidate-meta-prompt "Inspect current frames and bounded caption history for visible continuity before generating a concise segment instruction." \
+  --mock-confirmation-outcomes /home/intern/youngseo/surrogate_rollout/tests/fixtures/prompt_delta_iteration/mock_confirmation_outcomes.json
+```
+
+The output is write-once. Repeating the exact command with the same timestamp
+resumes the completed result without feedback, updater, or evaluator calls.
+Promotion writes the confirmed version beneath the isolated state directory
+and atomically replaces only `current_meta_prompt.json`; rollback writes a
+rejected candidate while retaining the parent pointer. No legacy codebook or
+router state is read or written.
+
+## Prompt-delta Checkpoint G: real DVD paired confirmation pilot
+
+`DVDMetaPromptConfirmationEvaluator` connects the provisional meta-prompt to
+the existing history-aware Qwen caption pipeline and `run_dvd_qa`. Parent and
+candidate share one immutable two-video/six-QA bundle, frame files,
+transcripts, sampling, captioner and DVD model/decoding configuration. They
+independently regenerate free-form prompts, on-policy sequential histories,
+captions, caption databases, cache identities, and downstream QA runs. The
+candidate text is supplied only as the free-form generator meta-prompt; an
+empty compatibility bank/router record satisfies the preserved builder API,
+but no legacy property is routed or selected.
+
+The operator script freezes the five already-saved production interventions,
+derives held-out videos `g1VFfVsZt7w` and `jIx5Zi84Z3Q` from
+`split_manifest.json`, and writes resolved model, decoding, history,
+transcript, sampling, worker, timeout, context, output-token and promotion
+settings into an immutable input manifest before any provider/model stage.
+`gpt-4o` feedback is attempted once per episode and the `gpt-4o` updater at
+most once. If the updater returns `no_update`, no confirmation runtime starts.
+There is no retry, JSON repair, fallback, truncation, sampling, or request
+splitting.
+
+Offline verification only:
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+PYTHONPATH=/home/intern/youngseo:/home/intern/youngseo/surrogate_rollout conda run --no-capture-output -n local_llm_vllm python -m pytest -q tests/test_dvd_meta_prompt_confirmation.py tests/test_prompt_delta_iteration.py tests/test_free_form_instruction.py tests/test_checkpoint3a_history_aware_baseline.py
+bash -n /home/intern/youngseo/surrogate_rollout/scripts/run_checkpoint_g_pilot.sh
+PYTHONPATH=/home/intern/youngseo:/home/intern/youngseo/surrogate_rollout conda run --no-capture-output -n local_llm_vllm python /home/intern/youngseo/surrogate_rollout/scripts/prepare_checkpoint_g_pilot.py --help
+PYTHONPATH=/home/intern/youngseo:/home/intern/youngseo/surrogate_rollout conda run --no-capture-output -n local_llm_vllm python /home/intern/youngseo/surrogate_rollout/scripts/run_prompt_delta_iteration.py --help
+```
+
+Operator-run pilot (paid API plus local Qwen/DVD work; Codex does not run it):
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+export CHECKPOINT_G_PILOT_TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+bash /home/intern/youngseo/surrogate_rollout/scripts/run_checkpoint_g_pilot.sh
+```
+
+Resume after interruption in the same shell by preserving the exact timestamp;
+completed feedback rows, updater result, paired QA rows, or a completed
+iteration are loaded without repeating those calls:
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+: "${CHECKPOINT_G_PILOT_TIMESTAMP:?set this to the original YYYYMMDD_HHMMSS value}"
+bash /home/intern/youngseo/surrogate_rollout/scripts/run_checkpoint_g_pilot.sh
+```
+
+Inspect the terminal state and paired confirmation (the second file exists only
+when the updater returned `update`):
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+jq . "/home/intern/youngseo/surrogate_rollout/runs/checkpoint_g_pilot_${CHECKPOINT_G_PILOT_TIMESTAMP}_output/iteration_result.json"
+jq '{aggregate,qa_results}' "/home/intern/youngseo/surrogate_rollout/runs/checkpoint_g_pilot_${CHECKPOINT_G_PILOT_TIMESTAMP}_output/confirmation/dvd_confirmation_manifest.json"
+jq . "/home/intern/youngseo/surrogate_rollout/runs/checkpoint_g_pilot_${CHECKPOINT_G_PILOT_TIMESTAMP}_state/current_meta_prompt.json"
+```
+
+All four timestamped input/output/state/cache roots are pairwise distinct.
+Caption cache entries are content-addressed beneath the isolated cache root;
+parent and candidate meta-prompt identities produce distinct router/prompt
+cache identities. Immutable decoded frames may be shared, while generated
+prompts, histories, captions, caption databases, and QA runs are never shared
+between policies. A completed manifest is write-once; a different request with
+the same output directory fails rather than overwriting it.
+
 ## Active data policy
 
 Older commands or artifacts that use three proposal videos plus separate
@@ -1326,35 +2038,27 @@ At minimum locate:
 
 ## 8. Resume and recovery
 
-Caption caches produced under `history_aware_caption_cache_v1` remain
-immutable legacy completed artifacts. `caption_output_contract_v2` and
-`caption_parse_result_v2` use a distinct cache/resume identity; do not copy a
-v1 `caption.json` into a v2 cache directory or edit its `parsed` field. Exact
-resume is supported only when the output-contract and parser versions match.
+Caption caches produced under earlier JSON-output policies remain immutable.
+`caption_plain_text_output_contract_v2`,
+`caption_plain_text_parse_result_v2`, `caption_repetition_guard_v1`, and
+`qwen_caption_plain_text_decoding_v2` use a distinct cache/resume identity. Do
+not copy or edit an earlier `caption.json`. Exact resume is supported only when
+the contract, parser, repetition, and decoding identities all match.
 
 Caption parse failures use a fixed five-retry budget. One segment therefore
 makes at most six caption-model calls. New artifacts report
-`history_aware_caption_cache_v4`,
-`caption_parse_retry_v2_percent_escape`, `attempt_count`,
+`history_aware_caption_cache_v5`, `caption_plain_text_retry_v1`, `attempt_count`,
 `retry_count`, `retry_exhausted`, and every attempt's raw output and parse
 result. The first valid attempt is used. If all retries fail, the selected
 intervention segment still raises `selected_segment_caption_failed`; it is not
 silently replaced by an empty caption.
 
-Existing valid v2/v3 caches are reused. For an existing invalid earlier cache,
-the original `caption.json` stays unchanged and the retry result is written to:
-
-```text
-<cache_dir>/parse_retries/caption_parse_retry_v2_percent_escape/caption.json
-```
-
-This policy performs one narrow repair: an unescaped JSON `\%` becomes `%` and
-is recorded as `replace_invalid_percent_escape`. It does not repair `\q`, broken
-quotes, truncated JSON, or other malformed output. When `\%` is the only defect,
-the immutable cached raw response is reparsed into the sidecar with zero model
-calls. Use a fresh output/state directory so the updated parser and valid-caption
-retrieval-universe identities are frozen; the existing caption cache directory
-may be reused.
+The model emits plain text only. Non-empty text is wrapped deterministically as
+`{"clip_description": text}`; even JSON-looking text is preserved literally.
+There is no sentence-count limit. Blank, repeated-sentence, and majority
+repeated-n-gram outputs fail closed. There is no JSON extraction, truncated-JSON repair,
+segment skip, or incumbent-caption fallback. Use a fresh timestamp so prompt,
+caption, history, and DVD QA evidence are recomputed in new output/cache roots.
 
 Focused verification:
 
@@ -1388,10 +2092,9 @@ find runs -path '*/history_v1/*/caption.json' -type f -print0 \
   | xargs -0 -n1 jq '{raw_output, parse_result, parsed}'
 ```
 
-Expected compatibility normalizations are
-`default_empty_subject_registry` and, for a single-object Qwen response,
-`unwrap_singleton_object_array`. `invalid_top_level_array`, `invalid_json`, or
-`missing_clip_description` is a real caption execution failure.
+The only normal normalization is `strip_surrounding_whitespace`. Errors such as
+`empty_output`, `repeated_sentence`, or
+`repeated_ngram_majority` are real caption execution failures.
 
 The top-level resume key hashes the parent confirmed checkpoint, current and
 confirmed component snapshots, coverage state, train roles, explicit execution
@@ -1428,11 +2131,11 @@ or fails closed before QA.
 A healthy run satisfies:
 
 - every new history-aware caption artifact reports
-  `history_aware_caption_cache_v4`, `caption_parse_result_v2`, and
-  `caption_parse_retry_v2_percent_escape`;
-- `clip_description` is non-empty while `subject_registry` may be `{}`;
-- populated registries from capable models are preserved;
-- singleton object arrays are audibly normalized rather than discarded;
+  `history_aware_caption_cache_v5`, `caption_plain_text_parse_result_v2`, and
+  `caption_plain_text_retry_v1`;
+- `clip_description` is non-empty plain text without a sentence-count limit;
+- decoding records temperature 0, maximum 1024 new tokens, and repetition
+  penalty 1.05;
 - current policy is frozen within an iteration;
 - each of the selected `K` batch videos has one complete incumbent caption view;
 - one video may generate multiple candidate properties;
@@ -1449,3 +2152,164 @@ A healthy run satisfies:
 - multiple supported properties may be accepted;
 - codebook/router update cites intervention evidence;
 - scaffold version does not change.
+## Fresh prompt-delta production iteration (current active parent)
+
+This is the operator-only one-iteration path that creates new evidence rather
+than converting a saved legacy property intervention.  The frozen evidence
+videos are `0RxMZBLeqRI`, `TGom0uiW130`, and `w0Wmc8C0Eq0`; the confirmation
+holdout remains `g1VFfVsZt7w` and `jIx5Zi84Z3Q`.  The other five evidence-pool
+videos are recorded as already used by the earlier prompt-delta pilot.  The
+fresh path uses the active parent
+`runs/checkpoint_g_pilot_20260720_115145_state/versions/meta_prompt_42bb23b19a51450d6a9c.json`.
+
+Run exactly one fresh iteration (paid OpenAI calls and GPU captioning/QA occur
+only when the operator runs this command):
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+export FRESH_PROMPT_DELTA_TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+bash /home/intern/youngseo/surrogate_rollout/scripts/run_fresh_prompt_delta_iteration.sh
+```
+
+After the terminal JSON-caption failure in run `20260720_130647`, do not resume
+that timestamp: its completed baseline manifest intentionally retains the
+invalid old-policy caption. Start a new plain-text-policy run on the currently
+available GPU 7 with:
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+export FRESH_PROMPT_DELTA_TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+export FRESH_PROMPT_DELTA_WORKER_GPUS=7
+bash /home/intern/youngseo/surrogate_rollout/scripts/run_fresh_prompt_delta_iteration.sh
+```
+
+To resume the same immutable run after interruption, reuse the timestamp printed
+by the script (or chosen before launch):
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+export FRESH_PROMPT_DELTA_TIMESTAMP="$(find /home/intern/youngseo/surrogate_rollout/runs -maxdepth 1 -type d -name 'fresh_prompt_delta_iteration_*_inputs' -printf '%f\n' | sed -E 's/^fresh_prompt_delta_iteration_([0-9]{8}_[0-9]{6})_inputs$/\1/' | sort | tail -n 1)"
+test -n "$FRESH_PROMPT_DELTA_TIMESTAMP"
+bash /home/intern/youngseo/surrogate_rollout/scripts/run_fresh_prompt_delta_iteration.sh
+```
+
+GPU assignment is execution metadata and may be explicitly overridden without
+editing the immutable prepared input. For example, resume a new plain-text run
+on GPU 7 by reusing the timestamp printed when that new run started:
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+export FRESH_PROMPT_DELTA_TIMESTAMP="$(find /home/intern/youngseo/surrogate_rollout/runs -maxdepth 1 -type d -name 'fresh_prompt_delta_iteration_*_inputs' -printf '%f\n' | sed -E 's/^fresh_prompt_delta_iteration_([0-9]{8}_[0-9]{6})_inputs$/\1/' | sort | tail -n 1)"
+test -n "$FRESH_PROMPT_DELTA_TIMESTAMP"
+test "$FRESH_PROMPT_DELTA_TIMESTAMP" != 20260720_130647
+FRESH_PROMPT_DELTA_WORKER_GPUS=7 \
+bash /home/intern/youngseo/surrogate_rollout/scripts/run_fresh_prompt_delta_iteration.sh
+```
+
+The resolved GPU list is persisted in the fresh evidence manifest and is also
+passed to a deferred confirmation evaluator. It does not alter caption semantic
+cache identities or mutate `component_config.json`.
+
+The resume command resolves the most recent prepared fresh-input directory; set
+the same environment variable explicitly instead if resuming an older run. The script
+does not retry or repair provider responses. Completed baseline videos,
+proposal plans, interventions, feedbacks, updater output, and paired
+confirmation are immutable resume boundaries.
+
+The operator command explicitly sets a 900-second result timeout for each
+persistent caption-worker request. The parent polls worker liveness once per
+second and fails immediately if any configured GPU process exits instead of
+waiting the historical 24-hour compatibility default. Worker lifecycle,
+block-start/completion, and Python error records are appended to
+`runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_evidence/worker_logs/worker_gpu_4.jsonl`
+through `worker_gpu_7.jsonl`.
+An abrupt process death leaves the last lifecycle event intact; the parent CLI
+also atomically records its surfaced exception below the evidence
+`failures/` directory. These diagnostics do not alter caption/cache identity,
+do not retry work, and do not discard completed segment caches.
+
+Resolved production configuration is written before model startup to
+`runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_inputs/component_config.json`.
+It explicitly records Qwen2.5-VL-7B caption/prompt generation on GPUs 4–7,
+OpenAI `gpt-4o` prompt-delta proposal/episode feedback/updating, DVD
+`gpt-4o-mini` tool reasoning with the configured `gpt-5.5` text fallback,
+transcript/frame/segment/history settings, context/output budgets, cache paths,
+and all provider call limits. The empty compatibility bank/router records used
+by the existing caption builder contain no properties or routing rules and are
+marked `legacy_property_codebook_or_router_used=false`.
+
+Prompt-delta proposal requests use policy
+`fresh_prompt_delta_proposer_gpt4o_localized_inspection_v4` and representation
+`trajectory_grounded_normalized_catalog_v3_localized_inspection`. The selection
+scope is the ordered union of assistant timestamp citations and frame-inspection
+calls classified as localized. A call is global when its requested start and
+end are within the explicitly configured 10-second tolerance of the video start
+and end. Global inspection segments, legacy `explicitly_cited_segments`,
+`used_segments`, consumed, retrieved, and returned provenance remain only in
+the private selection audit. These segments indicate evidence exposure and
+localization, not causal attribution. Exact histories reconstruct from the
+content-addressed catalog, and a shared segment appears once across QAs. A QA
+without localized evidence is `no_localized_evidence`; a single-QA payload over
+context is `context_ineligible`. Neither makes a provider call, while other QAs
+continue. Exact `o200k_base` preflight uses the `128000` context limit and
+reserved `4096` output tokens. Context-ineligible details are written beneath
+`proposals/localized_trajectory_segments_only_v1/<video_id>/`; no truncation is
+performed. When no eligible QA remains, the run records
+`no_eligible_proposal_evidence` and exits normally before updating.
+
+Resume the completed `20260721_063937` baseline under the new proposer identity
+without rerunning its caption/DVD-QA stage:
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+export FRESH_PROMPT_DELTA_TIMESTAMP=20260721_063937
+export FRESH_PROMPT_DELTA_WORKER_GPUS=1,2,3
+bash /home/intern/youngseo/surrogate_rollout/scripts/run_fresh_prompt_delta_iteration.sh
+```
+
+The original input configuration and oversized failure artifact remain
+immutable. The launcher explicitly overlays localized-inspection proposer
+policy v4, a 10-second global-boundary tolerance, a nine-call fail-closed
+transport ceiling, and up to three per-video
+deltas. Compatible completed baseline prompt, caption, and DVD-QA artifacts are
+validated and reused read-only. New intervention QA uses the strict
+`HH:MM:SS` frame-inspect schema and at most one corrective tool-call retry; the
+previous failed intervention remains untouched. New interventions and episodes
+are isolated below `dvd_strict_frame_inspect_corrective_retry_v1`. Proposals,
+interventions, episodes, feedback, and updater outputs use the new execution
+identity. Successful fresh evidence writes the resolved
+execution configuration separately under the evidence output and passes that
+immutable file to feedback/updating.
+
+Expected stage artifacts:
+
+- inputs: `runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_inputs/manifest.json`,
+  `component_config.json`, `confirmation_cases.json`, and
+  `paired_decoding_settings.json` in that same directory;
+- fresh baseline: `runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_evidence/baseline/manifest.json` plus each selected
+  video's generated prompts, frozen histories, captions, and three QA results;
+- prompt deltas: the per-video `proposal_plans.json` files below
+  `runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_evidence/proposals/localized_trajectory_segments_only_v1/`;
+- selective interventions and typed episodes below
+  `runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_evidence/interventions/localized_trajectory_segments_only_v1/<video_id>/<delta_id>/dvd_strict_frame_inspect_corrective_retry_v1/`
+  and `runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_evidence/episodes/localized_trajectory_segments_only_v1/dvd_strict_frame_inspect_corrective_retry_v1/`;
+- fresh evidence completion: `runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_evidence/fresh_evidence_manifest.json`;
+- grounded feedback/updater/confirmation:
+  `runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_output/feedback/`,
+  `updater_result.json`, optional `provisional_meta_prompt.json`, optional
+  `confirmation/`, and final `iteration_result.json`;
+- lineage/pointer: `runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_state/current_meta_prompt.json`
+  and its immutable `versions/` directory.
+
+Completion checks (set the exact run timestamp first):
+
+```bash
+cd /home/intern/youngseo/surrogate_rollout
+export FRESH_PROMPT_DELTA_TIMESTAMP="$(find /home/intern/youngseo/surrogate_rollout/runs -maxdepth 1 -type d -name 'fresh_prompt_delta_iteration_*_inputs' -printf '%f\n' | sed -E 's/^fresh_prompt_delta_iteration_([0-9]{8}_[0-9]{6})_inputs$/\1/' | sort | tail -n 1)"
+test -n "$FRESH_PROMPT_DELTA_TIMESTAMP"
+jq -e '(.status == "completed" or .status == "no_eligible_proposal_evidence") and .legacy_property_codebook_or_router_used == false and .source_hashes_before == .source_hashes_after' "/home/intern/youngseo/surrogate_rollout/runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_evidence/fresh_evidence_manifest.json"
+if [[ "$(jq -r '.status' "/home/intern/youngseo/surrogate_rollout/runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_evidence/fresh_evidence_manifest.json")" != "no_eligible_proposal_evidence" ]]; then
+  jq -e '.status == "no_update" or .status == "promoted" or .status == "rolled_back"' "/home/intern/youngseo/surrogate_rollout/runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_output/iteration_result.json"
+  jq . "/home/intern/youngseo/surrogate_rollout/runs/fresh_prompt_delta_iteration_${FRESH_PROMPT_DELTA_TIMESTAMP}_state/current_meta_prompt.json"
+fi
+```

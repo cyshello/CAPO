@@ -187,14 +187,30 @@ def main() -> None:
                     score = float(record.get("score") or 0.0)
                     prediction = record.get("parsed_answer")
                 else:
-                    result = run_dvd_qa(
-                        captions_path=caption_view.captions_path,
-                        sample=dict(sample), run_dir=qa_dir,
-                        question_id=question_id,
-                        database_path=caption_view.database_path,
-                        max_iterations=args.dvd_max_iterations, gpu=gpus[0])
-                    score = float(result.score)
-                    prediction = result.parsed_answer
+                    # Isolate per-QA failures: a malformed DVD tool-call (e.g.
+                    # unparseable function-call arguments) must score 0 for this
+                    # one QA, never abort the whole benchmark. A stub result.json
+                    # is written so resume skips it instead of re-failing.
+                    try:
+                        result = run_dvd_qa(
+                            captions_path=caption_view.captions_path,
+                            sample=dict(sample), run_dir=qa_dir,
+                            question_id=question_id,
+                            database_path=caption_view.database_path,
+                            max_iterations=args.dvd_max_iterations, gpu=gpus[0])
+                        score = float(result.score)
+                        prediction = result.parsed_answer
+                    except Exception as exc:  # noqa: BLE001 - per-QA isolation
+                        score = 0.0
+                        prediction = None
+                        _write_json(result_path, {
+                            "score": 0.0, "parsed_answer": None,
+                            "question_id": question_id,
+                            "eval_error": f"{type(exc).__name__}: {exc}",
+                            "eval_error_isolated": True})
+                        print(f"  QA {question_id} FAILED (scored 0): "
+                              f"{type(exc).__name__}: {str(exc)[:160]}",
+                              flush=True)
                 rows.append({
                     "question_id": question_id,
                     "provider_index": provider_index,

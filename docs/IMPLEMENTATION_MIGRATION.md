@@ -157,27 +157,47 @@ Use structured-output decoding with fallback disabled. Do not apply this
 constraint to normal caption generation, and include the structured-output
 policy/version in router configuration identity.
 
-Caption generation itself uses the versioned `caption_output_contract_v2`
-compatibility boundary. The rendered request reiterates that the top level is
-one object and requires a non-empty `clip_description`. The default
-`SR_CAPTION_SUBJECT_REGISTRY_MODE=empty` asks Qwen for `{}`; `optional` enables
-registry generation for a more capable model. Parsing preserves a valid registry, defaults a
-missing/null/non-object registry to `{}`, and unwraps only a single-element
-object array. Raw output and `caption_parse_result_v2` are saved in
-`history_aware_caption_cache_v2`; ambiguous arrays, invalid JSON, and blank
-descriptions remain failures. Contract/parser versions enter cache and resume
-identity so v1 cache files remain immutable and are not reinterpreted.
+Caption generation uses `caption_plain_text_output_contract_v2`. Qwen emits
+plain text without a sentence-count limit; the harness, not the model, creates
+the `{"clip_description": text}` object. Empty, repeated-sentence, majority
+repeated-n-gram, and backend-error outputs fail closed. Baseline and
+selective intervention share the exact parser and decoding configuration:
+temperature zero, 1024 maximum newly generated tokens, and repetition penalty
+1.05. `history_aware_caption_cache_v5` includes contract/parser/repetition and
+decoding policy versions and hashes, so no completed JSON-caption cache is
+rewritten or reused under the new semantics. Up to five identical-input parse
+retries remain auditable; no truncated-JSON repair or segment fallback exists.
 
-`caption_parse_retry_v1` adds up to five parse-failure retries after the
-initial caption call. It does not retry runtime/backend exceptions and does not
-alter property text, frames, transcript, frozen history, or decoding. New
-artifacts use `history_aware_caption_cache_v3` and retain every raw attempt and
-parse reason. Existing valid v2 cache entries remain compatible; existing
-invalid v2 entries remain immutable and receive a versioned retry sidecar.
-After five unsuccessful retries, the segment remains invalid and the existing
-selected-segment intervention failure path is unchanged.
+DVD frame inspection now uses
+`strict_hhmmss_pair_with_one_corrective_retry_v1`. The harness narrows the
+provider tool schema to exact string pairs before each agent run and validates
+again immediately before tool execution. One invalid call is returned to the
+same agent as a corrective tool result without executing the vision tool; a
+second invalid call fails closed. Invalid calls remain audit events and are
+excluded from localized proposal evidence. Vendored DVD source is unchanged.
 
 ### 3.3 Property proposal stage
+
+The separate fresh prompt-delta compatibility path uses
+`prompt_delta_proposal_request_v4_localized_trajectory_normalized`. Prompt-delta
+proposals use only assistant timestamp citations and frame-inspection calls
+classified as localized. Whole-video/factually-global frame-inspection calls
+are classified at the original call boundary using the explicitly configured
+video-boundary tolerance. Their segments, legacy `explicitly_cited_segments`,
+`used_segments`, consumed, retrieved, and returned provenance remain in audit
+artifacts but never enter proposal or intervention scope. Each included segment
+is stored once, exact frozen histories use deterministic snapshot/history-item
+catalogs, and each QA retains ordered `intervention_candidate_segment_refs` and
+semantic trajectory evidence. A QA with no localized segment is
+`no_localized_evidence`; a localized single-QA request that exceeds context is
+`context_ineligible`. Both are skipped without a provider call, and other QAs
+continue.
+If the normalized video request exceeds the configured provider context, it
+preflights all stable QA-order single-QA requests before making any provider
+call. Any single-QA overflow is recorded as `context_ineligible` with an
+immutable size report and skipped without a provider call while other eligible
+QAs continue. There is no truncation, semantic filtering, sampling, or
+intra-QA split.
 
 Adapt `optimization/policies/llm_feedback.py` or add a narrowly scoped property
 proposal policy.
@@ -948,7 +968,7 @@ artifacts remain immutable and require a fresh output/state directory;
 compatible caption caches remain reusable. Proposal parsing, candidate
 semantics, intervention, memory, updater, and router behavior are unchanged.
 
-### 3.24 Percent-escape recovery and valid-caption retrieval universe
+### 3.24 Plain-text caption boundary and valid-caption retrieval universe
 
 A completed real run exposed two coupled boundary errors. Qwen emitted an
 otherwise-valid fenced caption object containing the invalid JSON escape `\%`.
@@ -958,13 +978,12 @@ with `caption_view.segment_ids`, which describes every scheduled source segment,
 not the subset with a valid incumbent caption. The invalid segment could
 therefore enter `S_sim` and fail later during mixed-view replacement.
 
-`caption_parse_normalization_v2_percent_escape` removes only an unescaped `\%`
-before strict JSON loading and records `replace_invalid_percent_escape`. Valid
-escaped backslashes and unrelated invalid escapes are unchanged. Raw model
-output remains immutable. `history_aware_caption_cache_v4` and
-`caption_parse_retry_v2_percent_escape` reuse earlier valid caches; an earlier
-invalid raw response is reparsed in the new versioned retry sidecar, without a
-model call when that narrow normalization is sufficient.
+The former percent-escape JSON normalization is superseded for all new
+history-aware captions. `caption_plain_text_output_contract_v2` requests plain
+text without a sentence-count limit and the harness creates the JSON artifact.
+`history_aware_caption_cache_v5` uses new contract/parser/repetition/decoding
+identities and therefore never aliases or rewrites the earlier invalid raw
+response. Empty or degenerate text remains a hard caption failure.
 
 `valid_baseline_caption_segment_intersection_v2` passes only source-ordered,
 non-empty actual `captions.json` entries to `property_retrieval_batch_v3` and

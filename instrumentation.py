@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 import time
 from typing import Any
 
@@ -36,6 +37,7 @@ class RunRecorder:
         self.tool_events: list[dict] = []
         self.llm_calls: list[dict] = []
         self._uninstallers: list = []
+        self.frame_inspect_argument_failures = 0
 
     # ------------------------------------------------------------------ #
     def dump(self, tool_events_path: str, llm_calls_path: str) -> None:
@@ -123,14 +125,72 @@ def _wrap_retrieval_tool(
     return wrapped
 
 
+_HHMMSS_ARGUMENT = re.compile(
+    r"^[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$")
+
+
+class FrameInspectArgumentValidationError(ValueError):
+    pass
+
+
+def _frame_inspect_argument_error(value: Any) -> str | None:
+    if not isinstance(value, list) or not value:
+        return "time_ranges_hhmmss must be a non-empty array"
+    for index, pair in enumerate(value):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return f"time_ranges_hhmmss[{index}] must contain exactly two values"
+        for endpoint_index, endpoint in enumerate(pair):
+            if not isinstance(endpoint, str) or not _HHMMSS_ARGUMENT.fullmatch(
+                    endpoint):
+                return (
+                    f"time_ranges_hhmmss[{index}][{endpoint_index}] must be "
+                    "an HH:MM:SS string")
+            _hours, minutes, seconds = endpoint.split(".", 1)[0].split(":")
+            if int(minutes) >= 60 or int(seconds) >= 60:
+                return (
+                    f"time_ranges_hhmmss[{index}][{endpoint_index}] has an "
+                    "invalid minute or second")
+    return None
+
+
 def _wrap_frame_inspect(tool, recorder: RunRecorder):
     @functools.wraps(tool)
     def wrapped(database, question, time_ranges_hhmmss):
         t0 = time.time()
         error = None
+        validation_error = _frame_inspect_argument_error(time_ranges_hhmmss)
+        if validation_error is not None:
+            recorder.frame_inspect_argument_failures += 1
+            retry_index = recorder.frame_inspect_argument_failures
+            retry_limit = config.DVD_FRAME_INSPECT_CORRECTIVE_RETRY_LIMIT
+            event = {
+                "tool": tool.__name__,
+                "args": {"question": question,
+                         "time_ranges_hhmmss": time_ranges_hhmmss},
+                "hits": [], "n_hits": 0,
+                "latency_seconds": time.time() - t0,
+                "error": validation_error,
+                "status": "argument_validation_error",
+                "execution_performed": False,
+                "corrective_retry_index": retry_index,
+                "corrective_retry_limit": retry_limit,
+                "policy_version":
+                    config.DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION,
+            }
+            recorder.tool_events.append(event)
+            if retry_index > retry_limit:
+                raise FrameInspectArgumentValidationError(
+                    "frame_inspect_tool argument validation failed after the "
+                    f"single corrective retry: {validation_error}")
+            return (
+                "Error: invalid frame_inspect_tool arguments. "
+                f"{validation_error}. Correct the arguments and call "
+                "frame_inspect_tool again using only HH:MM:SS strings. "
+                "Exactly one corrective retry is allowed.")
         try:
-            return tool(database=database, question=question,
-                        time_ranges_hhmmss=time_ranges_hhmmss)
+            result = tool(database=database, question=question,
+                          time_ranges_hhmmss=time_ranges_hhmmss)
+            return result
         except Exception as e:
             error = str(e)
             raise
@@ -143,6 +203,14 @@ def _wrap_frame_inspect(tool, recorder: RunRecorder):
                 "n_hits": 0,
                 "latency_seconds": time.time() - t0,
                 "error": error,
+                "status": "completed" if error is None else "execution_error",
+                "execution_performed": True,
+                "corrective_retry_index":
+                    recorder.frame_inspect_argument_failures,
+                "corrective_retry_limit":
+                    config.DVD_FRAME_INSPECT_CORRECTIVE_RETRY_LIMIT,
+                "policy_version":
+                    config.DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION,
             })
 
     return wrapped

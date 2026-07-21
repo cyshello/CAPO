@@ -29,8 +29,7 @@ def default_merge_fn(partial_registries: list) -> dict | list | None:
 
 
 def caption_entry_from_parsed(parsed: dict) -> dict | None:
-    """DVD captions.json entry from one parsed captioner ckpt JSON (transcript
-    is already appended to clip_description by the captioning path)."""
+    """DVD captions.json entry from one validated caption artifact."""
     if parsed and parsed.get("clip_description"):
         return {"caption": parsed["clip_description"]}
     return None

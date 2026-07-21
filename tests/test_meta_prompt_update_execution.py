@@ -1,0 +1,258 @@
+"""Checkpoint E2 one-call updater and provisional persistence tests."""
+
+import hashlib
+import json
+
+import pytest
+
+from surrogate_rollout.optimization.meta_prompt_update_execution import (
+    META_PROMPT_UPDATE_STRICT_SCHEMA_NAME,
+    MetaPromptUpdateExecutionError,
+    OpenAICompatibleMetaPromptUpdaterBackend,
+    execute_meta_prompt_update_once,
+)
+from surrogate_rollout.optimization.meta_prompt_updater import (
+    MetaPromptUpdaterParseError,
+    build_meta_prompt_update_request,
+    parse_meta_prompt_update_response,
+)
+from surrogate_rollout.prompt_routing.schemas import dumps_canonical
+from test_meta_prompt_updater import (
+    CANDIDATE,
+    POLICY,
+    feedback_fixtures,
+    parent_fixture,
+    response,
+)
+
+
+CREATED_AT = "2026-07-20T01:02:03Z"
+
+
+class Transport:
+    def __init__(self, content, *, usage=None):
+        self.content = content
+        self.usage = usage or {"prompt_tokens": 50, "completion_tokens": 20}
+        self.calls = []
+
+    def __call__(self, body):
+        self.calls.append(json.loads(dumps_canonical(body)))
+        return {
+            "id": "fixture-response-1",
+            "model": "fixture-updater-snapshot",
+            "choices": [{"message": {"content": self.content}}],
+            "usage": self.usage,
+        }
+
+
+class FailingTransport:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, body):
+        self.calls += 1
+        error = RuntimeError("fixture provider failure")
+        error.raw_error = "fixture raw provider error"
+        raise error
+
+
+def write_sources(tmp_path):
+    parent = parent_fixture()
+    feedbacks = feedback_fixtures()
+    parent_path = tmp_path / "parent.json"
+    parent_path.write_text(dumps_canonical(parent), encoding="utf-8")
+    feedback_paths = []
+    for index, feedback in enumerate(feedbacks):
+        path = tmp_path / f"feedback_{index}.json"
+        path.write_text(dumps_canonical(feedback), encoding="utf-8")
+        feedback_paths.append(path)
+    return parent, feedbacks, parent_path, tuple(feedback_paths)
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def backend_for(transport):
+    return OpenAICompatibleMetaPromptUpdaterBackend(
+        provider="fixture_provider",
+        model_id="fixture-updater-model",
+        maximum_output_tokens=321,
+        generation_settings={"temperature": 0.0},
+        updater_policy_version=POLICY,
+        response_transport=transport,
+    )
+
+
+def test_update_executes_once_and_writes_provisional_with_lineage(tmp_path):
+    parent, feedbacks, parent_path, feedback_paths = write_sources(tmp_path)
+    before = [digest(path) for path in (parent_path, *feedback_paths)]
+    transport = Transport(dumps_canonical(response(
+        [item.feedback_id for item in feedbacks])))
+    backend = backend_for(transport)
+    output = tmp_path / "update_run"
+
+    result = execute_meta_prompt_update_once(
+        parent_artifact_path=parent_path,
+        feedback_artifact_paths=feedback_paths,
+        output_directory=output,
+        backend=backend,
+        updater_policy_version=POLICY,
+        candidate_created_at=CREATED_AT,
+    )
+
+    assert backend.call_count == len(transport.calls) == 1
+    assert result.decision.decision == "update"
+    candidate = json.loads((output / "provisional_meta_prompt.json").read_text())
+    assert candidate == {
+        "meta_prompt_id": result.candidate_meta_prompt_id,
+        "parent_meta_prompt_id": parent.meta_prompt_id,
+        "text": CANDIDATE,
+        "created_at": CREATED_AT,
+        "status": "provisional",
+    }
+    assert not (output / "no_update.json").exists()
+    for name in (
+        "updater_request.json", "provider_request.json", "raw_response.txt",
+        "provider_response.json", "parsed_meta_prompt_update_result.json",
+        "usage.json", "input_manifest.json", "run_manifest.json",
+    ):
+        assert (output / name).is_file()
+    manifest = json.loads((output / "run_manifest.json").read_text())
+    assert manifest["status"] == "succeeded"
+    assert manifest["provider_call_count"] == 1
+    assert manifest["ordered_feedback_ids"] == [
+        item.feedback_id for item in feedbacks]
+    assert [digest(path) for path in (parent_path, *feedback_paths)] == before
+
+
+def test_no_update_writes_decision_without_candidate(tmp_path):
+    parent, feedbacks, parent_path, feedback_paths = write_sources(tmp_path)
+    transport = Transport(dumps_canonical(response(
+        [item.feedback_id for item in feedbacks], candidate=None)))
+    output = tmp_path / "no_update_run"
+    result = execute_meta_prompt_update_once(
+        parent_artifact_path=parent_path,
+        feedback_artifact_paths=feedback_paths,
+        output_directory=output,
+        backend=backend_for(transport),
+        updater_policy_version=POLICY,
+        candidate_created_at=CREATED_AT,
+    )
+    assert result.decision.decision == "no_update"
+    assert result.candidate_meta_prompt_id is None
+    assert (output / "no_update.json").is_file()
+    assert not (output / "provisional_meta_prompt.json").exists()
+
+
+def test_provider_request_is_strict_and_omits_candidate_identity(tmp_path):
+    _, feedbacks, parent_path, feedback_paths = write_sources(tmp_path)
+    transport = Transport(dumps_canonical(response(
+        [item.feedback_id for item in feedbacks])))
+    backend = backend_for(transport)
+    request = build_meta_prompt_update_request(
+        parent_fixture(), feedbacks, updater_policy_version=POLICY)
+    prepared = backend.prepare_messages(
+        request.system_instruction, request.user_request)
+    response_format = prepared.request_body["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == \
+        META_PROMPT_UPDATE_STRICT_SCHEMA_NAME
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert "candidate_meta_prompt_id" not in schema["properties"]
+    assert "status" not in schema["properties"]
+
+
+def test_unknown_supporting_feedback_fails_once_and_preserves_raw(tmp_path):
+    _, feedbacks, parent_path, feedback_paths = write_sources(tmp_path)
+    invalid = response([feedbacks[0].feedback_id, "feedback-missing"])
+    transport = Transport(dumps_canonical(invalid))
+    backend = backend_for(transport)
+    output = tmp_path / "failed_parse"
+    with pytest.raises(MetaPromptUpdateExecutionError, match="unknown"):
+        execute_meta_prompt_update_once(
+            parent_artifact_path=parent_path,
+            feedback_artifact_paths=feedback_paths,
+            output_directory=output,
+            backend=backend,
+            updater_policy_version=POLICY,
+            candidate_created_at=CREATED_AT,
+        )
+    assert backend.call_count == len(transport.calls) == 1
+    assert (output / "raw_response.txt").read_text() == dumps_canonical(invalid)
+    assert (output / "raw_error.txt").is_file()
+    assert json.loads((output / "run_manifest.json").read_text())["status"] == \
+        "failed"
+
+
+def test_provider_failure_is_not_retried_and_raw_error_is_written(tmp_path):
+    _, _, parent_path, feedback_paths = write_sources(tmp_path)
+    transport = FailingTransport()
+    backend = backend_for(transport)
+    output = tmp_path / "failed_provider"
+    with pytest.raises(MetaPromptUpdateExecutionError, match="provider failure"):
+        execute_meta_prompt_update_once(
+            parent_artifact_path=parent_path,
+            feedback_artifact_paths=feedback_paths,
+            output_directory=output,
+            backend=backend,
+            updater_policy_version=POLICY,
+            candidate_created_at=CREATED_AT,
+        )
+    assert backend.call_count == transport.calls == 1
+    assert (output / "raw_error.txt").read_text() == \
+        "fixture raw provider error"
+
+
+def test_existing_output_directory_is_write_once_and_skips_call(tmp_path):
+    _, _, parent_path, feedback_paths = write_sources(tmp_path)
+    output = tmp_path / "existing"
+    output.mkdir()
+    marker = output / "user.txt"
+    marker.write_text("keep", encoding="utf-8")
+    transport = FailingTransport()
+    backend = backend_for(transport)
+    with pytest.raises(MetaPromptUpdateExecutionError, match="exists"):
+        execute_meta_prompt_update_once(
+            parent_artifact_path=parent_path,
+            feedback_artifact_paths=feedback_paths,
+            output_directory=output,
+            backend=backend,
+            updater_policy_version=POLICY,
+            candidate_created_at=CREATED_AT,
+        )
+    assert transport.calls == backend.call_count == 0
+    assert marker.read_text() == "keep"
+
+
+def test_known_ids_use_boundaries_and_unavailable_inputs_are_rejected():
+    parent = parent_fixture()
+    feedbacks = feedback_fixtures()
+    request = build_meta_prompt_update_request(
+        parent, feedbacks, updater_policy_version=POLICY)
+    known_segment = next(
+        segment
+        for feedback in feedbacks
+        for evidence in (*feedback.observations, *feedback.counterevidence)
+        for segment in evidence.supporting_segment_ids)
+    value = response([item.feedback_id for item in feedbacks])
+    value["candidate_meta_prompt"] = \
+        f"Preserve visible continuity for {known_segment}suffix conditions."
+    decision, candidate_id, status = parse_meta_prompt_update_response(
+        dumps_canonical(value), request=request, feedbacks=feedbacks)
+    assert decision.candidate_meta_prompt == value["candidate_meta_prompt"]
+    assert candidate_id and status == "provisional"
+
+    value["candidate_meta_prompt"] = \
+        f"Preserve visible continuity for {known_segment}."
+    with pytest.raises(MetaPromptUpdaterParseError, match="identifiers"):
+        parse_meta_prompt_update_response(
+            dumps_canonical(value), request=request, feedbacks=feedbacks)
+
+    value["candidate_meta_prompt"] = \
+        "Consult correctness labels before generating an instruction."
+    with pytest.raises(MetaPromptUpdaterParseError, match="runtime-unavailable"):
+        parse_meta_prompt_update_response(
+            dumps_canonical(value), request=request, feedbacks=feedbacks)

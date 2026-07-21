@@ -554,6 +554,10 @@ def main() -> None:
         "property_retrieval_top_k": args.property_retrieval_top_k,
         "dvd_clip_search_top_k": config.DVD_CLIP_SEARCH_TOP_K,
         "dvd_clip_search_policy_version": config.DVD_CLIP_SEARCH_POLICY_VERSION,
+        "dvd_frame_inspect_tool_contract_version":
+            config.DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION,
+        "dvd_frame_inspect_corrective_retry_limit":
+            config.DVD_FRAME_INSPECT_CORRECTIVE_RETRY_LIMIT,
         "dvd_embedding_preload_policy_version":
             DVD_EMBEDDER_PRELOAD_POLICY_VERSION,
         "dvd_qa_concurrency_policy_version":

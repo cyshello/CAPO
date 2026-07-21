@@ -62,6 +62,7 @@ FREE_FORM_ROUTER_VERSION_NUMBER = 8888
 
 DEFAULT_GENERATOR_MAX_TOKENS = 192
 DEFAULT_TEMPLATE_VERSION = "v1"
+META_PROMPT_TEMPLATE_VERSION = "meta_prompt_version_v1"
 
 GENERATOR_TEMPLATES: Mapping[str, str] = {
     "v1": """You generate a segment-specific instruction for a video captioning model.
@@ -139,18 +140,34 @@ class VLMFreeFormInstructionGenerator:
     def __init__(self, vlm: Any, *,
                  max_tokens: int = DEFAULT_GENERATOR_MAX_TOKENS,
                  template_version: str = DEFAULT_TEMPLATE_VERSION,
+                 template_text: str | None = None,
+                 meta_prompt_id: str | None = None,
                  model_id: str | None = None,
                  backend_id: str | None = None) -> None:
-        if template_version not in GENERATOR_TEMPLATES:
-            raise ValueError(
-                f"unknown generator template version {template_version!r} "
-                f"(known: {sorted(GENERATOR_TEMPLATES)})")
+        if template_text is None:
+            if template_version not in GENERATOR_TEMPLATES:
+                raise ValueError(
+                    f"unknown generator template version {template_version!r} "
+                    f"(known: {sorted(GENERATOR_TEMPLATES)})")
+            if meta_prompt_id is not None:
+                raise ValueError(
+                    "meta_prompt_id requires explicit template_text")
+            template = GENERATOR_TEMPLATES[template_version]
+        else:
+            if not isinstance(template_text, str) or not template_text:
+                raise ValueError("template_text must be a non-empty string")
+            if not isinstance(meta_prompt_id, str) or not meta_prompt_id:
+                raise ValueError(
+                    "explicit template_text requires meta_prompt_id")
+            template = template_text
+            template_version = META_PROMPT_TEMPLATE_VERSION
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         self.vlm = vlm
         self.max_tokens = max_tokens
         self.template_version = template_version
-        self.template = GENERATOR_TEMPLATES[template_version]
+        self.template = template
+        self.meta_prompt_id = meta_prompt_id
         self.model_id = model_id or config.CAPTION_MODEL_ID
         self.backend_id = backend_id or (
             f"{type(vlm).__module__}.{type(vlm).__qualname__}")
@@ -165,6 +182,7 @@ class VLMFreeFormInstructionGenerator:
             "backend": self.backend_id,
             "template_version": self.template_version,
             "template_hash": sha256_text(self.template),
+            "meta_prompt_id": self.meta_prompt_id,
             "max_tokens": self.max_tokens,
             "parser_version": PARSER_VERSION,
             "real_model": True,

@@ -174,6 +174,84 @@ class BaselinePhaseResult:
     resumed: bool = False
 
 
+def load_completed_baseline_for_read_only_resume(
+    baseline_root: str, *, selected_video_ids: tuple[str, ...],
+) -> BaselinePhaseResult | None:
+    """Validate and reuse an immutable completed baseline at one exact root.
+
+    This compatibility boundary is for a downstream-only execution-contract
+    change. It never rewrites the saved baseline or treats an incomplete or
+    invalid QA result as reusable source evidence.
+    """
+    root = os.path.abspath(baseline_root)
+    manifest_path = os.path.join(root, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return None
+    manifest = _read_json(manifest_path)
+    if manifest.get("status") != "completed":
+        raise RuntimeError("saved baseline manifest is not completed")
+    if tuple(manifest.get("selected_video_ids") or ()) != selected_video_ids:
+        raise RuntimeError("saved baseline has different selected videos")
+    video_paths = tuple(os.path.abspath(path) for path in
+                        manifest.get("video_manifest_paths") or ())
+    if len(video_paths) != len(selected_video_ids):
+        raise RuntimeError("saved baseline video manifest count differs")
+    qa_count = 0
+    for expected_video_id, video_path in zip(selected_video_ids, video_paths):
+        if os.path.commonpath((root, video_path)) != root:
+            raise RuntimeError(
+                "saved baseline video manifest escapes baseline root")
+        video = _read_json(video_path)
+        if video.get("video_id") != expected_video_id:
+            raise RuntimeError("saved baseline video order or identity differs")
+        required = (
+            "routing_manifest_path", "caption_view_path", "captions_path",
+            "frames_path", "frozen_histories_path", "baseline_qas_path",
+        )
+        missing = [name for name in required
+                   if not os.path.isfile(str(video.get(name, "")))]
+        if missing:
+            raise RuntimeError(
+                f"saved baseline {expected_video_id} is incomplete: {missing}")
+        with open(video["baseline_qas_path"], encoding="utf-8") as handle:
+            qa_rows = [json.loads(line) for line in handle if line.strip()]
+        if len(qa_rows) != int(video.get("qa_count", -1)):
+            raise RuntimeError(
+                f"saved baseline {expected_video_id} QA count differs")
+        for qa in qa_rows:
+            if qa.get("errors") or not str(qa.get("prediction") or "").strip() \
+                    or not str(qa.get("parsed_answer") or "").strip():
+                raise RuntimeError(
+                    f"saved baseline QA is invalid: {qa.get('question_id')}")
+            trajectory = qa.get("trajectory_path")
+            if not isinstance(trajectory, str) or not os.path.isfile(trajectory):
+                raise RuntimeError(
+                    f"saved baseline QA trajectory is absent: "
+                    f"{qa.get('question_id')}")
+        qa_count += len(qa_rows)
+    if qa_count != int(manifest.get("baseline_qa_count", -1)):
+        raise RuntimeError("saved baseline aggregate QA count differs")
+    provisional_path = os.path.abspath(str(
+        manifest.get("provisional_state_path", "")))
+    if not os.path.isfile(provisional_path):
+        raise RuntimeError("saved baseline provisional state is absent")
+    return BaselinePhaseResult(
+        run_id=str(manifest["run_id"]), output_dir=root,
+        selected_video_ids=selected_video_ids, baseline_qa_count=qa_count,
+        video_manifest_paths=video_paths,
+        property_proposal_paths=tuple(
+            os.path.abspath(path) for path in
+            manifest.get("property_proposal_paths") or ()),
+        property_retrieval_paths=tuple(
+            os.path.abspath(path) for path in
+            manifest.get("property_retrieval_paths") or ()),
+        provisional_state_path=provisional_path,
+        manifest_path=manifest_path,
+        next_coverage_state=_coverage_from_json(
+            manifest["next_coverage_state"]), resumed=True,
+    )
+
+
 class BaselinePhaseRunner:
     """Materialize each selected incumbent video once, then run all its QAs."""
 
