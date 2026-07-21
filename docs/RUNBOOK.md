@@ -2154,13 +2154,29 @@ A healthy run satisfies:
 - scaffold version does not change.
 ## Fresh prompt-delta production iteration (current active parent)
 
+The free-form prompt-generator output contract is plain text. New runs use
+`free_form_instruction_request_v2_plain_text` with parser
+`free_form_instruction_plain_text_parser_v2`: the complete non-empty trimmed
+model response becomes the captioning instruction. JSON-looking or fenced text
+is not decoded, extracted, or repaired. The template hash and parser version
+change the generator/cache identity; do not resume a caption stage created by
+the former JSON-instruction contract under this policy.
+
+The launcher bootstraps this mechanical contract migration exactly once beneath
+`runs/meta_prompt_plain_text_bootstrap_v2/`. It writes an immutable parent,
+pointer, and provenance manifest without changing any earlier pointer or
+artifact. The parent ID is deterministic over the previous parent ID, exact
+template, request-contract version, and parser version. Always use a new fresh
+iteration timestamp after this migration; the completed JSON-instruction run
+`20260721_063937` remains read-only.
+
 This is the operator-only one-iteration path that creates new evidence rather
 than converting a saved legacy property intervention.  The frozen evidence
 videos are `0RxMZBLeqRI`, `TGom0uiW130`, and `w0Wmc8C0Eq0`; the confirmation
 holdout remains `g1VFfVsZt7w` and `jIx5Zi84Z3Q`.  The other five evidence-pool
-videos are recorded as already used by the earlier prompt-delta pilot.  The
-fresh path uses the active parent
-`runs/checkpoint_g_pilot_20260720_115145_state/versions/meta_prompt_42bb23b19a51450d6a9c.json`.
+videos are recorded as already used by the earlier prompt-delta pilot. The
+fresh path uses the plain-text parent and pointer beneath
+`runs/meta_prompt_plain_text_bootstrap_v2/`.
 
 Run exactly one fresh iteration (paid OpenAI calls and GPU captioning/QA occur
 only when the operator runs this command):

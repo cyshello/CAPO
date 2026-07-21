@@ -168,6 +168,13 @@ decoding policy versions and hashes, so no completed JSON-caption cache is
 rewritten or reused under the new semantics. Up to five identical-input parse
 retries remain auditable; no truncated-JSON repair or segment fallback exists.
 
+Free-form prompt generation separately uses
+`free_form_instruction_request_v2_plain_text`. Because its output is one
+instruction string, no JSON envelope is requested. The v2 parser accepts the
+complete non-empty trimmed response literally and performs no JSON/fence/field
+extraction or repair. Template hash and parser version isolate new caption-cache
+identities from the former JSON instruction contract.
+
 DVD frame inspection now uses
 `strict_hhmmss_pair_with_one_corrective_retry_v1`. The harness narrows the
 provider tool schema to exact string pairs before each agent run and validates

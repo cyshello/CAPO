@@ -53,7 +53,7 @@ from surrogate_rollout.schemas import sha256_text
 FREE_FORM_ROUTING_MODE = "free_form_generator"
 PROPERTY_BANK_ROUTING_MODE = "property_bank"
 FREE_FORM_PROMPT_ID = "free_form_generated"
-FREE_FORM_REQUEST_SCHEMA_VERSION = "free_form_instruction_request_v1"
+FREE_FORM_REQUEST_SCHEMA_VERSION = "free_form_instruction_request_v2_plain_text"
 # Reserved router-version number for the free-form baseline. Real router
 # lineages are persisted snapshots (e.g. router_v0002 / bootstrap router_v9002);
 # 8888 plus the generator-identity content suffix keeps free-form caption cache
@@ -61,11 +61,11 @@ FREE_FORM_REQUEST_SCHEMA_VERSION = "free_form_instruction_request_v1"
 FREE_FORM_ROUTER_VERSION_NUMBER = 8888
 
 DEFAULT_GENERATOR_MAX_TOKENS = 192
-DEFAULT_TEMPLATE_VERSION = "v1"
-META_PROMPT_TEMPLATE_VERSION = "meta_prompt_version_v1"
+DEFAULT_TEMPLATE_VERSION = "v2_plain_text"
+META_PROMPT_TEMPLATE_VERSION = "meta_prompt_version_v2_plain_text"
 
 GENERATOR_TEMPLATES: Mapping[str, str] = {
-    "v1": """You generate a segment-specific instruction for a video captioning model.
+    "v2_plain_text": """You generate a segment-specific instruction for a video captioning model.
 
 Inspect the sampled frames from the current video segment and the preceding
 caption history.
@@ -83,7 +83,7 @@ Do not invent identities, actions, states, relationships, or events.
 Avoid generic advice that could apply to every segment.
 
 Produce one concise and actionable captioning instruction for the current segment.
-Return only strict JSON: {"caption_instruction": "..."}. Do not use Markdown.""",
+Return only the non-empty captioning instruction as plain text. Do not use JSON or Markdown.""",
 }
 
 
@@ -134,7 +134,7 @@ class VLMFreeFormInstructionGenerator:
 
     Reuses the same multimodal backend object as the router/captioner (no
     separate inference stack); calls are unconstrained text generation and the
-    output goes through the deterministic parser fallback ladder.
+    output goes through the deterministic plain-text parser.
     """
 
     def __init__(self, vlm: Any, *,

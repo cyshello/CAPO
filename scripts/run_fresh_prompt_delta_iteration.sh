@@ -29,12 +29,24 @@ EVIDENCE_ROOT="${RUN_ROOT}_evidence"
 OUTPUT_ROOT="${RUN_ROOT}_output"
 STATE_ROOT="${RUN_ROOT}_state"
 CACHE_ROOT="${RUN_ROOT}_cache"
-PARENT="$PROJECT_ROOT/runs/checkpoint_g_pilot_20260720_115145_state/versions/meta_prompt_42bb23b19a51450d6a9c.json"
-ACTIVE_POINTER="$PROJECT_ROOT/runs/checkpoint_g_pilot_20260720_115145_state/current_meta_prompt.json"
+PLAIN_TEXT_PARENT_ROOT="$PROJECT_ROOT/runs/meta_prompt_plain_text_bootstrap_v2"
+PARENT="$PLAIN_TEXT_PARENT_ROOT/parent_meta_prompt.json"
+ACTIVE_POINTER="$PLAIN_TEXT_PARENT_ROOT/current_meta_prompt.json"
 SPLIT="$PROJECT_ROOT/split_manifest.json"
 COMPONENTS="$PROJECT_ROOT/prompt_routing/fixtures/stage4_7_components.json"
 SOURCE_REVISION="$(git rev-parse HEAD)"
 CANDIDATE_CREATED_AT="$(date -u -d "${RUN_TIMESTAMP:0:8} ${RUN_TIMESTAMP:9:2}:${RUN_TIMESTAMP:11:2}:${RUN_TIMESTAMP:13:2}" +%Y-%m-%dT%H:%M:%SZ)"
+
+if [[ ! -f "$PLAIN_TEXT_PARENT_ROOT/bootstrap_manifest.json" ]]; then
+  test ! -e "$PLAIN_TEXT_PARENT_ROOT"
+  conda run --no-capture-output -n local_llm_vllm \
+    python "$PROJECT_ROOT/scripts/bootstrap_plain_text_meta_prompt.py" \
+    --output-dir "$PLAIN_TEXT_PARENT_ROOT" \
+    --previous-meta-prompt-id meta_prompt_42bb23b19a51450d6a9c
+fi
+jq -e \
+  '.identity.request_contract_version == "free_form_instruction_request_v2_plain_text" and .identity.parser_version == "free_form_instruction_plain_text_parser_v2"' \
+  "$PLAIN_TEXT_PARENT_ROOT/bootstrap_manifest.json" >/dev/null
 
 if [[ ! -f "$INPUT_ROOT/manifest.json" ]]; then
   test ! -e "$INPUT_ROOT"

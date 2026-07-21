@@ -1,4 +1,4 @@
-"""Free-form instruction baseline: parser ladder, transcript policy, cache
+"""Free-form instruction baseline: plain-text parsing, transcript policy, cache
 identity separation, and mocked end-to-end integration through the shared
 scaffold + captioner + cache infrastructure. No real model inference."""
 
@@ -28,6 +28,7 @@ from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
     free_form_router_version,
 )
 from surrogate_rollout.prompt_routing.free_form_instruction_parser import (
+    PARSER_VERSION,
     parse_generated_instruction,
 )
 from surrogate_rollout.prompt_routing.persistence import (
@@ -49,39 +50,31 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 # --------------------------------------------------------------------------- #
-#                              parser fallbacks                                #
+#                            plain-text parser                                 #
 # --------------------------------------------------------------------------- #
-def test_parser_direct_json():
+def test_parser_plain_text():
     outcome = parse_generated_instruction(
-        '{"caption_instruction": "Describe who holds each object."}')
+        "Describe who holds each object.")
     assert outcome.ok
-    assert outcome.parser_path == "direct_json"
+    assert outcome.parser_path == "plain_text"
     assert outcome.instruction == "Describe who holds each object."
 
 
-def test_parser_fenced_json():
+def test_parser_json_looking_text_is_not_interpreted():
     outcome = parse_generated_instruction(
-        '```json\n{"caption_instruction": "Track the red car."}\n```')
-    assert outcome.ok
-    assert outcome.parser_path == "fenced_json"
-    assert outcome.instruction == "Track the red car."
-
-
-def test_parser_near_json_field_extraction():
-    outcome = parse_generated_instruction(
-        'Sure! Here is the JSON you asked for:\n'
-        '{"caption_instruction": "Note the \\"exit\\" sign text.", broken')
-    assert outcome.ok
-    assert outcome.parser_path == "near_json_field"
-    assert outcome.instruction == 'Note the "exit" sign text.'
-
-
-def test_parser_plain_text_fallback():
-    outcome = parse_generated_instruction(
-        "Describe the whiteboard contents precisely.")
+        '{"caption_instruction": "Track the red car."}')
     assert outcome.ok
     assert outcome.parser_path == "plain_text"
-    assert outcome.instruction == "Describe the whiteboard contents precisely."
+    assert outcome.instruction == \
+        '{"caption_instruction": "Track the red car."}'
+
+
+def test_parser_markdown_fence_is_not_interpreted():
+    outcome = parse_generated_instruction(
+        "```\nTrack the red car.\n```")
+    assert outcome.ok
+    assert outcome.parser_path == "plain_text"
+    assert outcome.instruction == "```\nTrack the red car.\n```"
 
 
 @pytest.mark.parametrize("raw", [None, "", "   \n  "])
@@ -129,7 +122,7 @@ def context(**overrides):
 class GeneratorVLM:
     """Fake backend returning a fixed generator reply; records every call."""
 
-    def __init__(self, output='{"caption_instruction": "Track object handoffs."}'):
+    def __init__(self, output="Track object handoffs."):
         self.output = output
         self.calls = []
 
@@ -152,9 +145,7 @@ class FreeFormMockVLM:
         self.calls.append({"kind": kind, "images": tuple(images),
                            "prompt": prompt, "kwargs": kwargs})
         if kind == "generator":
-            return json.dumps({
-                "caption_instruction":
-                    f"Generated instruction {len(self.calls)}"})
+            return f"Generated instruction {len(self.calls)}"
         self.caption_number += 1
         return f"Generated caption {self.caption_number}."
 
@@ -169,7 +160,7 @@ def test_generate_builds_query_independent_request(monkeypatch):
     generated = generator.generate(context(), {"transcript": "hello there"})
 
     assert generated.instruction == "Track object handoffs."
-    assert generated.parser_path == "direct_json"
+    assert generated.parser_path == "plain_text"
     prompt = vlm.calls[0]["prompt"]
     assert "SECRET QUESTION" not in prompt
     assert "SECRET ANSWER" not in prompt
@@ -184,6 +175,21 @@ def test_generate_builds_query_independent_request(monkeypatch):
     assert generator.last_exchange.request_hash == generated.request_hash
 
 
+def test_generator_uses_versioned_plain_text_contract():
+    vlm = GeneratorVLM()
+    generator = VLMFreeFormInstructionGenerator(vlm, backend_id="test-backend")
+    generated = generator.generate(context(), {})
+
+    assert generated.parser_path == "plain_text"
+    assert FREE_FORM_REQUEST_SCHEMA_VERSION == \
+        "free_form_instruction_request_v2_plain_text"
+    assert PARSER_VERSION == "free_form_instruction_plain_text_parser_v2"
+    assert generator.template_version == "v2_plain_text"
+    assert "plain text" in generator.template
+    assert "strict JSON" not in generator.template
+    assert generator.configuration_identity["parser_version"] == PARSER_VERSION
+
+
 def test_generate_raises_on_unusable_output():
     generator = VLMFreeFormInstructionGenerator(GeneratorVLM(output="   "))
     with pytest.raises(FreeFormGenerationError, match="unusable"):
@@ -193,7 +199,7 @@ def test_generate_raises_on_unusable_output():
 # --------------------------------------------------------------------------- #
 #                       request identity sensitivity                           #
 # --------------------------------------------------------------------------- #
-def _request_hash(monkeypatch, *, ctx=None, template_version="v1"):
+def _request_hash(monkeypatch, *, ctx=None, template_version="v2_plain_text"):
     generator = VLMFreeFormInstructionGenerator(
         GeneratorVLM(), template_version=template_version)
     generated = generator.generate(ctx or context(), {})
@@ -229,7 +235,7 @@ def test_transcript_never_enters_request_identity(monkeypatch):
 
 def test_changing_template_version_changes_identity(monkeypatch):
     templates = dict(GENERATOR_TEMPLATES)
-    templates["v2-test"] = templates["v1"] + "\nEXTRA RULE."
+    templates["v2-test"] = templates["v2_plain_text"] + "\nEXTRA RULE."
     monkeypatch.setattr(
         "surrogate_rollout.prompt_routing.free_form_instruction_generator."
         "GENERATOR_TEMPLATES", templates)
@@ -308,7 +314,7 @@ def test_build_free_form_selection_composes_through_shared_scaffold(monkeypatch)
     assert decision.bank_version == bank.bank_version
     payload = dict(decision.decision_payload)
     assert payload["mode"] == FREE_FORM_ROUTING_MODE
-    assert payload["parser_path"] == "direct_json"
+    assert payload["parser_path"] == "plain_text"
     assert payload["generated_instruction"] == "Track object handoffs."
     assert payload["generated_instruction_hash"] == \
         sha256_text("Track object handoffs.")
@@ -385,7 +391,7 @@ def test_free_form_mode_end_to_end_mocked(tmp_path, monkeypatch):
     for record in decisions:
         payload = record["decision_payload"]
         assert payload["mode"] == FREE_FORM_ROUTING_MODE
-        assert payload["parser_path"] == "direct_json"
+        assert payload["parser_path"] == "plain_text"
         assert payload["raw_generator_response"]
         assert payload["generated_instruction_hash"] == \
             sha256_text(payload["generated_instruction"])

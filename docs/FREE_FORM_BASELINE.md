@@ -76,15 +76,15 @@ are code-identical in both modes.
 
 - Backend: the same process-shared local Qwen2.5-VL backend as router and
   captioner (`config.CAPTION_MODEL_ID`); no separate inference stack.
-- Template: `GENERATOR_TEMPLATES["v1"]` in
+- Template: `GENERATOR_TEMPLATES["v2_plain_text"]` in
   `prompt_routing/free_form_instruction_generator.py`
-  (`template_version="v1"`, `max_tokens=192` by default; constructor
+  (`template_version="v2_plain_text"`, `max_tokens=192` by default; constructor
   parameters of `VLMFreeFormInstructionGenerator`).
-- Output parsing: deterministic fallback ladder in
-  `prompt_routing/free_form_instruction_parser.py`
-  (direct_json -> fenced_json -> near_json_field -> plain_text; empty output
-  raises `FreeFormGenerationError` — never a silent fallback). The taken path
-  is logged as `parser_path`.
+- Output parsing: strict plain text in
+  `prompt_routing/free_form_instruction_parser.py`. Surrounding whitespace is
+  removed and the complete non-empty response is retained literally. JSON-like
+  text and Markdown fences are not interpreted or repaired. Empty output raises
+  `FreeFormGenerationError`. The path is logged as `parser_path=plain_text`.
 
 ## Transcript behavior
 

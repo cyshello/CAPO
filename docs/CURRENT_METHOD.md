@@ -106,6 +106,15 @@ repetition-guard version, and decoding policy/hash participate in segment-state,
 caption-cache, baseline, intervention, and confirmation identities. Completed
 legacy JSON cache artifacts are never reinterpreted or overwritten.
 
+The runtime free-form prompt generator also uses a single-string plain-text
+output contract (`free_form_instruction_request_v2_plain_text` and
+`free_form_instruction_plain_text_parser_v2`). The model returns only the
+non-empty segment-specific captioning instruction. The parser strips surrounding
+whitespace and preserves the remaining response literally; it does not parse
+JSON, unwrap Markdown fences, extract fields, or repair near-JSON. Its template
+text/hash and parser version remain part of the generator and caption-cache
+identity, so earlier JSON-instruction runs cannot alias this contract.
+
 Caption parsing uses `caption_plain_text_parse_result_v2` and
 `caption_repetition_guard_v1`. Three consecutive canonically identical
 sentences are rejected. For outputs of at least 48 word tokens, at least four
