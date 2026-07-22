@@ -11,12 +11,17 @@ import os
 from dataclasses import dataclass, field
 
 HARNESS_ROOT = os.path.dirname(os.path.abspath(__file__))
+# The DVD stack (data_provider / dvd_prompt / dvd_backend / the `dvd` package /
+# the Video-MME provider) is vendored under vendor/dvd_stack so this repository
+# clones and runs on its own. SR_PROMPT_SENS_ROOT still points the harness at an
+# external checkout when one is available.
 PROMPT_SENS_ROOT = os.environ.get(
     "SR_PROMPT_SENS_ROOT",
-    os.path.abspath(os.path.join(HARNESS_ROOT, "..", "prompt_sensitivity")),
+    os.path.join(HARNESS_ROOT, "vendor", "dvd_stack"),
 )
 DVD_ROOT = os.path.join(PROMPT_SENS_ROOT, "dvd")
-DVD_RUN_WORKSPACE = os.path.join(DVD_ROOT, "run_workspace")
+DVD_RUN_WORKSPACE = os.environ.get(
+    "SR_DVD_RUN_WORKSPACE", os.path.join(DVD_ROOT, "run_workspace"))
 
 RUNS_ROOT = os.environ.get("SR_RUNS_ROOT", os.path.join(HARNESS_ROOT, "runs"))
 CAPTION_CACHE_ROOT = os.environ.get(
@@ -58,7 +63,12 @@ PREVIOUSLY_CACHED_VIDEOS = (
 ) if BENCHMARK == "videomme" else ()
 
 # ------------------------------ models ------------------------------------ #
-CAPTION_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+CAPTION_MODEL_ID = os.environ.get(
+    "SR_CAPTION_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
+PROMPT_GENERATOR_MODEL_ID = os.environ.get(
+    "SR_PROMPT_GENERATOR_MODEL_ID", "gpt-4o-mini")
+PROMPT_GENERATOR_BACKEND_ID = "openai_chat_completions_vision_replace_body_v1"
+PROMPT_GENERATOR_MAX_TOKENS = 512
 ORCHESTRATOR_TOOL_MODEL = "gpt-4o-mini"
 TEXT_FALLBACK_MODEL = "gpt-5.5"  # codex CLI
 FEEDBACK_MODEL = os.environ.get("SR_FEEDBACK_MODEL", "gpt-4o")
@@ -89,6 +99,14 @@ if CAPTION_SUBJECT_REGISTRY_MODE not in {"empty", "optional"}:
     raise ValueError(
         "SR_CAPTION_SUBJECT_REGISTRY_MODE must be 'empty' or 'optional'")
 CAPTION_PARSE_MAX_RETRIES = 5
+# Attempts that request the canonical DVD registry JSON before the captioner
+# falls back to a description-only plain-text contract for the remaining
+# attempts. Must be >= 1 and <= CAPTION_PARSE_MAX_RETRIES + 1.
+CAPTION_JSON_ATTEMPTS = int(os.environ.get("SR_CAPTION_JSON_ATTEMPTS", "2"))
+if not 1 <= CAPTION_JSON_ATTEMPTS <= CAPTION_PARSE_MAX_RETRIES + 1:
+    raise ValueError(
+        "SR_CAPTION_JSON_ATTEMPTS must be between 1 and "
+        f"{CAPTION_PARSE_MAX_RETRIES + 1}")
 
 # --------------------------- DVD run settings ------------------------------ #
 SAMPLE_FPS = 1.0

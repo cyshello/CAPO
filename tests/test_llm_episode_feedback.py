@@ -1,421 +1,201 @@
-"""Checkpoint D1 complete request and strict LLM boundary tests."""
+"""Lean episode-feedback request and parser tests."""
 
-import dataclasses
 import json
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
-from surrogate_rollout.optimization.episode_feedback import (
-    EpisodeFeedbackGenerator,
-)
 from surrogate_rollout.optimization.llm_episode_feedback import (
     EPISODE_FEEDBACK_SYSTEM_INSTRUCTION,
-    EpisodeFeedbackBackendConfigurationError,
-    EpisodeFeedbackContextOverflowError,
+    LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION,
     EpisodeFeedbackParseError,
+    FreshEpisodeFeedbackArtifactResolver,
     LLMEpisodeFeedbackGenerator,
-    LegacyEpisodeFeedbackArtifactResolver,
-    build_episode_feedback_request,
-    parse_episode_feedback_response,
+    build_lean_episode_feedback_request,
 )
 from surrogate_rollout.prompt_routing.schemas import dumps_canonical
-from surrogate_rollout.schemas import sha256_json
-from test_legacy_intervention_adapter import convert, legacy_bundle
+from surrogate_rollout.optimization.schemas import QAInterventionOutcome
+from episode_artifact_fixture import fresh_episode_bundle
 
 
-POLICY_VERSION = "fixture_episode_feedback_policy_v1"
+POLICY_VERSION = "episode_feedback_request_v6_candidate_mixed_view_sibling_outcomes"
 
 
-def valid_response(episode_id, *, recommendation="Inspect continuity conditionally."):
+def valid_response(
+    episode_id, segment_id="0_10", qa_id="benchmark/train/1",
+):
     return {
         "episode_id": episode_id,
-        "outcome_summary": "Observed: all stored QA outcomes were considered.",
+        "outcome_summary": "One stored outcome improved.",
         "observations": [{
-            "statement": "Observed: both recaptioned clip strings changed.",
-            "supporting_segment_ids": ["0_10", "10_20"],
-            "supporting_qa_ids": [],
-            "evidence_type": "caption_change",
-            "transition_type": None,
-            "confidence": "direct string comparison",
-        }, {
-            "statement": "Observed: the stored source QA changed correctness.",
-            "supporting_segment_ids": [],
-            "supporting_qa_ids": ["benchmark/train/1"],
-            "evidence_type": "qa_transition",
-            "transition_type": "wrong_to_correct",
-            "confidence": "stored correctness pair",
+            "statement": "Observed: Returned evidence links the changed caption to QA use.",
+            "supporting_segment_ids": [segment_id],
+            "supporting_qa_ids": [qa_id],
+            "evidence_type": "trajectory",
+            "confidence": "Direct stored evidence.",
         }],
         "counterevidence": [],
-        "generator_diagnosis": (
-            "Hypothesis: inspect continuity evidence; causal credit remains "
-            "uncertain across the episode."),
-        "recommended_strategy_change": recommendation,
-        "confidence": "episode evidence with uncertain attribution",
+        "generator_diagnosis": "A local caption change may have helped.",
+        "recommended_strategy_change": "Retain the locally supported detail.",
+        "confidence": "Local evidence only.",
+        "compact_memory_text": "Visible detail was added.\nThe stored result improved.",
     }
 
 
 class FakeBackend:
-    def __init__(
-        self, response_factory=None, *, context_limit_tokens=None,
-        token_count=100,
-    ):
-        self.response_factory = response_factory or (
-            lambda request: valid_response(request["episode"]["episode_id"]))
-        self.context_limit_tokens = context_limit_tokens
-        self.token_count = token_count
+    def __init__(self, response=None):
+        self.response = response
         self.calls = []
 
-    def __call__(self, system_instruction, request):
-        payload = json.loads(request)
-        self.calls.append((system_instruction, request))
-        return dumps_canonical(self.response_factory(payload))
-
-    def count_tokens(self, messages):
-        assert tuple(item["role"] for item in messages) == ("system", "user")
-        return self.token_count
+    def __call__(self, system, user):
+        self.calls.append((system, user))
+        episode = json.loads(user)["episode"]
+        value = self.response or valid_response(episode["episode_id"])
+        return dumps_canonical(value)
 
     def metadata(self):
         return {
-            "provider": "deterministic_fake_backend",
-            "model": "fixture-model-not-called",
+            "provider": "fixture", "model": "fixture-model",
             "generation_settings": {"temperature": 0},
-            "output_token_limit": 512,
-            "context_limit_tokens": self.context_limit_tokens,
-            "call_count": len(self.calls),
+            "output_token_limit": 512, "context_limit_tokens": 1_000_000,
         }
 
 
-def episode_and_request(tmp_path, **request_kwargs):
-    episode = convert(legacy_bundle(tmp_path))
-    request = build_episode_feedback_request(
-        episode,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
-        **request_kwargs,
+def request(tmp_path):
+    episode = fresh_episode_bundle(tmp_path)
+    value = build_lean_episode_feedback_request(
+        episode, artifact_resolver=FreshEpisodeFeedbackArtifactResolver())
+    return episode, value
+
+
+def test_prompt_is_one_repository_owned_lean_file():
+    root = Path(__file__).parents[1] / "optimization" / "prompts"
+    assert EPISODE_FEEDBACK_SYSTEM_INSTRUCTION == (
+        root / "episode_feedback_system_v7.txt").read_text().strip()
+    assert not (root / "episode_feedback_system_v6_lean.txt").exists()
+    assert not (root / "episode_feedback_system_v5.txt").exists()
+    assert not (root / "episode_feedback_model_compact_addendum_v1.txt").exists()
+
+
+def test_lean_payload_keeps_exact_qa_fields_and_changed_caption_pairs(tmp_path):
+    episode, built = request(tmp_path)
+    payload = built.model_payload
+    assert payload["schema_version"] == LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION
+    body = payload["episode"]
+    assert set(body) == {
+        "episode_id", "prompt_delta", "qa_transition_summary",
+        "changed_captions", "qas"}
+    expected_changed = [clip for clip in episode.clips
+                        if clip.baseline_caption != clip.intervention_caption]
+    assert body["changed_captions"] == [{
+        "segment_id": clip.segment_id,
+        "baseline_caption": clip.baseline_caption,
+        "intervention_caption": clip.intervention_caption,
+    } for clip in expected_changed]
+    qa = body["qas"][0]
+    assert qa["question"] == "Stored question 0?"
+    assert qa["answer_choices"] == ["A. first", "B. second", "C. third", "D. fourth"]
+    assert qa["gold_answer"] == "A"
+    assert qa["baseline_answer"] == "B"
+    assert qa["intervention_answer"] == "A"
+    assert qa["transition"] == "wrong_to_correct"
+
+
+def test_lean_feedback_receives_source_and_sibling_all_transition_types(tmp_path):
+    episode, _built = request(tmp_path)
+    base = FreshEpisodeFeedbackArtifactResolver().resolve_qas(episode)[0]
+    states = (
+        (False, True, "wrong_to_correct"),
+        (True, False, "correct_to_wrong"),
+        (True, True, "correct_to_correct"),
+        (False, False, "wrong_to_wrong"),
     )
-    return episode, request
+    base_outcome = episode.qa_outcomes[0]
+    outcomes = tuple(QAInterventionOutcome(
+        qa_id=f"qa-{index}", is_source_qa=index == 0,
+        baseline_answer="B", intervention_answer="A",
+        baseline_correct=before, intervention_correct=after,
+        baseline_trajectory_ref=base_outcome.baseline_trajectory_ref,
+        intervention_trajectory_ref=base_outcome.intervention_trajectory_ref,
+    ) for index, (before, after, _transition) in enumerate(states))
+    episode = replace(episode, episode_id="episode-all-transitions",
+                      qa_outcomes=outcomes)
+
+    class _Resolver:
+        def resolve_qas(self, _episode):
+            return tuple({
+                **base,
+                "qa_id": outcome.qa_id,
+                "is_source_qa": outcome.is_source_qa,
+                "baseline_answer": outcome.baseline_answer,
+                "intervention_answer": outcome.intervention_answer,
+                "baseline_correct": outcome.baseline_correct,
+                "intervention_correct": outcome.intervention_correct,
+                "transition": state[2],
+            } for outcome, state in zip(outcomes, states))
+
+    built = build_lean_episode_feedback_request(
+        episode, artifact_resolver=_Resolver())
+    qas = built.model_payload["episode"]["qas"]
+
+    assert [row["is_source_qa"] for row in qas] == [True, False, False, False]
+    assert [row["transition"] for row in qas] == [
+        "wrong_to_correct", "correct_to_wrong", "correct_to_correct",
+        "wrong_to_wrong"]
 
 
-def test_complete_request_preserves_every_clip_and_exact_clip_fields(tmp_path):
-    episode, request = episode_and_request(tmp_path)
-    clips = request.user_payload["episode"]["clips"]
-    assert [item["segment_id"] for item in clips] == [
-        item.segment_id for item in episode.clips]
-    for source, payload in zip(episode.clips, clips):
-        assert payload["time_range"] == json.loads(dumps_canonical(
-            source.time_range))
-        assert payload["history_snapshot"] == json.loads(dumps_canonical(
-            source.history_snapshot))
-        assert payload["base_prompt"] == source.base_prompt
-        assert payload["applied_prompt_delta_instruction"] == \
-            source.prompt_delta.instruction
-        assert payload["baseline_caption"] == source.baseline_caption
-        assert payload["intervention_caption"] == source.intervention_caption
+def test_lean_payload_has_no_history_full_clips_or_lossy_marker(tmp_path):
+    _, built = request(tmp_path)
+    text = dumps_canonical(built.model_payload)
+    for forbidden in (
+            "history_catalog", "history_item_ids", "base_prompt",
+            "referenced_segment_ids", "retrieved_segment_ids", "hits",
+            "assistant_steps", "final_response", "[TRUNCATED_TO_CONTEXT]"):
+        assert forbidden not in text
 
 
-def test_request_contains_episode_lineage_and_all_sibling_qas(tmp_path):
-    episode, request = episode_and_request(tmp_path)
-    payload = request.user_payload["episode"]
-    assert payload["episode_id"] == episode.episode_id
-    assert payload["video_id"] == episode.video_id
-    assert payload["parent_meta_prompt_id"] == episode.parent_meta_prompt_id
-    assert payload["prompt_delta"] == {
-        "delta_id": episode.prompt_delta.delta_id,
-        "instruction": episode.prompt_delta.instruction,
-        "source_qa_ids": list(episode.prompt_delta.source_qa_ids),
-        "proposer_diagnosis": episode.prompt_delta.proposer_diagnosis,
-    }
-    assert [item["qa_id"] for item in payload["qas"]] == [
-        item.qa_id for item in episode.qa_outcomes]
-    assert payload["qa_transition_summary"] == {
-        "correct_to_correct": ["benchmark/train/2"],
-        "wrong_to_wrong": ["benchmark/train/3"],
-        "wrong_to_correct": ["benchmark/train/1"],
-        "correct_to_wrong": [],
-    }
+def test_tool_calls_keep_only_query_evidence_and_changed_id_intersection(tmp_path):
+    _, built = request(tmp_path)
+    call = built.model_payload["episode"]["qas"][0]["baseline_tool_calls"][0]
+    assert set(call) == {"query", "returned_evidence", "segment_ids"}
+    assert call["query"] == "fixture query"
+    assert call["returned_evidence"] == ["baseline evidence for 0_10"]
+    assert call["segment_ids"] == ["0_10"]
 
 
-def test_qa_metadata_is_resolved_only_from_saved_baseline_artifact(tmp_path):
-    _, request = episode_and_request(tmp_path)
-    first = request.user_payload["episode"]["qas"][0]
-    assert first["question"] == "Stored question 0?"
-    assert first["answer_choices"] == [
-        "A. first", "B. second", "C. third"]
-    assert first["gold_answer"] == "A"
-    assert first["transition"] == "wrong_to_correct"
-
-
-def test_raw_trajectory_tool_events_and_references_are_lossless(tmp_path):
-    _, request = episode_and_request(tmp_path)
-    first = request.user_payload["episode"]["qas"][0]
-    baseline = first["baseline_trajectory"]
-    intervention = first["intervention_trajectory"]
-    assert baseline["availability"] == "available"
-    assert baseline["content"][3]["content"] == "baseline evidence for 0_10"
-    assert intervention["content"][3]["content"] == \
-        "intervention evidence for 0_10"
-    assert baseline["tool_events"][0]["tool"] == "clip_search_tool"
-    assert baseline["referenced_segment_ids"] == ["0_10"]
-    assert baseline["retrieved_segment_ids"] == ["0_10"]
-    assert baseline["reference_sets"] == {
-        "explicitly_cited_segments": ["0_10"],
-        "retrieved_segments": ["0_10"],
-    }
-    assert baseline["reference_evidence"] == [{
-        "segment": "0_10", "set": "retrieved_segments",
-        "reason": "clip_search_tool_hit", "event_index": 0,
-    }]
-
-
-def test_none_trajectory_is_explicitly_unavailable(tmp_path):
-    _, request = episode_and_request(tmp_path)
-    unavailable = request.user_payload["episode"]["qas"][1]
-    expected = {
-        "availability": "unavailable",
-        "content": None,
-        "tool_events": [],
-        "reference_sets": {},
-        "reference_evidence": [],
-        "referenced_segment_ids": [],
-        "retrieved_segment_ids": [],
-    }
-    assert unavailable["baseline_trajectory"] == expected
-    assert unavailable["intervention_trajectory"] == expected
-
-
-def test_payload_excludes_frames_codebook_and_unrelated_state(tmp_path):
-    _, request = episode_and_request(tmp_path)
-    payload_text = dumps_canonical(request.user_payload)
-    assert '"frames"' not in payload_text
-    assert '"codebook"' not in payload_text
-    assert '"current_meta_prompt"' not in payload_text
-    assert '"updater_history"' not in payload_text
-
-
-def test_request_serialization_hash_and_size_statistics_are_exact(tmp_path):
-    episode, first = episode_and_request(tmp_path)
-    _, second = episode_and_request(tmp_path)
-    assert first.user_request == second.user_request
-    assert first.payload_hash == second.payload_hash
-    assert first.payload_hash == sha256_json(first.user_payload)
-    stats = first.size_statistics
-    assert stats.clip_count == len(episode.clips)
-    assert stats.qa_count == len(episode.qa_outcomes)
-    assert stats.total_history_item_count == sum(
-        len(clip.history_snapshot["history"]) for clip in episode.clips)
-    assert stats.serialized_request_character_count == len(
-        dumps_canonical(first.messages))
-    assert stats.clip_record_character_count == sum(
-        len(dumps_canonical(item))
-        for item in first.user_payload["episode"]["clips"])
-    assert stats.qa_record_character_count == sum(
-        len(dumps_canonical(item))
-        for item in first.user_payload["episode"]["qas"])
-    expected_trajectory_chars = 0
-    for qa in first.user_payload["episode"]["qas"]:
-        for side in ("baseline_trajectory", "intervention_trajectory"):
-            trajectory = qa[side]
-            if trajectory["availability"] == "available":
-                expected_trajectory_chars += len(dumps_canonical(
-                    trajectory["content"]))
-                expected_trajectory_chars += len(dumps_canonical(
-                    trajectory["tool_events"]))
-    assert stats.trajectory_character_count == expected_trajectory_chars
-    assert stats.token_count is None
-    assert stats.context_limit_checked is False
-    assert stats.unresolved_reference_count == 0
-
-
-def test_system_instruction_contains_required_causal_and_output_limits():
-    assert "Do not attribute an episode-level QA outcome to one clip" in \
-        EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "Retrieved or referenced clips are not causal proof" in \
-        EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "Length limits:" in EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "at most 4 observations" in EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "at most 3 counterevidence" in EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "Do not return feedback_id" in EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "Do not use Markdown fences" in EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "propose codebook entries" in EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "Copy QA transition facts exactly from qa_transition_summary" in \
-        EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "Do not infer or recompute QA transitions from trajectories" in \
-        EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert "Do not state that all QAs share one transition" in \
-        EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-
-
-def test_fake_backend_valid_json_returns_feedback_and_full_trace(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+def test_generator_uses_only_lean_request(tmp_path):
+    episode = fresh_episode_bundle(tmp_path)
     backend = FakeBackend()
-    generator: EpisodeFeedbackGenerator = LLMEpisodeFeedbackGenerator(
+    result = LLMEpisodeFeedbackGenerator(
         response_provider=backend,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
-        policy_version=POLICY_VERSION,
-    )
-    result = generator.generate_with_trace(episode)
-    assert result.feedback.episode_id == episode.episode_id
-    assert result.raw_response == dumps_canonical(valid_response(
-        episode.episode_id))
-    assert result.request.messages[0]["content"] == \
-        EPISODE_FEEDBACK_SYSTEM_INSTRUCTION
-    assert backend.calls[0] == (
-        result.request.system_instruction, result.request.user_request)
-    assert result.backend_metadata["model"] == "fixture-model-not-called"
-    assert generator.generate(episode).episode_id == episode.episode_id
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver(),
+        policy_version=POLICY_VERSION).generate_with_trace(episode)
+    sent = json.loads(backend.calls[0][1])
+    assert sent["schema_version"] == LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION
+    assert sent == result.request.model_payload
 
 
-def test_feedback_id_is_deterministic_from_episode_policy_and_request(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+def test_request_and_raw_response_persist_before_structural_parse_failure(tmp_path):
+    episode = fresh_episode_bundle(tmp_path)
+    invalid = valid_response(episode.episode_id)
+    invalid["observations"][0]["supporting_segment_ids"] = "not-an-array"
+    stage = tmp_path / "feedback-stage"
     generator = LLMEpisodeFeedbackGenerator(
-        response_provider=FakeBackend(),
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
-        policy_version=POLICY_VERSION,
-    )
-    first = generator.generate_with_trace(episode)
-    second = generator.generate_with_trace(episode)
-    identity = {
-        "episode_id": episode.episode_id,
-        "feedback_policy_version": POLICY_VERSION,
-        "request_payload_hash": first.request.payload_hash,
-    }
-    assert first.feedback.feedback_id == (
-        "episode_feedback_" + sha256_json(identity)[:20])
-    assert first.feedback.feedback_id == second.feedback.feedback_id
-    assert dumps_canonical(first.feedback) == dumps_canonical(second.feedback)
-
-
-def parse_fixture_response(episode, request, value):
-    return parse_episode_feedback_response(
-        dumps_canonical(value), episode=episode,
-        policy_version=POLICY_VERSION,
-        request_payload_hash=request.payload_hash)
-
-
-def test_wrong_episode_id_is_rejected(tmp_path):
-    episode, request = episode_and_request(tmp_path)
-    response = valid_response("another-episode")
-    with pytest.raises(EpisodeFeedbackParseError, match="episode_id") as caught:
-        parse_fixture_response(episode, request, response)
-    assert caught.value.raw_response == dumps_canonical(response)
-
-
-@pytest.mark.parametrize(("field", "bad_id"), (
-    ("supporting_segment_ids", "missing-segment"),
-    ("supporting_qa_ids", "missing-qa"),
-))
-def test_unknown_supporting_id_is_rejected(tmp_path, field, bad_id):
-    episode, request = episode_and_request(tmp_path)
-    response = valid_response(episode.episode_id)
-    response["observations"][0][field] = [bad_id]
-    with pytest.raises(EpisodeFeedbackParseError, match="unknown"):
-        parse_fixture_response(episode, request, response)
-
-
-def test_evidence_item_with_no_support_is_rejected_at_real_boundary(tmp_path):
-    episode, request = episode_and_request(tmp_path)
-    response = valid_response(episode.episode_id)
-    response["observations"][0]["supporting_segment_ids"] = []
-    with pytest.raises(EpisodeFeedbackParseError, match="no supporting IDs"):
-        parse_fixture_response(episode, request, response)
-
-
-@pytest.mark.parametrize("raw", (
-    "not-json",
-    '```json\n{"episode_id":"x"}\n```',
-    '{"episode_id":"x"} trailing prose',
-))
-def test_malformed_fenced_and_trailing_responses_are_rejected(tmp_path, raw):
-    episode, request = episode_and_request(tmp_path)
-    with pytest.raises(EpisodeFeedbackParseError) as caught:
-        parse_episode_feedback_response(
-            raw, episode=episode, policy_version=POLICY_VERSION,
-            request_payload_hash=request.payload_hash)
-    assert caught.value.raw_response == raw
-
-
-def test_placeholder_evidence_type_is_rejected(tmp_path):
-    episode, request = episode_and_request(tmp_path)
-    response = valid_response(episode.episode_id)
-    response["observations"][0]["evidence_type"] = "placeholder"
-    with pytest.raises(EpisodeFeedbackParseError, match="evidence_type"):
-        parse_fixture_response(episode, request, response)
-
-
-def test_transition_type_must_match_every_stored_supporting_qa(tmp_path):
-    episode, request = episode_and_request(tmp_path)
-    response = valid_response(episode.episode_id)
-    response["observations"][1]["transition_type"] = "correct_to_correct"
-    with pytest.raises(EpisodeFeedbackParseError, match="stored QA outcomes"):
-        parse_fixture_response(episode, request, response)
-
-
-def test_transition_type_nullability_follows_evidence_type(tmp_path):
-    episode, request = episode_and_request(tmp_path)
-    response = valid_response(episode.episode_id)
-    response["observations"][0]["transition_type"] = "wrong_to_correct"
-    with pytest.raises(EpisodeFeedbackParseError, match="must be null"):
-        parse_fixture_response(episode, request, response)
-
-    response = valid_response(episode.episode_id)
-    response["observations"][1]["transition_type"] = None
-    with pytest.raises(EpisodeFeedbackParseError, match="invalid or null"):
-        parse_fixture_response(episode, request, response)
-
-
-def test_exact_delta_strategy_is_not_silently_repaired(tmp_path):
-    episode, request = episode_and_request(tmp_path)
-    response = valid_response(
-        episode.episode_id,
-        recommendation=episode.prompt_delta.instruction)
-    parsed = parse_fixture_response(episode, request, response)
-    assert parsed.recommended_strategy_change == episode.prompt_delta.instruction
-
-
-def test_generation_does_not_mutate_episode(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
-    before = dumps_canonical(episode)
-    LLMEpisodeFeedbackGenerator(
-        response_provider=FakeBackend(),
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
-        policy_version=POLICY_VERSION).generate(episode)
-    assert dumps_canonical(episode) == before
-
-
-def test_known_context_overflow_fails_before_backend_without_truncation(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
-    backend = FakeBackend(context_limit_tokens=10, token_count=11)
-    generator = LLMEpisodeFeedbackGenerator(
-        response_provider=backend,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
+        response_provider=FakeBackend(invalid),
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver(),
         policy_version=POLICY_VERSION)
-    with pytest.raises(EpisodeFeedbackContextOverflowError) as caught:
-        generator.generate(episode)
-    assert caught.value.observed_tokens == 11
-    assert caught.value.configured_limit == 10
-    assert caught.value.clip_count == len(episode.clips)
-    assert caught.value.qa_count == len(episode.qa_outcomes)
-    assert "no truncation" in str(caught.value)
-    assert backend.calls == []
-
-
-def test_unknown_context_limit_applies_no_invented_limit(tmp_path):
-    _, request = episode_and_request(tmp_path)
-    assert request.size_statistics.context_limit_tokens is None
-    assert request.size_statistics.context_limit_checked is False
-    assert request.size_statistics.token_count is None
-
-
-def test_missing_backend_identity_or_generation_config_fails_fast(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
-
-    class IncompleteBackend(FakeBackend):
-        def metadata(self):
-            return {"provider": "fake", "model": None}
-
-    generator = LLMEpisodeFeedbackGenerator(
-        response_provider=IncompleteBackend(),
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
-        policy_version=POLICY_VERSION)
-    with pytest.raises(
-            EpisodeFeedbackBackendConfigurationError, match="model identity"):
-        generator.generate(episode)
+    with pytest.raises(EpisodeFeedbackParseError):
+        generator.generate_to_directory(episode, str(stage))
+    manifest_path = stage / "request_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert "call_count" not in manifest["backend"]
+    manifest["backend"]["call_count"] = 99
+    manifest_path.write_text(dumps_canonical(manifest) + "\n")
+    with pytest.raises(EpisodeFeedbackParseError):
+        generator.generate_to_directory(episode, str(stage))
+    assert len(generator.response_provider.calls) == 1
+    assert json.loads((stage / "request.json").read_text())["schema_version"] == \
+        LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION
+    assert json.loads((stage / "raw_response.json").read_text()) == invalid
+    assert json.loads(manifest_path.read_text())["backend"]["call_count"] == 99

@@ -2,100 +2,47 @@
 
 ## Active specification
 
-Read before modifying Phase 4:
+Read before modifying the fresh prompt-delta path:
 
 1. `docs/CURRENT_METHOD.md`
 2. `docs/IMPLEMENTATION_MIGRATION.md`
 3. `docs/RUNBOOK.md`
 
-When an older Phase 4 document conflicts with these files,
-`docs/CURRENT_METHOD.md` wins.
+`docs/CURRENT_METHOD.md` wins when older notes conflict.
 
 ## Repository preservation
 
 - Inspect the branch, `git status`, and `git diff` before editing.
 - Do not reset or discard existing work.
-- Preserve Phase 0–3 behavior.
 - Preserve stable segment IDs, mixed caption views, cache isolation, downstream
-  DVD reasoning, versioned snapshots, and existing tests.
-- Keep legacy caption caches read-only.
-- Prefer minimal adapters and migrations over architectural rewrites.
+  DVD reasoning, immutable artifact identity, and source non-mutation checks.
+- Keep existing run artifacts and caption caches read-only.
+- Do not retain unused codebook/router/property/GEPA adapters for compatibility.
 - Do not rename files/classes solely for terminology.
 
 ## Active implementation scope
 
-### Train roles and iteration cadence
+The active Phase 4 implementation is fresh prompt-delta only:
 
-The frozen top-level split remains 10 train / 10 validation / 10 test videos,
-with three QAs per video. Derive Phase 4 roles only inside train:
+- generate per-segment static-meta prompt instructions with OpenAI
+  `gpt-4o-mini`;
+- compose them with the `replace_body` scaffold;
+- caption with local Qwen over original segment frames without passing frozen
+  history separately to the captioner;
+- propose prompt deltas with independent per-QA provider calls;
+- apply each candidate to the source QA localized segments as one mixed view;
+- rerun every sibling QA from the same video on that mixed view;
+- generate detailed feedback and compact memory from the full sibling outcome;
+- update and confirm only the meta-prompt.
 
-- evidence pool: the eight `previously_cached` train videos;
-- confirmation holdout: the two remaining train videos;
-- no separate regression-video subset.
+Do not reintroduce:
 
-Each optimization iteration selects exactly three unique evidence videos and
-runs all three QAs per video. Selection rotates deterministically through the
-eight-video evidence pool and prioritizes videos not yet used in the current
-coverage cycle. If fewer than three unused videos remain, fill the batch from
-the deterministic rotation while keeping it unique. Once all eight evidence
-videos have appeared, confirmation is due. Reset coverage only after
-confirmation accepts the provisional state or rejects it and rolls back to the
-last confirmed checkpoint.
-
-Confirmation videos never propose properties or generate optimization
-feedback. Validation and test never enter component-update feedback. Use
-`correct_to_wrong` flips on the current three evidence videos as the regression
-signal. Older separate regression-video and per-iteration confirmation flows
-are superseded.
-
-At confirmation, materialize one immutable two-video/six-QA input bundle and
-reuse it for parent and candidate. Both policies use identical sampled frames
-and runtime/history configuration, but independently build on-policy sequential
-caption histories. Use the complete history-aware cache identity plus the
-bundle hash; confirmation must fail before QA on bundle/config mismatch or
-cache-path aliasing across unequal identities.
-
-Implement:
-
-- history-aware multi-property VLM inference routing;
-- one current-policy full-caption pass over exactly three evidence videos per
-  iteration;
-- all baseline QAs for every source video;
-- multiple property proposals per video;
-- frame-only property-conditioned SigLIP retrieval within each source video:
-  exact candidate property text against sampled frames, maximum frame pooling,
-  deterministic top-M selection;
-- one independent property intervention per
-  `(source_video, candidate_property)`;
-- frozen incumbent history;
-- force-add exactly one ephemeral candidate after incumbent routed properties
-  only on retrieved segments; the temporary sequence may contain
-  `max_selected_properties + 1` entries;
-- retain every incumbent property without conflict resolution and fail the
-  candidate on prompt-budget overflow or any selected-segment caption failure;
-- reuse incumbent captions only for unselected segments;
-- parallel property interventions;
-- rerun all source-video QAs per intervention;
-- correctness-flip-only compact multimodal feedback;
-- `S_feedback = S_sim ∩ (S_used ∪ S_usedagain)`;
-- one iteration-level codebook/router update;
-- acceptance of multiple supported properties per iteration;
-- fixed deterministic scaffold.
-
-Do not implement:
-
-- history propagation;
-- SLM-only routing;
-- per-segment QA rollouts;
-- scaffold optimization;
-- trust regions;
-- broad renaming.
-
-Frozen local history is never a property-retrieval input or retrieval-cache
-identity field. History is used only for baseline routing, baseline captioning,
-later selective re-captioning, and later multimodal feedback. Retrieval also
-must not directly consume QA text, answers, correctness, captions, traces, or
-used-segment references.
+- legacy property/codebook/router optimization;
+- GEPA meta-prompt runners;
+- rule-based, SLM, or history-aware property routers;
+- property-conditioned SigLIP retrieval;
+- legacy property intervention adapters;
+- deterministic semantic validators or candidate fallbacks.
 
 ## Execution policy
 
@@ -111,12 +58,13 @@ Do not launch:
 You may run:
 
 - unit tests;
-- deterministic offline dry runs;
-- the smallest strictly bounded smoke test when its scope and cost are explicit.
+- Python compile checks;
+- CLI `--help`;
+- shell syntax checks;
+- deterministic file/package inspections.
 
-After implementation, update `docs/RUNBOOK.md` with exact copy-paste commands,
-required environment variables, output paths, resume/recovery behavior, and
-success checks. Do not leave placeholders when declaring completion.
+After implementation, update `docs/RUNBOOK.md` with exact commands, required
+environment variables, output paths, resume behavior, and success checks.
 
 ## Required completion report
 
@@ -131,17 +79,4 @@ Report:
 - unresolved assumptions;
 - exact commands the user should execute next.
 
-Do not execute the user's main command.
-
-Real Checkpoint 3E execution must be constructed with
-`Checkpoint3EOrchestrator.with_real_confirmation(...)`. Before every fresh or
-resumed run, log and persist the exact router, captioner, property proposer,
-feedback provider, and downstream QA model identities. Fail before all stage
-calls if any component is missing a model identity, uses a mock/fixture/stub,
-or does not match the reviewed real provider/backend path.
-
-The one-video smoke must use `scripts/run_phase4_bounded_smoke.py` with three
-pairwise independent output/state/cache directories. Its typed
-`post_intervention_mode` may progress from `qa_only` to `feedback_only` to
-`provisional_update` using the same directories. It must never call
-confirmation or write production coverage/confirmed pointers.
+Do not execute the user's main experiment command.

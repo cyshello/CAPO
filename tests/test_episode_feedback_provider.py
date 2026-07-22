@@ -6,9 +6,8 @@ import json
 import pytest
 
 from surrogate_rollout.optimization.llm_episode_feedback import (
-    EpisodeFeedbackParseError,
     LLMEpisodeFeedbackGenerator,
-    LegacyEpisodeFeedbackArtifactResolver,
+    FreshEpisodeFeedbackArtifactResolver,
 )
 from surrogate_rollout.optimization.policies.episode_feedback_provider import (
     EpisodeFeedbackProviderContextOverflowError,
@@ -19,7 +18,7 @@ from surrogate_rollout.optimization.policies.episode_feedback_provider import (
     prepare_and_measure,
 )
 from surrogate_rollout.prompt_routing.schemas import dumps_canonical
-from test_legacy_intervention_adapter import convert, legacy_bundle
+from episode_artifact_fixture import fresh_episode_bundle
 from test_llm_episode_feedback import POLICY_VERSION, valid_response
 
 
@@ -76,11 +75,11 @@ def test_every_provider_and_tokenizer_setting_is_required(missing):
 
 
 def test_prepare_and_measure_exact_counts_output_reservation_and_fit(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+    episode = fresh_episode_bundle(tmp_path)
     adapter = provider()
     inspection = prepare_and_measure(
         episode, provider_adapter=adapter,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver())
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver())
     messages = inspection.prepared_request.messages
     stats = inspection.token_statistics
     assert stats.system_prompt_tokens == len(messages[0]["content"])
@@ -96,13 +95,13 @@ def test_prepare_and_measure_exact_counts_output_reservation_and_fit(tmp_path):
     assert adapter.response_transport.calls == []
 
 
-def test_exact_provider_body_contains_only_model_compact_user_payload(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+def test_exact_provider_body_contains_only_lean_user_payload(tmp_path):
+    episode = fresh_episode_bundle(tmp_path)
     inspection = prepare_and_measure(
         episode, provider_adapter=provider(),
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver())
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver())
     body = inspection.prepared_request.request_body
-    request = inspection.model_compact_request
+    request = inspection.lean_request
     assert body["model"] == "fixture-model-explicit"
     assert body["messages"][1]["content"] == dumps_canonical(
         request.model_payload)
@@ -121,7 +120,10 @@ def test_strict_output_schema_excludes_feedback_id():
     assert set(schema["properties"]) == {
         "episode_id", "outcome_summary", "observations", "counterevidence",
         "generator_diagnosis", "recommended_strategy_change", "confidence",
+        "compact_memory_text",
     }
+    assert schema["properties"]["compact_memory_text"]["type"] == [
+        "string", "null"]
 
 
 def test_strict_output_schema_keeps_confidence_open_vocabulary_strings():
@@ -140,16 +142,12 @@ def test_strict_output_schema_keeps_confidence_open_vocabulary_strings():
     assert "enum" not in evidence["properties"]["confidence"]
 
 
-def test_strict_output_schema_requires_nullable_grounded_transition_type():
+def test_strict_output_schema_excludes_model_authored_transitions():
     schema = episode_feedback_response_json_schema()
     evidence = schema["properties"]["observations"]["items"]
-    assert "transition_type" in evidence["required"]
-    transition = evidence["properties"]["transition_type"]
-    assert transition["type"] == ["string", "null"]
-    assert set(transition["enum"]) == {
-        "correct_to_correct", "wrong_to_wrong", "wrong_to_correct",
-        "correct_to_wrong", None,
-    }
+    assert "transition_type" not in evidence["required"]
+    assert "transition_type" not in evidence["properties"]
+    assert "qa_transition" not in evidence["properties"]["evidence_type"]["enum"]
 
 
 def test_every_strict_response_object_rejects_additional_properties():
@@ -166,47 +164,59 @@ def test_every_strict_response_object_rejects_additional_properties():
     visit(episode_feedback_response_json_schema())
 
 
-def test_context_overflow_is_reported_without_transport_call(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+def test_context_overflow_fails_before_transport_without_truncation(tmp_path):
+    episode = fresh_episode_bundle(tmp_path)
     roomy = prepare_and_measure(
         episode, provider_adapter=provider(),
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver())
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver())
     total = roomy.token_statistics.total_input_tokens
     transport = Transport()
     adapter = provider(
         context_limit=total + 511, response_transport=transport)
     inspection = prepare_and_measure(
         episode, provider_adapter=adapter,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver())
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver())
     assert inspection.fits_context is False
     assert inspection.token_statistics.remaining_tokens == -1
 
     generator = LLMEpisodeFeedbackGenerator(
         response_provider=adapter,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
-        policy_version=POLICY_VERSION,
-        request_representation="model_compact")
-    with pytest.raises(
-            EpisodeFeedbackProviderContextOverflowError,
-            match="no truncation") as caught:
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver(),
+        policy_version=POLICY_VERSION)
+    with pytest.raises(EpisodeFeedbackProviderContextOverflowError):
         generator.generate(episode)
-    assert caught.value.statistics.total_input_tokens == total
-    assert caught.value.statistics.reserved_output_tokens == 512
     assert adapter.call_count == 0
     assert transport.calls == []
 
 
-def test_fitting_request_uses_strict_schema_and_existing_parser(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+def test_provider_safety_margin_is_reserved_before_transport():
+    adapter = provider(
+        context_limit=1000, maximum_output_tokens=100,
+        context_safety_margin_tokens=512)
+    with pytest.raises(EpisodeFeedbackProviderContextOverflowError):
+        adapter.preflight(
+            "fixed system", dumps_canonical({"text": "evidence " * 1000}))
+
+
+def test_lean_request_uses_strict_schema_and_existing_parser(tmp_path):
+    episode = fresh_episode_bundle(tmp_path)
     transport = Transport()
     adapter = provider(response_transport=transport)
+    stage = tmp_path / "feedback-trace"
     feedback = LLMEpisodeFeedbackGenerator(
         response_provider=adapter,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
-        policy_version=POLICY_VERSION,
-        request_representation="model_compact").generate(episode)
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver(),
+        policy_version=POLICY_VERSION).generate_to_directory(
+            episode, str(stage))
     assert feedback.episode_id == episode.episode_id
+    assert feedback.observations[0].transition_type is None
     assert adapter.call_count == 1
+    assert json.loads((stage / "provider_request.json").read_text()) == \
+        transport.calls[0]
+    assert json.loads((stage / "request.json").read_text())["schema_version"] == \
+        "episode_feedback_request_v6_candidate_mixed_view_sibling_outcomes"
+    assert json.loads((stage / "raw_response.json").read_text())["episode_id"] == \
+        episode.episode_id
     response_format = transport.calls[0]["response_format"]
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["strict"] is True
@@ -214,34 +224,41 @@ def test_fitting_request_uses_strict_schema_and_existing_parser(tmp_path):
         "properties"]
 
 
-def test_existing_parser_validation_remains_final_boundary(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+def test_parser_accepts_trajectory_counterevidence_with_only_qa_ids(tmp_path):
+    episode = fresh_episode_bundle(tmp_path)
 
-    def invalid(request):
+    def sparse_counterevidence(request):
         value = valid_response(json.loads(
             request["messages"][1]["content"])["episode"]["episode_id"])
-        value["observations"][0]["supporting_segment_ids"] = ["not-present"]
+        value["counterevidence"] = [{
+            "statement": "Observed: The QA evidence is not attributable to a segment.",
+            "supporting_segment_ids": [],
+            "supporting_qa_ids": ["benchmark/train/1"],
+            "evidence_type": "trajectory",
+            "confidence": "Attribution is incomplete.",
+        }]
         return value
 
-    adapter = provider(response_transport=Transport(invalid))
+    adapter = provider(response_transport=Transport(sparse_counterevidence))
     generator = LLMEpisodeFeedbackGenerator(
         response_provider=adapter,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver(),
-        policy_version=POLICY_VERSION,
-        request_representation="model_compact")
-    with pytest.raises(EpisodeFeedbackParseError, match="unknown segment"):
-        generator.generate(episode)
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver(),
+        policy_version=POLICY_VERSION)
+    feedback = generator.generate(episode)
+    assert feedback.counterevidence[0].supporting_segment_ids == ()
+    assert feedback.counterevidence[0].supporting_qa_ids == (
+        "benchmark/train/1",)
 
 
 def test_same_request_has_same_tokens_and_identity(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+    episode = fresh_episode_bundle(tmp_path)
     adapter = provider()
     first = prepare_and_measure(
         episode, provider_adapter=adapter,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver())
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver())
     second = prepare_and_measure(
         episode, provider_adapter=adapter,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver())
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver())
     assert first.token_statistics == second.token_statistics
     assert first.prepared_request.request_identity == \
         second.prepared_request.request_identity
@@ -250,7 +267,7 @@ def test_same_request_has_same_tokens_and_identity(tmp_path):
 
 
 def test_inspection_does_not_mutate_source_artifacts(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
+    episode = fresh_episode_bundle(tmp_path)
     files = sorted(path for path in tmp_path.rglob("*") if path.is_file())
     before = {
         path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
@@ -258,7 +275,7 @@ def test_inspection_does_not_mutate_source_artifacts(tmp_path):
     adapter = provider()
     prepare_and_measure(
         episode, provider_adapter=adapter,
-        artifact_resolver=LegacyEpisodeFeedbackArtifactResolver())
+        artifact_resolver=FreshEpisodeFeedbackArtifactResolver())
     after = {
         path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
     assert before == after

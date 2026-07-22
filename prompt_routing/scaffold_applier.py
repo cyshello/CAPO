@@ -158,29 +158,21 @@ def finalize_composed_prompt(
 # --------------------------------------------------------------------------- #
 def create_scaffold_applier(scaffold_policy: ScaffoldPolicySnapshot, *,
                             base_prompt_template: str | None = None):
-    """The configured applier for a scaffold policy (§5.3): policy_type
-    'deterministic' -> DeterministicScaffoldApplier (the initial real
-    implementation), 'slm' -> interface-compatible SLMScaffoldApplier stub.
-    Unknown types abort — never a silent default."""
-    from surrogate_rollout.prompt_routing.policies.deterministic_scaffold import (
-        DeterministicScaffoldApplier,
-    )
-    from surrogate_rollout.prompt_routing.policies.slm_scaffold import (
-        SLMScaffoldApplier,
+    """Return the active replace-body applier."""
+    from surrogate_rollout.prompt_routing.policies.replace_body_scaffold import (
+        ReplaceBodyScaffoldApplier,
     )
 
-    if scaffold_policy.policy_type == "deterministic":
+    if scaffold_policy.policy_type == "replace_body":
         if not base_prompt_template:
             raise ValueError(
-                "policy_type 'deterministic' requires a non-empty "
+                "policy_type 'replace_body' requires a non-empty "
                 "base_prompt_template")
-        return DeterministicScaffoldApplier(
+        return ReplaceBodyScaffoldApplier(
             base_prompt_template=base_prompt_template)
-    if scaffold_policy.policy_type == "slm":
-        return SLMScaffoldApplier()
     raise ValueError(
         f"unknown scaffold policy_type {scaffold_policy.policy_type!r} "
-        "(supported: 'deterministic', 'slm')")
+        "(supported: 'replace_body')")
 
 
 # --------------------------------------------------------------------------- #

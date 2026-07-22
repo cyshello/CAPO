@@ -39,13 +39,14 @@ from surrogate_rollout.optimization.policies.episode_feedback_provider import (
     ExactProviderInputTokenCount,
     OpenAICompatibleEpisodeFeedbackProviderAdapter,
 )
+from surrogate_rollout.optimization.context_budget import (
+    PROVIDER_CONTEXT_SAFETY_MARGIN_TOKENS,
+)
 from surrogate_rollout.prompt_routing.persistence import (
     scaffold_contract_from_json,
     scaffold_policy_from_json,
 )
 from surrogate_rollout.prompt_routing.schemas import (
-    PromptBankSnapshot,
-    RouterPolicySnapshot,
     dumps_canonical,
 )
 
@@ -76,25 +77,18 @@ def _real_identity(value: Any, name: str) -> str:
     return result
 
 
-class _BoundedOpenAITransport:
-    """Explicit bounded attempts; no retry, repair, or fallback."""
+class _OpenAITransport:
+    """One HTTP request per invocation; no retry, repair, or fallback."""
 
-    def __init__(self, *, endpoint: str, api_key: str, timeout_seconds: int,
-                 maximum_calls: int):
-        if not endpoint or not api_key or timeout_seconds <= 0 or \
-                maximum_calls <= 0:
+    def __init__(self, *, endpoint: str, api_key: str, timeout_seconds: int):
+        if not endpoint or not api_key or timeout_seconds <= 0:
             raise CheckpointGConfigurationError(
                 "endpoint, API key, and positive timeout are required")
         self.endpoint = endpoint
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
-        self.maximum_calls = maximum_calls
-        self.call_count = 0
 
     def request(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
-        if self.call_count >= self.maximum_calls:
-            raise RuntimeError("provider transport call budget exhausted")
-        self.call_count += 1
         request = urllib.request.Request(
             self.endpoint, data=dumps_canonical(body).encode("utf-8"),
             headers={"Authorization": f"Bearer {self.api_key}",
@@ -121,6 +115,38 @@ class _BoundedOpenAITransport:
         if not isinstance(result, str):
             raise TypeError("provider message content must be a string")
         return result
+
+
+class _SingleCallOpenAITransport(_OpenAITransport):
+    """Preserve the updater's one-call execution contract."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        self._called = False
+
+    def request(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self._called:
+            raise RuntimeError("provider transport call budget exhausted")
+        self._called = True
+        return super().request(body)
+
+
+class _BoundedOpenAITransport(_OpenAITransport):
+    """Fail-closed aggregate call budget used only by bounded stages."""
+
+    def __init__(self, *, maximum_calls: int, **kwargs: Any):
+        if maximum_calls <= 0:
+            raise CheckpointGConfigurationError(
+                "maximum_calls must be positive")
+        super().__init__(**kwargs)
+        self.maximum_calls = maximum_calls
+        self.call_count = 0
+
+    def request(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self.call_count >= self.maximum_calls:
+            raise RuntimeError("provider transport call budget exhausted")
+        self.call_count += 1
+        return super().request(body)
 
 
 def _exact_counter(model_id: str):
@@ -174,9 +200,8 @@ def build_checkpoint_g_components(args):
     feedback_model = _real_identity(
         _required(feedback_cfg, "model_id"), "feedback.model_id")
     counter, tokenizer_identity = _exact_counter(feedback_model)
-    feedback_transport = _BoundedOpenAITransport(
-        endpoint=endpoint, api_key=api_key, timeout_seconds=timeout,
-        maximum_calls=int(_required(feedback_cfg, "maximum_calls")))
+    feedback_transport = _OpenAITransport(
+        endpoint=endpoint, api_key=api_key, timeout_seconds=timeout)
     feedback_backend = OpenAICompatibleEpisodeFeedbackProviderAdapter(
         provider="openai_api",
         model_id=feedback_model,
@@ -190,19 +215,20 @@ def build_checkpoint_g_components(args):
             "feedback.generation_settings"),
         feedback_policy_version=str(_required(
             feedback_cfg, "policy_version")),
-        response_transport=feedback_transport.feedback)
+        response_transport=feedback_transport.feedback,
+        context_safety_margin_tokens=
+            PROVIDER_CONTEXT_SAFETY_MARGIN_TOKENS)
     feedback = LLMEpisodeFeedbackGenerator(
         response_provider=feedback_backend,
         artifact_resolver=SavedEpisodeFeedbackArtifactResolver(),
-        policy_version=str(_required(feedback_cfg, "policy_version")),
-        request_representation="model_compact")
+        policy_version=str(_required(feedback_cfg, "policy_version")))
 
     updater_cfg = _object(_required(cfg, "updater"), "updater")
     updater_model = _real_identity(
         _required(updater_cfg, "model_id"), "updater.model_id")
-    updater_transport = _BoundedOpenAITransport(
-        endpoint=endpoint, api_key=api_key, timeout_seconds=timeout,
-        maximum_calls=1)
+    updater_counter, updater_tokenizer_identity = _exact_counter(updater_model)
+    updater_transport = _SingleCallOpenAITransport(
+        endpoint=endpoint, api_key=api_key, timeout_seconds=timeout)
     updater_backend = OpenAICompatibleMetaPromptUpdaterBackend(
         provider="openai_api", model_id=updater_model,
         maximum_output_tokens=int(_required(
@@ -211,6 +237,11 @@ def build_checkpoint_g_components(args):
             _required(updater_cfg, "generation_settings"),
             "updater.generation_settings"),
         updater_policy_version=str(_required(updater_cfg, "policy_version")),
+        tokenizer_identity=updater_tokenizer_identity,
+        exact_token_counter=updater_counter,
+        context_limit=int(_required(updater_cfg, "context_limit")),
+        context_safety_margin_tokens=
+            PROVIDER_CONTEXT_SAFETY_MARGIN_TOKENS,
         response_transport=updater_transport.request)
     updater = LLMMetaPromptUpdater(
         backend=updater_backend,
@@ -243,7 +274,8 @@ def build_checkpoint_g_components(args):
                        f"runtime.{identity_name}")
     expected = {
         "captioner_model_id": config.CAPTION_MODEL_ID,
-        "prompt_generator_model_id": config.CAPTION_MODEL_ID,
+        "prompt_generator_model_id": config.PROMPT_GENERATOR_MODEL_ID,
+        "prompt_generator_backend_id": config.PROMPT_GENERATOR_BACKEND_ID,
         "dvd_orchestrator_tool_model": config.ORCHESTRATOR_TOOL_MODEL,
         "dvd_text_fallback_model": config.TEXT_FALLBACK_MODEL,
         "use_transcript": config.USE_TRANSCRIPT,
@@ -274,15 +306,8 @@ def build_checkpoint_g_components(args):
         provider_indices=tuple(int(v) for v in item["provider_indices"]),
         question_ids=tuple(str(v) for v in item["question_ids"]))
         for item in _required(cfg, "confirmation_videos"))
-    neutral_bank = PromptBankSnapshot(
-        bank_version="bank_v9999", entries=(), max_selected_entries=1,
-        created_by="checkpoint_g_free_form_compatibility",
-        provenance={"legacy_codebook_used": False})
-    neutral_router = RouterPolicySnapshot(
-        router_version="router_v9999", policy_type="free_form_compatibility",
-        max_selected_entries=1,
-        configuration={"legacy_property_routing_used": False},
-        provenance={"checkpoint": "G"})
+    bank_version = "bank_v9999"
+    router_version = "router_v9999"
     def construct_confirmation():
         for path in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
             if path not in os.sys.path:
@@ -337,8 +362,8 @@ def build_checkpoint_g_components(args):
                 "use_openai_tools": runtime["dvd_use_openai_tools"]})
         return DVDMetaPromptConfirmationEvaluator(
             evaluator=dvd, confirmation_videos=videos,
-            compatibility_bank=neutral_bank,
-            compatibility_router=neutral_router,
+            bank_version=bank_version,
+            router_version=router_version,
             scaffold_policy=scaffold, scaffold_contract=contract,
             prompt_generator_model_id=str(_required(
                 runtime, "prompt_generator_model_id")),

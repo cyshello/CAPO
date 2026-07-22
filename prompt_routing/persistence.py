@@ -40,21 +40,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from surrogate_rollout.prompt_routing.schemas import (
-    PromptBankSnapshot,
-    PromptEntry,
-    RouterPolicySnapshot,
-    RoutingRule,
     ScaffoldContract,
     ScaffoldPolicySnapshot,
     as_json_dict,
-    make_component_version,
     validate_component_version,
-)
-from surrogate_rollout.prompt_routing.validators import (
-    validate_prompt_bank,
-    validate_router_policy,
-    validate_scaffold_contract,
-    validate_scaffold_policy,
 )
 
 
@@ -75,51 +64,6 @@ class SnapshotValidationError(SnapshotStoreError):
 # --------------------------------------------------------------------------- #
 def _tup(data: Mapping[str, Any], key: str) -> tuple:
     return tuple(data.get(key) or ())
-
-
-def prompt_entry_from_json(d: Mapping[str, Any]) -> PromptEntry:
-    return PromptEntry(
-        prompt_id=d["prompt_id"], prompt_text=d["prompt_text"],
-        prompt_hash=d["prompt_hash"], name=d["name"], description=d["description"],
-        tags=_tup(d, "tags"), applicability_traits=d.get("applicability_traits") or {},
-        conflicts_with=_tup(d, "conflicts_with"), status=d.get("status", "active"),
-        parent_prompt_ids=_tup(d, "parent_prompt_ids"),
-        created_by=d.get("created_by", ""), created_at=d.get("created_at", ""),
-        provenance=d.get("provenance") or {},
-    )
-
-
-def prompt_bank_from_json(d: Mapping[str, Any]) -> PromptBankSnapshot:
-    return PromptBankSnapshot(
-        bank_version=d["bank_version"],
-        entries=tuple(prompt_entry_from_json(e) for e in d.get("entries") or ()),
-        parent_bank_version=d.get("parent_bank_version"),
-        default_entry_ids=_tup(d, "default_entry_ids"),
-        max_selected_entries=d.get("max_selected_entries", 4),
-        created_at=d.get("created_at", ""), created_by=d.get("created_by", ""),
-        provenance=d.get("provenance") or {},
-    )
-
-
-def routing_rule_from_json(d: Mapping[str, Any]) -> RoutingRule:
-    return RoutingRule(
-        rule_id=d["rule_id"], priority=d["priority"],
-        conditions=d.get("conditions") or {},
-        target_prompt_ids=_tup(d, "target_prompt_ids"),
-        enabled=d.get("enabled", True), provenance=d.get("provenance") or {},
-    )
-
-
-def router_policy_from_json(d: Mapping[str, Any]) -> RouterPolicySnapshot:
-    return RouterPolicySnapshot(
-        router_version=d["router_version"], policy_type=d["policy_type"],
-        rules=tuple(routing_rule_from_json(r) for r in d.get("rules") or ()),
-        parent_router_version=d.get("parent_router_version"),
-        fallback_prompt_ids=_tup(d, "fallback_prompt_ids"),
-        max_selected_entries=d.get("max_selected_entries", 4),
-        configuration=d.get("configuration") or {},
-        created_at=d.get("created_at", ""), provenance=d.get("provenance") or {},
-    )
 
 
 def scaffold_contract_from_json(d: Mapping[str, Any]) -> ScaffoldContract:
@@ -145,6 +89,26 @@ def scaffold_policy_from_json(d: Mapping[str, Any]) -> ScaffoldPolicySnapshot:
         configuration=d.get("configuration") or {},
         created_at=d.get("created_at", ""), provenance=d.get("provenance") or {},
     )
+
+
+def _validate_scaffold_policy(policy: ScaffoldPolicySnapshot) -> tuple[str, ...]:
+    contract_owned = {
+        "contract_version",
+        "required_placeholders",
+        "required_sections",
+        "output_schema",
+        "forbidden_patterns",
+        "max_prompt_tokens",
+    }
+    overlap = contract_owned & set(policy.configuration)
+    if overlap:
+        return (f"scaffold policy {policy.scaffold_version!r} attempts to modify "
+                f"contract-owned fields: {sorted(overlap)}",)
+    return ()
+
+
+def _validate_scaffold_contract(contract: ScaffoldContract) -> tuple[str, ...]:
+    return ()
 
 
 # --------------------------------------------------------------------------- #
@@ -347,27 +311,15 @@ class ComponentSnapshotStore:
 # --------------------------------------------------------------------------- #
 #                             concrete stores                                  #
 # --------------------------------------------------------------------------- #
-def prompt_bank_store(root: str) -> ComponentSnapshotStore:
-    return ComponentSnapshotStore(root, kind="bank", version_field="bank_version",
-                                  from_json=prompt_bank_from_json,
-                                  validate_fn=validate_prompt_bank)
-
-
-def router_policy_store(root: str) -> ComponentSnapshotStore:
-    return ComponentSnapshotStore(root, kind="router", version_field="router_version",
-                                  from_json=router_policy_from_json,
-                                  validate_fn=validate_router_policy)
-
-
 def scaffold_policy_store(root: str) -> ComponentSnapshotStore:
     return ComponentSnapshotStore(root, kind="scaffold",
                                   version_field="scaffold_version",
                                   from_json=scaffold_policy_from_json,
-                                  validate_fn=validate_scaffold_policy)
+                                  validate_fn=_validate_scaffold_policy)
 
 
 def scaffold_contract_store(root: str) -> ComponentSnapshotStore:
     return ComponentSnapshotStore(root, kind="contract",
                                   version_field="contract_version",
                                   from_json=scaffold_contract_from_json,
-                                  validate_fn=validate_scaffold_contract)
+                                  validate_fn=_validate_scaffold_contract)

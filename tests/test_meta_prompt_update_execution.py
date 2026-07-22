@@ -11,6 +11,9 @@ from surrogate_rollout.optimization.meta_prompt_update_execution import (
     OpenAICompatibleMetaPromptUpdaterBackend,
     execute_meta_prompt_update_once,
 )
+from surrogate_rollout.optimization.policies.episode_feedback_provider import (
+    ExactProviderInputTokenCount,
+)
 from surrogate_rollout.optimization.meta_prompt_updater import (
     MetaPromptUpdaterParseError,
     build_meta_prompt_update_request,
@@ -82,6 +85,44 @@ def backend_for(transport):
         updater_policy_version=POLICY,
         response_transport=transport,
     )
+
+
+def test_updater_backend_fits_only_dynamic_json_values_before_transport():
+    transport = Transport(dumps_canonical(response([])))
+
+    def counter(messages):
+        system = len(messages[0]["content"])
+        user = len(messages[1]["content"])
+        return ExactProviderInputTokenCount(system, user, system + user + 7)
+
+    backend = OpenAICompatibleMetaPromptUpdaterBackend(
+        provider="fixture_provider", model_id="fixture-updater-model",
+        maximum_output_tokens=20,
+        generation_settings={"temperature": 0.0},
+        updater_policy_version=POLICY,
+        tokenizer_identity="unicode_codepoints_v1",
+        exact_token_counter=counter,
+        context_limit=500,
+        context_safety_margin_tokens=128,
+        response_transport=transport,
+    )
+    original = dumps_canonical({
+        "schema_version": "updater_v1",
+        "feedback_id": "feedback_1",
+        "diagnosis": "long evidence " * 200,
+    })
+    backend("fixed system instruction", original)
+    sent = transport.calls[0]["messages"]
+    assert sent[0]["content"] == "fixed system instruction"
+    payload = json.loads(sent[1]["content"])
+    assert payload["feedback_id"] == "feedback_1"
+    assert "[TRUNCATED_TO_CONTEXT]" in payload["diagnosis"]
+    assert backend.last_context_truncation["original_payload_hash"] != \
+        backend.last_context_truncation["transmitted_payload_hash"]
+    system = len(sent[0]["content"])
+    user = len(sent[1]["content"])
+    assert system + user + 7 + backend.maximum_output_tokens + 128 <= \
+        backend.context_limit
 
 
 def test_update_executes_once_and_writes_provisional_with_lineage(tmp_path):

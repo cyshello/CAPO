@@ -1,16 +1,19 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from surrogate_rollout.optimization.fresh_prompt_delta_evidence import (
     FreshPromptDeltaError, LLMPromptDeltaProposer,
     OpenAICompatiblePromptDeltaProposalBackend,
-    PromptDeltaInterventionRunner, PromptDeltaProposalBackend,
+    PromptDeltaExecutionPlan, PromptDeltaInterventionRunner,
+    PromptDeltaProposalBackend,
     PromptDeltaRequestPreflight, build_prompt_delta_proposal_request,
     build_prompt_delta_single_qa_request,
     _qa_segment_selection_records,
+    _source_qa_classification_hash,
     PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
     reconstruct_prompt_delta_history_snapshot,
 )
@@ -65,6 +68,7 @@ def _baseline(tmp_path: Path):
     histories = _jsonl(tmp_path / "histories.jsonl", ({
         "segment_id": segment_id,
         "history": [{"segment_id": "prior", "caption": "shared history"}],
+        "history_hash": "history-shared",
         "opaque_metadata": "preserved",
     } for segment_id in segment_ids))
     captions = _json(tmp_path / "captions.json", {
@@ -132,7 +136,8 @@ class FakeBackend:
         value = json.loads(payload)
         qas = tuple(value["request_scope"]["qa_ids"])
         fits = (self.full_fits if value["request_scope"]["mode"] == "all_qas"
-                else not bool(set(qas) & self.oversized_qa))
+                else (not bool(set(qas) & self.oversized_qa) or
+                      "[TRUNCATED_TO_CONTEXT]" in payload))
         total = 50 if fits else 150
         return PromptDeltaRequestPreflight(
             system_prompt_tokens=10, user_payload_tokens=total - 20,
@@ -145,9 +150,11 @@ class FakeBackend:
         self.calls += 1
         value = json.loads(payload)
         self.payloads.append(value)
-        if self.raw is not None:
-            return self.raw
         qa_id = value["request_scope"]["qa_ids"][0]
+        configured_raw = (
+            self.raw.get(qa_id) if isinstance(self.raw, dict) else self.raw)
+        if configured_raw is not None:
+            return configured_raw
         return json.dumps({"proposals": [{
             "instruction": f"Inspect visible continuity for {qa_id}.",
             "source_qa_ids": [qa_id],
@@ -160,10 +167,12 @@ def test_fresh_request_and_proposal_are_complete_and_deterministic(tmp_path):
     source_before = {path: path.read_bytes() for path in tmp_path.glob("*.json*")}
     system, payload, digest = build_prompt_delta_proposal_request(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         global_inspection_boundary_tolerance_seconds=10)
     assert "not a" in system and "codebook" in system
     assert payload["parent_meta_prompt_id"] == "meta_parent"
-    assert payload["schema_version"].startswith("prompt_delta_proposal_request_v4")
+    assert payload["parent_meta_prompt_text"] == "Current parent instruction."
+    assert payload["schema_version"].startswith("prompt_delta_proposal_request_v5")
     assert [row["segment_id"] for row in payload["segment_catalog"]] == [
         "0_10", "10_20"]
     assert "20_30" not in {
@@ -183,26 +192,34 @@ def test_fresh_request_and_proposal_are_complete_and_deterministic(tmp_path):
             json.loads(Path(tmp_path / "histories.jsonl").read_text().splitlines()[0]))
     assert digest == build_prompt_delta_proposal_request(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         global_inspection_boundary_tolerance_seconds=10)[2]
-    backend = FakeBackend(json.dumps({"proposals": [{
+    backend = FakeBackend({"qa1": json.dumps({"proposals": [{
         "instruction": "Inspect the visible handoff.",
         "source_qa_ids": ["qa1"],
         "proposer_diagnosis": "The handoff was absent.",
-    }]}))
+    }]})})
     proposer = LLMPromptDeltaProposer(
-        backend=backend, maximum_deltas_per_video=1,
+        backend=backend, maximum_deltas_per_qa=1,
         selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
         global_inspection_boundary_tolerance_seconds=10)
     plans = proposer.propose(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         output_directory=str(tmp_path / "proposal"))
     assert plans[0].selected_segment_ids == ("0_10", "10_20")
     assert plans[0].prompt_delta.source_qa_ids == ("qa1",)
     assert "property" not in dumps_canonical(plans[0])
     assert proposer.propose(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         output_directory=str(tmp_path / "proposal")) == plans
-    assert backend.calls == 1
+    assert backend.calls == 2
+    assert [row["request_scope"]["qa_ids"] for row in backend.payloads] == [
+        ["qa1"], ["qa2"]]
+    assert all(len(row["qa_records"]) == 1 for row in backend.payloads)
+    assert backend.payloads[0]["qa_records"][0]["qa_id"] == "qa1"
+    assert backend.payloads[1]["qa_records"][0]["qa_id"] == "qa2"
     audit = json.loads(
         (tmp_path / "proposal/selection_audit.json").read_text())
     qa1_audit = next(row for row in audit["qa_records"]
@@ -227,25 +244,30 @@ def test_fresh_request_and_proposal_are_complete_and_deterministic(tmp_path):
     assert {path: path.read_bytes() for path in source_before} == source_before
 
 
-def test_canonical_candidate_deduplication_uses_source_and_target_identity(
+def test_schema_valid_candidates_are_not_normalized_or_deduplicated(
         tmp_path):
     manifest = _baseline(tmp_path)
-    backend = FakeBackend(json.dumps({"proposals": [{
+    backend = FakeBackend({"qa1": json.dumps({"proposals": [{
         "instruction": "Inspect   the visible handoff.",
         "source_qa_ids": ["qa1"], "proposer_diagnosis": "first",
     }, {
         "instruction": "Inspect the visible handoff.",
         "source_qa_ids": ["qa1"], "proposer_diagnosis": "second",
-    }]}))
+    }]})})
     proposer = LLMPromptDeltaProposer(
-        backend=backend, maximum_deltas_per_video=2,
+        backend=backend, maximum_deltas_per_qa=2,
         selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
         global_inspection_boundary_tolerance_seconds=10)
     plans = proposer.propose(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         output_directory=str(tmp_path / "dedup"))
-    assert len(plans) == 1
-    assert plans[0].prompt_delta.instruction == "Inspect the visible handoff."
+    qa1_plans = [plan for plan in plans
+                 if plan.prompt_delta.source_qa_ids == ("qa1",)]
+    assert len(qa1_plans) == 2
+    assert [plan.prompt_delta.instruction for plan in qa1_plans] == [
+        "Inspect   the visible handoff.", "Inspect the visible handoff."]
+    assert len({plan.prompt_delta.delta_id for plan in qa1_plans}) == 2
 
 
 def test_provider_preflight_uses_exact_injected_counter_without_call():
@@ -270,15 +292,16 @@ def test_provider_preflight_uses_exact_injected_counter_without_call():
     assert transports == []
 
 
-def test_full_overflow_splits_in_stable_qa_order_without_truncation(tmp_path):
+def test_proposer_always_calls_each_qa_in_stable_isolated_order(tmp_path):
     manifest = _baseline(tmp_path)
     backend = FakeBackend(full_fits=False)
     proposer = LLMPromptDeltaProposer(
-        backend=backend, maximum_deltas_per_video=2,
+        backend=backend, maximum_deltas_per_qa=2,
         selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
         global_inspection_boundary_tolerance_seconds=10)
     plans = proposer.propose(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         output_directory=str(tmp_path / "split"))
 
     assert [row["request_scope"]["qa_ids"] for row in backend.payloads] == [
@@ -288,28 +311,188 @@ def test_full_overflow_splits_in_stable_qa_order_without_truncation(tmp_path):
     manifest_value = json.loads(
         (tmp_path / "split/request_manifest.json").read_text())
     assert manifest_value["request_identity"]["split_mode"] == \
-        "deterministic_per_qa"
+        "isolated_per_qa"
     assert manifest_value[
         "truncation_filtering_sampling_or_intra_qa_split"] is False
+    assert all(row["minimum_proposals"] == 1 for row in
+               manifest_value["requests"])
+    assert all(row["maximum_proposals"] == 2 for row in
+               manifest_value["requests"])
+    serialized = [dumps_canonical(row) for row in backend.payloads]
+    assert "Who remained?" not in serialized[0]
+    assert "What happened?" not in serialized[1]
 
 
-def test_context_ineligible_qa_is_skipped_while_other_qa_runs(tmp_path):
+def test_three_eligible_qas_create_three_sibling_free_requests(tmp_path):
+    manifest = Path(_baseline(tmp_path))
+    baseline = json.loads(manifest.read_text())
+    qa_path = Path(baseline["baseline_qas_path"])
+    qas = [json.loads(line) for line in qa_path.read_text().splitlines()]
+    qa3_trajectory = _jsonl(tmp_path / "qa3/trajectory.jsonl", ({
+        "role": "assistant", "content": "Inspect 00:00:00."},))
+    qas.append({
+        **qas[0], "question_id": "qa3", "question": "Where did it occur?",
+        "provider_index": 3, "trajectory_path": qa3_trajectory,
+        "reference_sets": {
+            **qas[0]["reference_sets"],
+            "explicitly_cited_segments": ["0_10"],
+            "frame_inspected_segments": [],
+        },
+    })
+    qa_path.write_text(
+        "".join(dumps_canonical(row) + "\n" for row in qas),
+        encoding="utf-8")
+    source_before = {path: path.read_bytes() for path in tmp_path.rglob("*")
+                     if path.is_file()}
+    backend = FakeBackend()
+    proposer = LLMPromptDeltaProposer(
+        backend=backend, maximum_deltas_per_qa=2,
+        selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
+        global_inspection_boundary_tolerance_seconds=10)
+
+    plans = proposer.propose(
+        str(manifest), parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
+        output_directory=str(tmp_path / "three-qa-proposals"))
+
+    assert backend.calls == 3
+    assert [row["request_scope"]["qa_ids"] for row in backend.payloads] == [
+        ["qa1"], ["qa2"], ["qa3"]]
+    questions = ["What happened?", "Who remained?", "Where did it occur?"]
+    for index, payload in enumerate(backend.payloads):
+        serialized = dumps_canonical(payload)
+        assert payload["qa_records"][0]["question"] == questions[index]
+        assert all(question not in serialized
+                   for question in questions if question != questions[index])
+    assert {plan.prompt_delta.source_qa_ids for plan in plans} == {
+        ("qa1",), ("qa2",), ("qa3",)}
+    assert {path: path.read_bytes() for path in source_before} == source_before
+
+
+def test_completed_per_qa_raw_responses_are_reused_on_resume(tmp_path):
+    manifest = _baseline(tmp_path)
+    backend = FakeBackend()
+    proposer = LLMPromptDeltaProposer(
+        backend=backend, maximum_deltas_per_qa=1,
+        selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
+        global_inspection_boundary_tolerance_seconds=10)
+    output = tmp_path / "resume"
+    first = proposer.propose(
+        manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
+        output_directory=str(output))
+    (output / "proposal_plans.json").unlink()
+    backend.calls = 0
+    backend.payloads.clear()
+
+    resumed = proposer.propose(
+        manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
+        output_directory=str(output))
+
+    assert resumed == first
+    assert backend.calls == 0
+    assert backend.payloads == []
+
+
+def test_candidate_joint_view_recaption_and_all_sibling_qa_rerun(
+        tmp_path, monkeypatch):
+    manifest = _baseline(tmp_path / "baseline")
+    monkeypatch.setattr(
+        "surrogate_rollout.optimization.fresh_prompt_delta_evidence."
+        "validate_composed_text", lambda _text, _contract: ())
+
+    caption_calls = []
+    qa_calls = []
+
+    class _Captioner:
+        configuration_identity = {"captioner": "fixture"}
+
+        def caption(self, **kwargs):
+            caption_calls.append(kwargs["segment_id"])
+            return SimpleNamespace(parsed={
+                "clip_description": f"changed {kwargs['segment_id']}"})
+
+    class _Mixed:
+        def build(self, **kwargs):
+            selected = sorted(kwargs["selected_clip_ids"])
+            return SimpleNamespace(
+                captions_path=str(tmp_path / "mixed-captions.json"),
+                captions_hash="mixed-hash", database_path=str(
+                    tmp_path / "mixed-database.json"),
+                selected_clip_ids=selected, replaced_clip_ids=selected)
+
+    def qa_fn(**kwargs):
+        qa_calls.append(kwargs["question_id"])
+        qa_dir = Path(kwargs["run_dir"])
+        qa_dir.mkdir(parents=True, exist_ok=True)
+        _jsonl(qa_dir / "trajectory.jsonl", ({
+            "role": "assistant", "content": "done"},))
+        return SimpleNamespace(
+            errors=(), prediction=("A" if kwargs["question_id"] == "qa1"
+                                   else "B"),
+            score=(1.0 if kwargs["question_id"] == "qa1" else 0.0))
+
+    delta = PromptDelta(
+        "delta-qa1", "Describe the visible continuity.", ("qa1",),
+        "The source trajectory omitted continuity.")
+    plan = PromptDeltaExecutionPlan(
+        prompt_delta=delta, selected_segment_ids=("0_10", "10_20"),
+        selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
+        frame_inspection_classification_hash=_source_qa_classification_hash(
+            next(row for row in _qa_segment_selection_records(
+                manifest, global_inspection_boundary_tolerance_seconds=10)
+                 if row["qa_id"] == "qa1"), tolerance_seconds=10),
+        global_inspection_boundary_tolerance_seconds=10)
+    runner = PromptDeltaInterventionRunner(
+        segment_captioner=_Captioner(), sample_loader=lambda _index: {},
+        merge_prompt="merge", caption_cache_root=str(tmp_path / "cache"),
+        caption_cache_manifest_path=str(tmp_path / "cache.jsonl"),
+        composition_separator="\n", qa_fn=qa_fn,
+        clip_index_fn=lambda _sample, _video: [
+            ("0_10", {}), ("10_20", {}), ("20_30", {})],
+        mixed_view_builder=_Mixed(), dvd_max_iterations=1, gpu=None,
+        scaffold_contract=None)
+
+    episode = runner.run(
+        baseline_video_manifest_path=manifest,
+        parent_meta_prompt_id="meta_parent", plan=plan,
+        output_directory=str(tmp_path / "intervention"))
+
+    assert caption_calls == ["0_10", "10_20"]
+    assert qa_calls == ["qa1", "qa2"]
+    assert [row.is_source_qa for row in episode.qa_outcomes] == [True, False]
+    assert [(row.baseline_correct, row.intervention_correct)
+            for row in episode.qa_outcomes] == [(False, True), (True, False)]
+    assert episode.mixed_view_identity == {
+        "delta_id": "delta-qa1", "captions_hash": "mixed-hash",
+        "selected_segment_ids": ("0_10", "10_20"),
+        "replaced_segment_ids": ("0_10", "10_20"),
+    }
+
+
+def test_oversized_single_qa_is_recorded_without_payload_modification(tmp_path):
     manifest = _baseline(tmp_path)
     backend = FakeBackend(full_fits=False, oversized_qa={"qa2"})
     proposer = LLMPromptDeltaProposer(
-        backend=backend, maximum_deltas_per_video=2,
+        backend=backend, maximum_deltas_per_qa=2,
         selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
         global_inspection_boundary_tolerance_seconds=10)
     plans = proposer.propose(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         output_directory=str(tmp_path / "overflow"))
     assert backend.calls == 1
-    assert [plan.prompt_delta.source_qa_ids for plan in plans] == [("qa1",)]
-    ineligible = json.loads(
-        (tmp_path / "overflow/context_ineligible.json").read_text())
-    assert ineligible["truncation_performed"] is False
-    assert ineligible["provider_call_performed_for_ineligible_qa"] is False
-    assert ineligible["offending_requests"][0]["qa_ids"] == ["qa2"]
+    assert [plan.prompt_delta.source_qa_ids for plan in plans] == [
+        ("qa1",)]
+    assert (tmp_path / "overflow/context_ineligible.json").exists()
+    request_manifest = json.loads(
+        (tmp_path / "overflow/request_manifest.json").read_text())
+    assert request_manifest[
+        "truncation_filtering_sampling_or_intra_qa_split"] is False
+    assert request_manifest["context_ineligible_qa_ids"] == ["qa2"]
+    assert request_manifest[
+        "truncation_filtering_sampling_or_intra_qa_split"] is False
     audit = json.loads(
         (tmp_path / "overflow/selection_audit.json").read_text())
     qa2 = next(row for row in audit["qa_records"] if row["qa_id"] == "qa2")
@@ -323,13 +506,15 @@ def test_fresh_proposer_fails_closed_on_invalid_source_scope(tmp_path):
         "instruction": "x", "source_qa_ids": ["unknown"],
         "proposer_diagnosis": "y"}]}))
     proposer = LLMPromptDeltaProposer(
-        backend=backend, maximum_deltas_per_video=1,
+        backend=backend, maximum_deltas_per_qa=1,
         selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
         global_inspection_boundary_tolerance_seconds=10)
     with pytest.raises(FreshPromptDeltaError, match="content is invalid"):
         proposer.propose(
             manifest, parent_meta_prompt_id="meta_parent",
+            parent_meta_prompt_text="Current parent instruction.",
             output_directory=str(tmp_path / "bad"))
+    assert backend.calls == 1
 
 
 def test_empty_localized_evidence_skips_provider_and_records_no_evidence(tmp_path):
@@ -350,12 +535,13 @@ def test_empty_localized_evidence_skips_provider_and_records_no_evidence(tmp_pat
     qa_path.write_text("".join(dumps_canonical(row) + "\n" for row in qas))
     backend = FakeBackend()
     proposer = LLMPromptDeltaProposer(
-        backend=backend, maximum_deltas_per_video=2,
+        backend=backend, maximum_deltas_per_qa=2,
         selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
         global_inspection_boundary_tolerance_seconds=10)
 
     plans = proposer.propose(
         str(manifest), parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         output_directory=str(tmp_path / "no_evidence"))
 
     assert plans == ()
@@ -405,16 +591,17 @@ def test_rejected_frame_inspect_arguments_are_audit_only_not_localization(
     assert row["intervention_candidate_segments"] == ["10_20"]
 
 
-def test_all_localized_qas_context_ineligible_is_normal_no_evidence(tmp_path):
+def test_all_oversized_localized_qas_skip_without_provider_calls(tmp_path):
     manifest = _baseline(tmp_path)
     backend = FakeBackend(full_fits=False, oversized_qa={"qa1", "qa2"})
     proposer = LLMPromptDeltaProposer(
-        backend=backend, maximum_deltas_per_video=2,
+        backend=backend, maximum_deltas_per_qa=2,
         selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
         global_inspection_boundary_tolerance_seconds=10)
 
     plans = proposer.propose(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         output_directory=str(tmp_path / "all_context_ineligible"))
 
     assert plans == ()
@@ -431,15 +618,16 @@ def test_all_localized_qas_context_ineligible_is_normal_no_evidence(tmp_path):
 def test_intervention_rejects_retrieved_but_not_explicitly_cited_segment(
         tmp_path):
     manifest = _baseline(tmp_path)
-    backend = FakeBackend(json.dumps({"proposals": [{
+    backend = FakeBackend({"qa1": json.dumps({"proposals": [{
         "instruction": "Inspect continuity.", "source_qa_ids": ["qa1"],
-        "proposer_diagnosis": "diagnosis"}]}))
+        "proposer_diagnosis": "diagnosis"}]})})
     proposer = LLMPromptDeltaProposer(
-        backend=backend, maximum_deltas_per_video=1,
+        backend=backend, maximum_deltas_per_qa=1,
         selection_policy=PROMPT_DELTA_SEGMENT_SELECTION_POLICY,
         global_inspection_boundary_tolerance_seconds=10)
     valid_plan = proposer.propose(
         manifest, parent_meta_prompt_id="meta_parent",
+        parent_meta_prompt_text="Current parent instruction.",
         output_directory=str(tmp_path / "proposal_for_scope"))[0]
     plan = replace(valid_plan, selected_segment_ids=("20_30",))
     runner = PromptDeltaInterventionRunner(
@@ -511,7 +699,7 @@ def test_fresh_component_schema_and_exact_counter_contract(tmp_path):
     assert count.total_input_tokens > 0
 
 
-def test_completed_pre_contract_baseline_resume_is_read_only(tmp_path):
+def test_completed_baseline_resume_is_read_only(tmp_path):
     root = tmp_path / "baseline"
     video_root = root / "baseline" / "v1"
     required_paths = {}
@@ -534,7 +722,7 @@ def test_completed_pre_contract_baseline_resume_is_read_only(tmp_path):
         "status": "completed", "run_id": "baseline_old_identity",
         "selected_video_ids": ["v1"], "baseline_qa_count": 1,
         "video_manifest_paths": [video_manifest],
-        "property_proposal_paths": [], "property_retrieval_paths": [],
+        "prompt_delta_source_paths": [],
             "provisional_state_path": provisional,
             "next_coverage_state": {
                 "rotation_order": [

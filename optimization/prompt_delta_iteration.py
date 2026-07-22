@@ -19,6 +19,16 @@ from surrogate_rollout.optimization.episode_feedback import (
     evaluate_episode_feedback_eligibility,
 )
 from surrogate_rollout.optimization.meta_prompt_updater import MetaPromptUpdater
+from surrogate_rollout.optimization.llm_episode_feedback import (
+    LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION,
+)
+from surrogate_rollout.optimization.feedback_memory import (
+    append_parent_feedback_memory_bank,
+    archive_parent_feedback_memory_bank,
+    build_episode_feedback_memory_record,
+    initialize_parent_feedback_memory_bank,
+    load_parent_feedback_memory_bank,
+)
 from surrogate_rollout.optimization.schemas import (
     EpisodeFeedback,
     InterventionEpisode,
@@ -304,6 +314,7 @@ def build_feedback_grounding(
     for outcome in episode.qa_outcomes:
         transitions[classify_qa_transition(outcome)].append(outcome.qa_id)
     unchanged = not changed
+    has_positive_flip = bool(transitions["wrong_to_correct"])
     return {
         "schema_version": "episode_feedback_grounding_v1",
         "feedback_id": feedback.feedback_id,
@@ -312,7 +323,9 @@ def build_feedback_grounding(
         "changed_segment_ids": list(changed),
         "qa_transition_summary": transitions,
         "qa_flip_attribution": (
-            "uncertain_noop_no_caption_change" if unchanged else
+            "positive_episode_signal_without_caption_change"
+            if unchanged and has_positive_flip else
+            "no_positive_signal_without_caption_change" if unchanged else
             "episode_level_with_caption_change"),
     }
 
@@ -475,6 +488,8 @@ class PromptDeltaIterationOrchestrator:
         candidate_created_at: str,
         output_directory: str,
         state_directory: str,
+        feedback_memory_bank_directory: str,
+        historical_memory_character_budget: int | None = None,
         initialize_parent_pointer: bool = False,
     ) -> PromptDeltaIterationResult:
         if not iteration_id:
@@ -496,6 +511,9 @@ class PromptDeltaIterationOrchestrator:
                 "confirmation set is smaller than minimum_sample_count")
         if not candidate_created_at:
             raise ValueError("candidate_created_at must be explicit")
+        if not isinstance(feedback_memory_bank_directory, str) or not \
+                feedback_memory_bank_directory:
+            raise ValueError("feedback_memory_bank_directory is required")
 
         output = os.path.abspath(output_directory)
         state = os.path.abspath(state_directory)
@@ -512,6 +530,10 @@ class PromptDeltaIterationOrchestrator:
             "cache_reset_identity": cache_reset_identity,
             "evaluation_pipeline_identity": evaluation_pipeline_identity,
             "candidate_created_at": candidate_created_at,
+            "feedback_memory_bank_directory": os.path.abspath(
+                feedback_memory_bank_directory),
+            "historical_memory_character_budget": (
+                historical_memory_character_budget),
             "components": {
                 "feedback_generator": _component_identity(
                     self.feedback_generator),
@@ -560,15 +582,49 @@ class PromptDeltaIterationOrchestrator:
                 "artifact_sha256": _file_sha256(parent_state_path),
             })
 
+        historical_memories = load_parent_feedback_memory_bank(
+            feedback_memory_bank_directory, parent.meta_prompt_id)
         feedbacks = []
         grounding = []
+        iteration_memories = []
         for index, episode in enumerate(episodes):
             stage = os.path.join(output, "feedback", f"{index:03d}_{episode.episode_id}")
             feedback_path = os.path.join(stage, "feedback.json")
             eligibility_path = os.path.join(stage, "eligibility.json")
             grounding_path = os.path.join(stage, "grounding.json")
+            memory_path = os.path.join(stage, "compact_memory.json")
             if os.path.isfile(feedback_path):
-                feedback = episode_feedback_from_json(_read_object(feedback_path))
+                if callable(getattr(
+                        self.feedback_generator, "generate_to_directory", None)):
+                    required_trace_paths = {
+                        name: os.path.join(stage, name) for name in (
+                            "request.json", "provider_request.json",
+                            "request_manifest.json", "raw_response.json")
+                    }
+                    missing = [name for name, path in required_trace_paths.items()
+                               if not os.path.isfile(path)]
+                    if missing:
+                        raise PromptDeltaIterationConflictError(
+                            "saved feedback predates the active lean request "
+                            f"contract; remove this feedback stage and resume: "
+                            f"{stage}; missing={missing!r}")
+                    request_payload = _read_object(
+                        required_trace_paths["request.json"])
+                    request_manifest = _read_object(
+                        required_trace_paths["request_manifest.json"])
+                    if request_payload.get("schema_version") != \
+                            LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION or \
+                            request_manifest.get("request_schema_version") != \
+                            LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION or \
+                            request_manifest.get("episode_id") != \
+                            episode.episode_id or \
+                            request_manifest.get("model_payload_hash") != \
+                            sha256_json(request_payload):
+                        raise PromptDeltaIterationConflictError(
+                            "saved feedback request trace does not match the "
+                            "active lean request contract")
+                saved_feedback_data = _read_object(feedback_path)
+                feedback = episode_feedback_from_json(saved_feedback_data)
                 eligibility = _read_object(eligibility_path)
                 grounded = _read_object(grounding_path)
                 if not eligibility.get("eligible"):
@@ -577,7 +633,7 @@ class PromptDeltaIterationOrchestrator:
                 if eligibility.get("feedback_id") != feedback.feedback_id or \
                         eligibility.get("episode_id") != episode.episode_id or \
                         eligibility.get("feedback_sha256") != sha256_json(
-                            _plain(feedback)):
+                            saved_feedback_data):
                     raise PromptDeltaIterationConflictError(
                         "saved feedback eligibility provenance mismatch")
                 if dumps_canonical(grounded) != dumps_canonical(
@@ -585,7 +641,12 @@ class PromptDeltaIterationOrchestrator:
                     raise PromptDeltaIterationConflictError(
                         "saved feedback grounding mismatch")
             else:
-                feedback = self.feedback_generator.generate(episode)
+                generate_to_directory = getattr(
+                    self.feedback_generator, "generate_to_directory", None)
+                feedback = (
+                    generate_to_directory(episode, stage)
+                    if callable(generate_to_directory) else
+                    self.feedback_generator.generate(episode))
                 eligibility_record = evaluate_episode_feedback_eligibility(
                     feedback, episode)
                 _write_once(eligibility_path, eligibility_record)
@@ -597,6 +658,23 @@ class PromptDeltaIterationOrchestrator:
                 _write_once(feedback_path, feedback)
             feedbacks.append(feedback)
             grounding.append(grounded)
+            expected_memory = build_episode_feedback_memory_record(
+                feedback=feedback, episode=episode, iteration_id=iteration_id,
+                parent_meta_prompt_id=parent.meta_prompt_id,
+                feedback_artifact_ref=feedback_path)
+            expected_payload = {
+                "schema_version": "iteration_episode_feedback_memory_v2",
+                "record": expected_memory,
+            }
+            if os.path.isfile(memory_path):
+                if dumps_canonical(_read_object(memory_path)) != \
+                        dumps_canonical(_plain(expected_payload)):
+                    raise PromptDeltaIterationConflictError(
+                        "saved compact feedback memory mismatch")
+            else:
+                _write_once(memory_path, expected_payload)
+            if expected_memory is not None:
+                iteration_memories.append(expected_memory)
 
         updater_path = os.path.join(output, "updater_result.json")
         if os.path.isfile(updater_path):
@@ -604,10 +682,21 @@ class PromptDeltaIterationOrchestrator:
             decision = meta_prompt_update_decision_from_json(
                 saved_update["decision"])
             candidate_id = saved_update.get("candidate_meta_prompt_id")
-            validate_meta_prompt_update_decision(decision, tuple(feedbacks))
+            known_feedback_ids = {item.feedback_id for item in feedbacks}
+            known_feedback_ids.update(
+                item.feedback_id for item in historical_memories)
+            unknown = set(decision.supporting_feedback_ids) - known_feedback_ids
+            if unknown:
+                raise PromptDeltaIterationConflictError(
+                    f"saved updater result references unknown memory: {unknown}")
         else:
             update = self.updater.update(
-                parent, tuple(feedbacks), feedback_grounding=tuple(grounding))
+                parent, tuple(feedbacks),
+                feedback_grounding=tuple(grounding),
+                historical_memories=historical_memories,
+                current_iteration_id=iteration_id,
+                historical_memory_character_budget=(
+                    historical_memory_character_budget))
             decision = update.decision
             candidate_id = update.candidate_meta_prompt_id
             _write_once(updater_path, {
@@ -622,6 +711,13 @@ class PromptDeltaIterationOrchestrator:
                 "backend_metadata": update.backend_metadata,
                 "raw_response": update.raw_response,
             })
+
+        # Current compact text is deliberately appended only after the single
+        # updater decision. It therefore becomes historical evidence starting
+        # with the next iteration under this same parent.
+        memory_bank = append_parent_feedback_memory_bank(
+            feedback_memory_bank_directory, parent.meta_prompt_id,
+            tuple(iteration_memories))
 
         pointer = _read_valid_pointer(pointer_path)
         if decision.decision == "no_update":
@@ -639,6 +735,7 @@ class PromptDeltaIterationOrchestrator:
                 "candidate_meta_prompt_id": None,
                 "input_identity_path": identity_path,
                 "updater_result_path": updater_path,
+                "feedback_memory_bank": memory_bank,
                 "source_hashes_before": source_before,
                 "source_hashes_after": source_after,
             }
@@ -706,6 +803,11 @@ class PromptDeltaIterationOrchestrator:
                 })
             active_id = candidate.meta_prompt_id
             status = "promoted"
+            archived_memory_bank = archive_parent_feedback_memory_bank(
+                feedback_memory_bank_directory, parent.meta_prompt_id,
+                promoted_meta_prompt_id=candidate.meta_prompt_id)
+            new_parent_memory_bank = initialize_parent_feedback_memory_bank(
+                feedback_memory_bank_directory, candidate.meta_prompt_id)
         else:
             if pointer.get("active_meta_prompt_id") != parent.meta_prompt_id:
                 raise PromptDeltaIterationConflictError(
@@ -718,6 +820,8 @@ class PromptDeltaIterationOrchestrator:
             _write_once(os.path.join(output, "rejected_meta_prompt.json"), rejected)
             active_id = parent.meta_prompt_id
             status = "rolled_back"
+            archived_memory_bank = None
+            new_parent_memory_bank = None
 
         source_after = _source_hashes(episodes)
         if source_after != source_before:
@@ -730,6 +834,9 @@ class PromptDeltaIterationOrchestrator:
             "candidate_meta_prompt_id": candidate.meta_prompt_id,
             "input_identity_path": identity_path,
             "updater_result_path": updater_path,
+            "feedback_memory_bank": memory_bank,
+            "archived_parent_feedback_memory_bank": archived_memory_bank,
+            "new_parent_feedback_memory_bank": new_parent_memory_bank,
             "provisional_meta_prompt_path": provisional_path,
             "confirmation_request_path": request_path,
             "confirmation_result_path": confirmation_path,

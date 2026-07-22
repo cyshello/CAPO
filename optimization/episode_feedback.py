@@ -182,6 +182,12 @@ class DeterministicMockEpisodeFeedbackGenerator:
             generator_diagnosis=MOCK_GENERATOR_DIAGNOSIS,
             recommended_strategy_change=MOCK_RECOMMENDED_STRATEGY_CHANGE,
             confidence=DETERMINISTIC_CONFIDENCE_MARKER,
+            compact_memory_text=(
+                "Context: The stored intervention episode contains selected "
+                "caption changes and sibling QA outcomes.\n"
+                "Experience: Deterministic mock feedback records the observed "
+                "caption and correctness differences without semantic attribution."
+            ),
         )
         validate_episode_feedback(feedback, episode)
         return feedback
@@ -201,32 +207,7 @@ def evaluate_episode_feedback_eligibility(
     try:
         validate_episode_feedback(feedback, episode)
     except (TypeError, ValueError) as exc:
-        reasons.append(f"schema_or_transition_validation_failed: {exc}")
-
-    for collection_name in ("observations", "counterevidence"):
-        for index, item in enumerate(getattr(feedback, collection_name)):
-            location = f"{collection_name}[{index}]"
-            if not item.supporting_segment_ids and not item.supporting_qa_ids:
-                reasons.append(f"{location}: no supporting IDs")
-            if item.evidence_type == "caption_change" and (
-                    not item.supporting_segment_ids or item.supporting_qa_ids):
-                reasons.append(
-                    f"{location}: caption_change requires only segment IDs")
-            elif item.evidence_type == "qa_transition" and (
-                    item.supporting_segment_ids or not item.supporting_qa_ids):
-                reasons.append(
-                    f"{location}: qa_transition requires only QA IDs")
-            elif item.evidence_type in ("trajectory", "mixed") and (
-                    not item.supporting_segment_ids or
-                    not item.supporting_qa_ids):
-                reasons.append(
-                    f"{location}: trajectory-linked evidence requires both "
-                    "segment and QA IDs")
-
-    if not feedback.generator_diagnosis.strip():
-        reasons.append("generator_diagnosis is empty")
-    if not feedback.recommended_strategy_change.strip():
-        reasons.append("recommended_strategy_change is empty")
+        reasons.append(f"episode_identity_validation_failed: {exc}")
 
     return EpisodeFeedbackEligibility(
         schema_version=EPISODE_FEEDBACK_ELIGIBILITY_POLICY_VERSION,

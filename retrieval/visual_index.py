@@ -1,16 +1,4 @@
-"""Cached per-video frame-embedding index (PHASE2_3 §6).
-
-Embeds the same decoded frames the DVD captioner consumes (frames_fps{f}) with
-SigLIP once per video, preserving the frame-to-clip mapping used by
-dvd_captioning._build_clips (t_i = i * duration / n, contiguous CLIP_SECS
-windows). Embeddings are L2-normalized at build time; retrieval is a batched
-matrix product against normalized text embeddings. The captioner VLM is never
-loaded for retrieval.
-
-Cache key: video_id, vision model, frame-sampling config, frame-source hash,
-preprocessing version. The index is deterministic given those inputs; the
-embedder is injectable so tests build indexes without model weights.
-"""
+"""Cached per-video frame-embedding index (PHASE2_3 §6)."""
 
 from __future__ import annotations
 
@@ -34,7 +22,6 @@ _LIVE_ISOLATED_EMBEDDERS: set["ProcessIsolatedSiglipEmbedder"] = set()
 
 
 def frames_source_hash(frames_dir: str) -> str:
-    """Identity of the exact frame files (sorted name + size)."""
     entries = sorted(
         (f, os.path.getsize(os.path.join(frames_dir, f)))
         for f in os.listdir(frames_dir) if f.endswith(".jpg")
@@ -64,17 +51,17 @@ def index_cache_key(
 class VisualIndex:
     video_id: str
     model_id: str
-    frame_names: list[str]        # sorted jpg basenames
-    clip_ids: list[str]           # per-frame clip key
-    timestamps: list[float]       # per-frame seconds
-    embeddings: np.ndarray        # (n_frames, dim) float32, L2-normalized
+    frame_names: list[str]
+    clip_ids: list[str]
+    timestamps: list[float]
+    embeddings: np.ndarray
     key: dict
 
     @property
     def all_clip_ids(self) -> list[str]:
         seen: dict[str, None] = {}
-        for c in self.clip_ids:
-            seen.setdefault(c)
+        for clip_id in self.clip_ids:
+            seen.setdefault(clip_id)
         return list(seen)
 
 
@@ -99,66 +86,75 @@ def build_visual_index(
     if not names:
         raise ValueError(f"no frames in {frames_dir}")
     n = len(names)
-    ts = [i * duration / n for i in range(n)]
-    clip_ids = [clip_key_for_time(t, duration, clip_secs) for t in ts]
-
-    emb = np.asarray(
+    timestamps = [i * duration / n for i in range(n)]
+    clip_ids = [clip_key_for_time(t, duration, clip_secs) for t in timestamps]
+    embeddings = np.asarray(
         embed_images_fn([os.path.join(frames_dir, f) for f in names]),
         dtype=np.float32,
     )
-    norms = np.linalg.norm(emb, axis=1, keepdims=True)
-    emb = emb / np.clip(norms, 1e-12, None)
-
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embeddings = embeddings / np.clip(norms, 1e-12, None)
     key = index_cache_key(
-        video_id=video_id, frames_dir=frames_dir, model_id=model_id,
-        sample_fps=sample_fps, clip_secs=clip_secs,
+        video_id=video_id,
+        frames_dir=frames_dir,
+        model_id=model_id,
+        sample_fps=sample_fps,
+        clip_secs=clip_secs,
         preprocessing_version=preprocessing_version,
     )
-    return VisualIndex(video_id=video_id, model_id=model_id, frame_names=names,
-                       clip_ids=clip_ids, timestamps=ts, embeddings=emb, key=key)
+    return VisualIndex(
+        video_id=video_id, model_id=model_id, frame_names=names,
+        clip_ids=clip_ids, timestamps=timestamps, embeddings=embeddings, key=key)
 
 
-# ------------------------------ persistence -------------------------------- #
 def index_dir(key: dict, root: str | None = None) -> str:
     root = root or config.VISUAL_INDEX_ROOT
     return os.path.join(root, key["video_id"], sha256_json(key)[:16])
 
 
 def save_visual_index(index: VisualIndex, root: str | None = None) -> str:
-    d = index_dir(index.key, root)
-    os.makedirs(d, exist_ok=True)
-    np.savez_compressed(os.path.join(d, "embeddings.npz"), embeddings=index.embeddings)
-    with open(os.path.join(d, "meta.json"), "w") as f:
+    directory = index_dir(index.key, root)
+    os.makedirs(directory, exist_ok=True)
+    np.savez_compressed(
+        os.path.join(directory, "embeddings.npz"), embeddings=index.embeddings)
+    with open(os.path.join(directory, "meta.json"), "w") as handle:
         json.dump({
-            "video_id": index.video_id, "model_id": index.model_id,
-            "frame_names": index.frame_names, "clip_ids": index.clip_ids,
-            "timestamps": index.timestamps, "key": index.key,
-        }, f)
-    return d
+            "video_id": index.video_id,
+            "model_id": index.model_id,
+            "frame_names": index.frame_names,
+            "clip_ids": index.clip_ids,
+            "timestamps": index.timestamps,
+            "key": index.key,
+        }, handle)
+    return directory
 
 
 def load_visual_index(key: dict, root: str | None = None) -> VisualIndex | None:
-    d = index_dir(key, root)
-    meta_p, emb_p = os.path.join(d, "meta.json"), os.path.join(d, "embeddings.npz")
-    if not (os.path.exists(meta_p) and os.path.exists(emb_p)):
+    directory = index_dir(key, root)
+    meta_path = os.path.join(directory, "meta.json")
+    embeddings_path = os.path.join(directory, "embeddings.npz")
+    if not (os.path.exists(meta_path) and os.path.exists(embeddings_path)):
         return None
-    with open(meta_p) as f:
-        meta = json.load(f)
+    with open(meta_path) as handle:
+        meta = json.load(handle)
     if meta["key"] != key:
-        raise ValueError(f"visual index cache key mismatch in {d}")  # abort, never reuse
-    emb = np.load(emb_p)["embeddings"]
-    return VisualIndex(video_id=meta["video_id"], model_id=meta["model_id"],
-                       frame_names=meta["frame_names"], clip_ids=meta["clip_ids"],
-                       timestamps=meta["timestamps"], embeddings=emb, key=key)
+        raise ValueError(f"visual index cache key mismatch in {directory}")
+    embeddings = np.load(embeddings_path)["embeddings"]
+    return VisualIndex(
+        video_id=meta["video_id"], model_id=meta["model_id"],
+        frame_names=meta["frame_names"], clip_ids=meta["clip_ids"],
+        timestamps=meta["timestamps"], embeddings=embeddings, key=key)
 
 
-# ------------------------------ SigLIP embedder ----------------------------- #
 class SiglipEmbedder:
-    """Lazy SigLIP image/text embedder (HF transformers, local cache)."""
+    """Lazy SigLIP image/text embedder."""
 
-    def __init__(self, model_id: str = config.VISUAL_INDEX_MODEL_ID,
-                 device: str | None = None,
-                 batch_size: int = config.VISUAL_INDEX_BATCH_SIZE) -> None:
+    def __init__(
+        self,
+        model_id: str = config.VISUAL_INDEX_MODEL_ID,
+        device: str | None = None,
+        batch_size: int = config.VISUAL_INDEX_BATCH_SIZE,
+    ) -> None:
         self.model_id = model_id
         self.batch_size = batch_size
         self._device = device
@@ -186,17 +182,19 @@ class SiglipEmbedder:
 
         with self._inference_lock:
             model, processor = self._load()
-            out = []
+            outputs = []
             with torch.no_grad():
-                for i in range(0, len(paths), self.batch_size):
-                    imgs = [Image.open(p).convert("RGB")
-                            for p in paths[i:i + self.batch_size]]
+                for index in range(0, len(paths), self.batch_size):
+                    images = [
+                        Image.open(path).convert("RGB")
+                        for path in paths[index:index + self.batch_size]
+                    ]
                     inputs = processor(
-                        images=imgs, return_tensors="pt").to(self._device)
-                    feats = model.get_image_features(**inputs)
-                    out.append(feats.cpu().numpy())
-        emb = np.concatenate(out, axis=0).astype(np.float32)
-        return emb / np.clip(np.linalg.norm(emb, axis=1, keepdims=True), 1e-12, None)
+                        images=images, return_tensors="pt").to(self._device)
+                    outputs.append(model.get_image_features(**inputs).cpu().numpy())
+        embeddings = np.concatenate(outputs, axis=0).astype(np.float32)
+        return embeddings / np.clip(
+            np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-12, None)
 
     def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
         import torch
@@ -204,14 +202,15 @@ class SiglipEmbedder:
         with self._inference_lock:
             model, processor = self._load()
             with torch.no_grad():
-                inputs = processor(text=list(texts), padding="max_length",
-                                   return_tensors="pt").to(self._device)
-                feats = model.get_text_features(
+                inputs = processor(
+                    text=list(texts), padding="max_length",
+                    return_tensors="pt").to(self._device)
+                embeddings = model.get_text_features(
                     **inputs).cpu().numpy().astype(np.float32)
-        return feats / np.clip(np.linalg.norm(feats, axis=1, keepdims=True), 1e-12, None)
+        return embeddings / np.clip(
+            np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-12, None)
 
     def close(self) -> None:
-        """Release this process's model references and cached GPU allocator."""
         with self._inference_lock:
             with self._load_lock:
                 loaded = self._model is not None or self._processor is not None
@@ -232,7 +231,6 @@ class IsolatedSiglipWorkerError(RuntimeError):
 def _isolated_siglip_worker_main(
     connection, physical_gpu: str, model_id: str, batch_size: int,
 ) -> None:
-    """Own one physical GPU without inheriting the parent's logical ordinal."""
     os.environ["CUDA_VISIBLE_DEVICES"] = physical_gpu
     embedder = SiglipEmbedder(
         model_id=model_id, device="cuda:0", batch_size=batch_size)
@@ -274,7 +272,8 @@ class ProcessIsolatedSiglipEmbedder:
     """Serialize SigLIP requests through one GPU-owning spawn subprocess."""
 
     def __init__(
-        self, *, physical_gpu: str,
+        self, *,
+        physical_gpu: str,
         model_id: str = config.VISUAL_INDEX_MODEL_ID,
         batch_size: int = config.VISUAL_INDEX_BATCH_SIZE,
         startup_timeout_seconds: float = 30.0,
@@ -295,9 +294,6 @@ class ProcessIsolatedSiglipEmbedder:
             target=worker_target,
             args=(child_connection, physical_gpu, model_id, batch_size),
             name=f"siglip-gpu-{physical_gpu}", daemon=False)
-        # Spawn copies the environment before entering the child target. Set and
-        # restore it under a process-wide lock so even imports performed by the
-        # spawn bootstrap see only the dedicated physical GPU.
         with _PROCESS_ENVIRONMENT_LOCK:
             previous_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
             os.environ["CUDA_VISIBLE_DEVICES"] = physical_gpu
@@ -388,7 +384,6 @@ class ProcessIsolatedSiglipEmbedder:
 
 
 def close_all_isolated_siglip_embedders() -> tuple[dict[str, object], ...]:
-    """Best-effort run-boundary cleanup, including partial runtime builds."""
     with _ISOLATED_EMBEDDER_REGISTRY_LOCK:
         embedders = tuple(_LIVE_ISOLATED_EMBEDDERS)
     records = []

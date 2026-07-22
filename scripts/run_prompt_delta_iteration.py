@@ -21,6 +21,9 @@ from surrogate_rollout.optimization.episode_feedback import (
 from surrogate_rollout.optimization.meta_prompt_updater import (
     DeterministicMockMetaPromptUpdater,
 )
+from surrogate_rollout.optimization.meta_prompt_defaults import (
+    resolve_meta_prompt_artifact_path,
+)
 from surrogate_rollout.optimization.prompt_delta_iteration import (
     DeterministicMockMetaPromptConfirmationEvaluator,
     MetaPromptConfirmationCase,
@@ -69,13 +72,24 @@ def _parse_args(argv=None):
             "confirmation, and atomically promote or roll back. Real "
             "components are injected by an explicit module:callable factory."))
     parser.add_argument("--iteration-id", required=True)
-    parser.add_argument("--parent-meta-prompt", required=True)
+    parser.add_argument(
+        "--parent-meta-prompt",
+        help=("MetaPromptVersion JSON. Omit to use "
+              "optimization/prompts/init_meta_prompt.json."))
     parser.add_argument(
         "--update-episode", required=True, action="append",
         help="Ordered InterventionEpisode JSON; repeat for each update episode.")
     parser.add_argument("--confirmation-cases", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--state-dir", required=True)
+    parser.add_argument(
+        "--feedback-memory-bank-dir", required=True,
+        help=("Cumulative compact feedback memory bank directory; immutable "
+              "snapshots are appended idempotently across iterations."))
+    parser.add_argument(
+        "--historical-memory-character-budget", type=int,
+        help=("Optional explicit canonical-character budget for prior-iteration "
+              "memory text. Omit to include every prior memory for the parent."))
     parser.add_argument("--candidate-created-at", required=True)
     parser.add_argument("--model-identity", required=True)
     parser.add_argument("--decoding-settings", required=True)
@@ -108,7 +122,9 @@ def _parse_args(argv=None):
 def main(argv=None) -> int:
     args = _parse_args(argv)
     try:
-        parent = meta_prompt_version_from_json(_object(args.parent_meta_prompt))
+        parent_path = resolve_meta_prompt_artifact_path(
+            args.parent_meta_prompt)
+        parent = meta_prompt_version_from_json(_object(str(parent_path)))
         episodes = tuple(intervention_episode_from_json(_object(path))
                          for path in args.update_episode)
         cases = tuple(MetaPromptConfirmationCase(**item)
@@ -154,6 +170,9 @@ def main(argv=None) -> int:
                 candidate_created_at=args.candidate_created_at,
                 output_directory=args.output_dir,
                 state_directory=args.state_dir,
+                feedback_memory_bank_directory=args.feedback_memory_bank_dir,
+                historical_memory_character_budget=(
+                    args.historical_memory_character_budget),
                 initialize_parent_pointer=args.initialize_parent_pointer)
     except Exception as exc:
         print(f"prompt-delta iteration failed: {type(exc).__name__}: {exc}",

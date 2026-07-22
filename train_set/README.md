@@ -15,9 +15,13 @@ Selection is deterministic:
 
 This guarantees:
 
-- `10samples.txt` is a subset of `20samplestxt`;
-- `20samplestxt` is a subset of `50samples.txt`;
+- `10samples.txt` is a subset of `20samples.txt`;
+- `20samples.txt` is a subset of `50samples.txt`;
 - `confirmation.txt` contains 15 videos disjoint from all training cohorts.
+- `confirmation_5samples.txt` freezes the first five entries of that same
+  confirmation permutation for the bounded two-iteration 10-video pilot.
+- `confirmation_10samples.txt` freezes the first ten entries for the
+  four-iteration, five-video-per-iteration 20-video pilot.
 
 These files are selection manifests only. They do not modify the current
 Phase 4 `split_manifest.json`, runtime pointers, caches, or active train roles.

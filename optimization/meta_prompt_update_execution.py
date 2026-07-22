@@ -19,6 +19,10 @@ from surrogate_rollout.optimization.meta_prompt_updater import (
     build_meta_prompt_update_request,
     meta_prompt_update_response_json_schema,
 )
+from surrogate_rollout.optimization.context_budget import (
+    ContextTruncationResult,
+    fit_json_payload_to_token_budget,
+)
 from surrogate_rollout.optimization.schemas import (
     EpisodeFeedback,
     MetaPromptVersion,
@@ -99,6 +103,10 @@ class OpenAICompatibleMetaPromptUpdaterBackend:
         generation_settings: Mapping[str, Any],
         updater_policy_version: str,
         response_transport: MetaPromptUpdateProviderTransport,
+        tokenizer_identity: str | None = None,
+        exact_token_counter: Any | None = None,
+        context_limit: int | None = None,
+        context_safety_margin_tokens: int = 0,
     ) -> None:
         self.provider = _configured_string(provider, "provider")
         self.model_id = _configured_string(model_id, "model_id")
@@ -119,12 +127,35 @@ class OpenAICompatibleMetaPromptUpdaterBackend:
         if not callable(response_transport):
             raise ValueError("response_transport must be explicitly configured")
         self.response_transport = response_transport
+        configured_budget = (
+            tokenizer_identity is not None,
+            exact_token_counter is not None,
+            context_limit is not None,
+        )
+        if any(configured_budget) and not all(configured_budget):
+            raise ValueError(
+                "tokenizer_identity, exact_token_counter, and context_limit "
+                "must be configured together")
+        self.tokenizer_identity = tokenizer_identity
+        self.exact_token_counter = exact_token_counter
+        self.context_limit = context_limit
+        if not isinstance(context_safety_margin_tokens, int) or isinstance(
+                context_safety_margin_tokens, bool) or \
+                context_safety_margin_tokens < 0:
+            raise ValueError(
+                "context_safety_margin_tokens must be a non-negative integer")
+        self.context_safety_margin_tokens = context_safety_margin_tokens
+        if context_limit is not None:
+            _configured_positive_int(context_limit, "context_limit")
+            if not callable(exact_token_counter):
+                raise ValueError("exact_token_counter must be callable")
         self.call_count = 0
         self.response_schema = meta_prompt_update_response_json_schema()
         self.last_prepared_request: PreparedMetaPromptUpdateProviderRequest | None = None
         self.last_provider_response: Mapping[str, Any] | None = None
         self.last_raw_response: str | None = None
         self.last_usage: Mapping[str, Any] = {}
+        self.last_context_truncation: Mapping[str, Any] | None = None
 
     def prepare_messages(
         self, system_instruction: str, user_request: str,
@@ -166,6 +197,8 @@ class OpenAICompatibleMetaPromptUpdaterBackend:
     def __call__(self, system_instruction: str, user_request: str) -> str:
         if self.call_count:
             raise RuntimeError("updater backend is limited to exactly one call")
+        user_request, fitted = self.fit_user_request(
+            system_instruction, user_request)
         prepared = self.prepare_messages(system_instruction, user_request)
         self.last_prepared_request = prepared
         self.call_count += 1
@@ -188,6 +221,50 @@ class OpenAICompatibleMetaPromptUpdaterBackend:
         self.last_raw_response = raw
         return raw
 
+    def fit_user_request(
+        self, system_instruction: str, user_request: str,
+    ) -> tuple[str, ContextTruncationResult | None]:
+        if self.context_limit is None:
+            return user_request, None
+        try:
+            payload = json.loads(user_request)
+        except json.JSONDecodeError as exc:
+            raise TypeError("updater user request must be strict JSON") from exc
+        if not isinstance(payload, Mapping):
+            raise TypeError("updater user request must be a JSON object")
+
+        def measure(text: str) -> int:
+            messages = (
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": text},
+            )
+            value = self.exact_token_counter(messages)
+            total = getattr(value, "total_input_tokens", value)
+            if not isinstance(total, int) or isinstance(total, bool):
+                raise TypeError("exact_token_counter must return an exact count")
+            return total
+
+        maximum_input_tokens = (
+            int(self.context_limit) - self.maximum_output_tokens -
+            self.context_safety_margin_tokens)
+        if maximum_input_tokens <= 0:
+            raise ValueError(
+                "context limit cannot cover output reservation and provider "
+                "safety margin")
+        fitted = fit_json_payload_to_token_budget(
+            payload,
+            measure_input_tokens=measure,
+            maximum_input_tokens=maximum_input_tokens,
+        )
+        audit = fitted.audit_metadata()
+        previous = self.last_context_truncation
+        if not (previous and previous.get("transmitted_payload_hash") ==
+                audit["original_payload_hash"] and
+                previous.get("original_payload_hash") !=
+                previous.get("transmitted_payload_hash")):
+            self.last_context_truncation = audit
+        return fitted.serialized_payload, fitted
+
     def metadata(self) -> Mapping[str, Any]:
         value: dict[str, Any] = {
             "provider": self.provider,
@@ -196,6 +273,9 @@ class OpenAICompatibleMetaPromptUpdaterBackend:
             "generation_settings": self.generation_settings,
             "updater_policy_version": self.updater_policy_version,
             "provider_call_count": self.call_count,
+            "tokenizer_identity": self.tokenizer_identity,
+            "context_limit": self.context_limit,
+            "context_truncation": self.last_context_truncation,
         }
         if self.last_provider_response is not None:
             value["provider_response_id"] = self.last_provider_response.get("id")
@@ -238,9 +318,12 @@ def _load_parent(path: Path) -> MetaPromptVersion:
 
 
 def _load_feedback(path: Path) -> EpisodeFeedback:
-    value = _strict_object(
-        json.loads(path.read_text(encoding="utf-8")), _FEEDBACK_FIELDS,
-        "episode feedback artifact")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping) or set(value) not in (
+            _FEEDBACK_FIELDS, _FEEDBACK_FIELDS | {"compact_memory_text"}):
+        raise ValueError(
+            "episode feedback artifact must contain the detailed fields and "
+            "only the optional compact_memory_text field")
     for collection in ("observations", "counterevidence"):
         if not isinstance(value[collection], list):
             raise TypeError(f"EpisodeFeedback.{collection} must be an array")

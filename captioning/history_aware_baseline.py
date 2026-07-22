@@ -30,14 +30,12 @@ from surrogate_rollout.mixed_views.builder import (
     write_captions_json,
 )
 from surrogate_rollout.prompt_routing.persistence import _atomic_write_text
-from surrogate_rollout.prompt_routing.router import routing_decision_from_json
 from surrogate_rollout.prompt_routing.scaffold_applier import (
     composed_prompt_from_json,
     create_scaffold_applier,
 )
 from surrogate_rollout.prompt_routing.schemas import (
-    PromptBankSnapshot,
-    RouterPolicySnapshot,
+    RoutingDecision,
     ScaffoldContract,
     ScaffoldPolicySnapshot,
     SegmentContext,
@@ -53,26 +51,58 @@ from .qwen25_vl import (
 
 
 HISTORY_SCHEMA_VERSION = "frozen_local_caption_history_v1"
+# Free-form (static meta-prompt) instruction generators. 'openai' is the
+# default: the local 7B captioner cannot hold the "write an instruction, not a
+# caption" role (measured 2026-07-22 — instruction and caption came back
+# byte-identical on 4 of 5 mid-video segments, and repeated across segments).
+FREE_FORM_PROVIDER_OPENAI = "openai"
+FREE_FORM_PROVIDERS = (FREE_FORM_PROVIDER_OPENAI,)
 DEFAULT_HISTORY_BLOCK_SECONDS = 300.0
 DEFAULT_MAX_HISTORY_CAPTIONS = 30
 PARALLEL_GROUP_SCHEDULER_VERSION = "history_block_gpu_scheduler_v1"
 LOCAL_QWEN_BACKEND_ID = (
     "captioning.qwen25_vl.Qwen25VLCaptioner:"
     + VLLM_MM_CACHE_POLICY_VERSION)
-CAPTION_OUTPUT_CONTRACT_VERSION = "caption_plain_text_output_contract_v2"
-CAPTION_PARSE_SCHEMA_VERSION = "caption_plain_text_parse_result_v2"
-CAPTION_PARSE_NORMALIZATION_VERSION = "caption_plain_text_strip_v1"
+CAPTION_OUTPUT_CONTRACT_VERSION = "caption_registry_json_output_contract_v3"
+CAPTION_PARSE_SCHEMA_VERSION = "caption_registry_json_parse_result_v3"
+CAPTION_PARSE_NORMALIZATION_VERSION = "caption_registry_json_or_plain_text_v1"
 CAPTION_REPETITION_POLICY_VERSION = "caption_repetition_guard_v1"
 CAPTION_CACHE_SCHEMA_VERSION = "history_aware_caption_cache_v5"
-CAPTION_RETRY_POLICY_VERSION = "caption_plain_text_retry_v1"
+CAPTION_RETRY_POLICY_VERSION = "caption_registry_json_then_plain_text_retry_v1"
 CAPTION_ATTEMPT_SCHEMA_VERSION = "caption_generation_attempt_v2"
 
 
 def build_caption_output_contract(subject_registry_mode: str) -> str:
-    # Retain the argument for call-site compatibility while making both former
-    # registry modes use the same global plain-text contract.
+    # Retain the argument for call-site compatibility: both former registry
+    # modes now use the canonical DVD registry-JSON contract, and an
+    # unparsable response falls back to the plain-text contract below.
     if subject_registry_mode not in {"empty", "optional"}:
         raise ValueError("subject_registry_mode must be 'empty' or 'optional'")
+    return """
+
+CAPTION_OUTPUT_CONTRACT (this supersedes any earlier output-format wording):
+Output template:
+{
+  "clip_start_time": CLIP_START_TIME,
+  "clip_end_time": CLIP_END_TIME,
+  "subject_registry": {
+    <subject_i>: {
+      "name": <fill with short identity if name is unknown>,
+      "appearance": <list of appearance descriptions>,
+      "identity": <list of identity descriptions>,
+      "first_seen": <timestamp>
+    },
+    ...
+  },
+  "clip_description": <smooth and detailed natural narration of the video clip>
+}
+- Return only that JSON object. Do not add markdown fences or prose around it.
+- Do not repeat a sentence or phrase to fill the response.
+""".rstrip()
+
+
+def build_plain_text_caption_output_contract() -> str:
+    """Description-only fallback contract used after registry JSON fails."""
     return """
 
 CAPTION_OUTPUT_CONTRACT (this supersedes any earlier output-format wording):
@@ -84,16 +114,13 @@ CAPTION_OUTPUT_CONTRACT (this supersedes any earlier output-format wording):
 
 CAPTION_OUTPUT_CONTRACT = build_caption_output_contract(
     config.CAPTION_SUBJECT_REGISTRY_MODE)
+PLAIN_TEXT_CAPTION_OUTPUT_CONTRACT = build_plain_text_caption_output_contract()
 
 
 class _LazyLocalQwenBackend:
     """Avoid loading Qwen in the parent before GPU worker processes start."""
 
     def caption(self, *args: Any, **kwargs: Any) -> str:
-        from surrogate_rollout.prompt_routing.policies.history_aware_vlm_router import (
-            get_local_qwen_backend,
-        )
-
         return get_local_qwen_backend().caption(*args, **kwargs)
 
 
@@ -106,6 +133,18 @@ class _PersistentRawVLMProxy:
     def caption(self, images: Any, prompt: str, **kwargs: Any) -> str:
         return self.dispatcher.caption_raw_vlm(
             images=images, prompt=prompt, **kwargs)
+
+
+def get_local_qwen_backend() -> Any:
+    """Return DVD's configured, process-shared Qwen2.5-VL/vLLM captioner."""
+    import sys
+
+    for path in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    from dvd_backend import get_captioner
+
+    return get_captioner()
 
 
 def _subtitle_path(sample: Mapping[str, Any]) -> str | None:
@@ -173,7 +212,7 @@ def _sentence_chunks(text: str) -> tuple[str, ...]:
 
 
 def _repetition_error(text: str) -> str | None:
-    """Conservatively reject deterministic degeneration, not ordinary reuse."""
+    """Flag deterministic degeneration without rejecting non-empty captions."""
     sentences = _sentence_chunks(text)
     normalized = tuple(
         " ".join(re.findall(r"[\w'-]+", item.casefold()))
@@ -205,10 +244,49 @@ def _repetition_error(text: str) -> str | None:
     return None
 
 
+_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*\n(.*?)\n?```$", re.DOTALL)
+
+
+def _strip_code_fence(text: str) -> tuple[str, bool]:
+    """Inner text of one surrounding markdown fence, plus whether one existed."""
+    match = _FENCE_RE.match(text)
+    if match is None:
+        return text, False
+    return match.group(1).strip(), True
+
+
+def _parse_registry_json(text: str) -> dict[str, Any] | None:
+    """The canonical DVD caption artifact, or None when the text is not one.
+
+    Timestamps are optional here: `clip_start_time` / `clip_end_time` are
+    filled from the segment interval downstream, not trusted from the model.
+    """
+    try:
+        value = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    description = value.get("clip_description")
+    if not isinstance(description, str) or not description.strip():
+        return None
+    registry = value.get("subject_registry")
+    return {
+        "clip_description": description.strip(),
+        "subject_registry": registry if isinstance(registry, dict) else {},
+    }
+
+
 def _parse_caption_output_with_metadata(
     raw: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Validate plain model text and wrap it in the canonical artifact shape."""
+    """The canonical caption artifact from registry JSON, else from plain text.
+
+    Registry JSON is tried first (optionally inside one markdown fence). When
+    the response is not a usable registry object the whole stripped text
+    becomes `clip_description`, which is what the plain-text fallback contract
+    asks the captioner for.
+    """
     if not isinstance(raw, str):
         return {}, {
             "schema_version": CAPTION_PARSE_SCHEMA_VERSION,
@@ -226,18 +304,86 @@ def _parse_caption_output_with_metadata(
     }
     if not text:
         return {}, {**base, "status": "invalid", "error": "empty_output"}
-    repetition_error = _repetition_error(text)
-    if repetition_error is not None:
-        return {}, {**base, "status": "invalid", "error": repetition_error}
-    return {"clip_description": text}, {
+    unfenced, fenced = _strip_code_fence(text)
+    if fenced:
+        normalizations = [*normalizations, "strip_markdown_fence"]
+        base = {**base, "normalizations": normalizations}
+    parsed = _parse_registry_json(unfenced)
+    if parsed is not None:
+        repetition_warning = _repetition_error(parsed["clip_description"])
+        return parsed, {
+            **base, "status": "valid", "error": None,
+            "parse_path": "registry_json",
+            "subject_registry_present": bool(parsed["subject_registry"]),
+            "quality_warning": repetition_warning,
+            "sentence_count": len(
+                _sentence_chunks(parsed["clip_description"])),
+        }
+    repetition_warning = _repetition_error(text)
+    return {"clip_description": text, "subject_registry": {}}, {
         **base, "status": "valid", "error": None,
+        "parse_path": "plain_text",
+        "subject_registry_present": False,
+        "quality_warning": repetition_warning,
         "sentence_count": len(_sentence_chunks(text)),
     }
+
+
+def _is_registry_json_parse(parsed: Mapping[str, Any],
+                            parse_result: Mapping[str, Any]) -> bool:
+    """True when the captioner returned a usable registry-JSON object."""
+    return bool(parsed) and parse_result.get("parse_path") == "registry_json"
 
 
 def _parse_caption_output(raw: str) -> dict[str, Any]:
     """Compatibility wrapper for callers which only consume parsed output."""
     return _parse_caption_output_with_metadata(raw)[0]
+
+
+def routing_decision_from_json(d: Mapping[str, Any]) -> RoutingDecision:
+    return RoutingDecision(
+        video_id=d["video_id"],
+        segment_id=d["segment_id"],
+        bank_version=d["bank_version"],
+        router_version=d["router_version"],
+        selected_prompt_ids=tuple(d.get("selected_prompt_ids") or ()),
+        prompt_scores=d.get("prompt_scores") or {},
+        matched_rule_ids=tuple(d.get("matched_rule_ids") or ()),
+        selection_order=tuple(d.get("selection_order") or ()),
+        confidence=d.get("confidence"),
+        used_fallback=bool(d.get("used_fallback", False)),
+        fallback_reason=d.get("fallback_reason"),
+        decision_payload=d.get("decision_payload") or {},
+    )
+
+
+def build_free_form_generator(
+    provider: str, *, model_id: str | None = None,
+    max_tokens: int | None = None, template_text: str | None = None,
+    meta_prompt_id: str | None = None, backend_id: str | None = None,
+) -> Any:
+    """The configured free-form instruction generator. Unknown providers abort.
+
+    'openai' composes through the replace-body policy shared with the private
+    baseline repo (generated text owns the caption prompt's task section, 0.5
+    fps half-resolution generator frames). There is no local-Qwen fallback.
+    """
+    if provider == FREE_FORM_PROVIDER_OPENAI:
+        from surrogate_rollout.prompt_routing.policies.openai_free_form_generator import (
+            DEFAULT_MODEL_ID,
+            OpenAIFreeFormInstructionGenerator,
+        )
+        from surrogate_rollout.prompt_routing import static_meta_replace_body as smrb
+
+        return OpenAIFreeFormInstructionGenerator(
+            model_id=model_id or DEFAULT_MODEL_ID,
+            max_tokens=(smrb.DEFAULT_GENERATOR_MAX_TOKENS
+                        if max_tokens is None else max_tokens),
+            caption_fps=config.SAMPLE_FPS, template_text=template_text,
+            meta_prompt_id=meta_prompt_id, backend_id=backend_id)
+    raise ValueError(
+        f"unknown free-form generator provider {provider!r} "
+        f"(supported: {list(FREE_FORM_PROVIDERS)})")
 
 
 def _history_blocks(
@@ -290,7 +436,7 @@ def _parallel_history_worker(
     result_queue: Any,
     text_backend: str,
     use_openai_tools: bool,
-    routing_mode: str = "property_bank",
+    routing_mode: str = "free_form_generator",
     worker_log_path: str | None = None,
 ) -> None:
     """Own one GPU/model instance and serve caption tasks until shutdown."""
@@ -300,8 +446,6 @@ def _parallel_history_worker(
     try:
         from surrogate_rollout.evaluation.dvd_qa import ensure_backend
         from surrogate_rollout.prompt_routing.persistence import (
-            prompt_bank_from_json,
-            router_policy_from_json,
             scaffold_contract_from_json,
             scaffold_policy_from_json,
         )
@@ -323,7 +467,7 @@ def _parallel_history_worker(
                 "request_id": request_id, "request_type": command["type"]})
             try:
                 if command["type"] == "shutdown":
-                    engine = getattr(builder.router.vlm, "llm", None)
+                    engine = getattr(builder.segment_captioner.vlm, "llm", None)
                     engine_core = getattr(
                         getattr(engine, "llm_engine", None), "engine_core", None)
                     cleanup_warning = None
@@ -347,26 +491,25 @@ def _parallel_history_worker(
                     generator_configuration = common.get(
                         "free_form_generator_configuration")
                     if generator_configuration is not None:
-                        from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
-                            VLMFreeFormInstructionGenerator,
-                        )
-
-                        builder.free_form_generator = (
-                            VLMFreeFormInstructionGenerator(
-                                builder.router.vlm,
-                                max_tokens=generator_configuration["max_tokens"],
-                                template_text=generator_configuration["template_text"],
-                                meta_prompt_id=generator_configuration[
-                                    "meta_prompt_id"],
-                                model_id=generator_configuration["model_id"],
-                                backend_id=generator_configuration["backend_id"],
-                            ))
-                    prompt_bank = prompt_bank_from_json(common["prompt_bank"])
-                    router_policy = router_policy_from_json(common["router_policy"])
+                        provider = generator_configuration["provider"]
+                        builder.free_form_generator = build_free_form_generator(
+                            provider,
+                            model_id=generator_configuration["model_id"],
+                            max_tokens=generator_configuration["max_tokens"],
+                            template_text=generator_configuration[
+                                "template_text"],
+                            meta_prompt_id=generator_configuration[
+                                "meta_prompt_id"],
+                            backend_id=generator_configuration["backend_id"])
+                    # Keep the captioner's view consistent with the routing
+                    # mode this build request actually uses: under the static
+                    # meta-prompt condition it sees only the composed prompt.
+                    builder.segment_captioner.caption_sees_history = (
+                        generator_configuration is None)
                     scaffold_policy = scaffold_policy_from_json(
                         common["scaffold_policy"])
                     scaffold_contract = scaffold_contract_from_json(
-                        common["scaffold_contract"])
+                            common["scaffold_contract"])
                     completed = []
                     for block_index, block_clips, block_root, fragment_path in \
                             command["jobs"]:
@@ -378,7 +521,8 @@ def _parallel_history_worker(
                             "block_root": os.path.abspath(block_root)})
                         artifact = builder.build(
                             sample=common["sample"], clip_index=list(block_clips),
-                            prompt_bank=prompt_bank, router_policy=router_policy,
+                            bank_version=common["bank_version"],
+                            router_version=common["router_version"],
                             scaffold_policy=scaffold_policy,
                             scaffold_contract=scaffold_contract,
                             base_prompt_template=common["base_prompt_template"],
@@ -429,7 +573,7 @@ def _parallel_history_worker(
                     }
                 elif command["type"] == "raw_vlm":
                     raw_payload = command["payload"]
-                    text = builder.router.vlm.caption(
+                    text = builder.segment_captioner.vlm.caption(
                         raw_payload["images"], raw_payload["prompt"],
                         **raw_payload["kwargs"],
                     )
@@ -480,12 +624,20 @@ class HistoryAwareSegmentCaptioner:
 
     def __init__(self, vlm: Any, *, caption_model_id: str | None = None,
                  backend_id: str | None = None,
-                 remote_dispatcher: Any | None = None) -> None:
+                 remote_dispatcher: Any | None = None,
+                 caption_sees_history: bool = True) -> None:
         self.vlm = vlm
         self.caption_model_id = caption_model_id or config.CAPTION_MODEL_ID
         self.backend_id = backend_id or (
             f"{type(vlm).__module__}.{type(vlm).__qualname__}")
         self.remote_dispatcher = remote_dispatcher
+        # When False the captioner reads ONLY the composed prompt and the
+        # segment's own frames — the frozen history reaches it exclusively
+        # through the generated instruction. Required by the static
+        # meta-prompt condition (the private baseline repo captions that way);
+        # the property-bank path keeps the historical default so its existing
+        # captions and caches stay valid.
+        self.caption_sees_history = bool(caption_sees_history)
 
     @property
     def configuration_identity(self) -> Mapping[str, Any]:
@@ -508,6 +660,7 @@ class HistoryAwareSegmentCaptioner:
             "caption_retry_policy_version": CAPTION_RETRY_POLICY_VERSION,
             "caption_parse_max_retries": config.CAPTION_PARSE_MAX_RETRIES,
             "caption_artifact_shape": {"clip_description": "string"},
+            "caption_sees_history": self.caption_sees_history,
             "vllm_multimodal_cache_policy_version":
                 VLLM_MM_CACHE_POLICY_VERSION,
             "vllm_mm_processor_cache_gb": VLLM_MM_PROCESSOR_CACHE_GB,
@@ -570,6 +723,7 @@ class HistoryAwareSegmentCaptioner:
                     CAPTION_PARSE_NORMALIZATION_VERSION,
                 "caption_repetition_policy_version":
                     CAPTION_REPETITION_POLICY_VERSION,
+                "caption_sees_history": self.caption_sees_history,
             })),
             caption_model_id=self.caption_model_id,
             intervention_identity_hash=intervention_identity_hash,
@@ -595,13 +749,15 @@ class HistoryAwareSegmentCaptioner:
                 cached = json.load(f)
             if cached.get("cache_key") != key_as_dict(key):
                 raise RuntimeError("history-aware cache file identity mismatch")
-            if cached.get("parsed") or (
-                    cached.get("caption_retry_policy_version") ==
-                    CAPTION_RETRY_POLICY_VERSION and
-                    cached.get("caption_parse_normalization_version") ==
-                    CAPTION_PARSE_NORMALIZATION_VERSION):
+            parsed_from_cache = cached.get("parsed") or {}
+            cached_policy_matches = (
+                cached.get("caption_retry_policy_version") ==
+                CAPTION_RETRY_POLICY_VERSION and
+                cached.get("caption_parse_normalization_version") ==
+                CAPTION_PARSE_NORMALIZATION_VERSION)
+            if parsed_from_cache and cached_policy_matches:
                 return HistoryAwareCaptionResult(
-                    parsed=cached.get("parsed") or {}, cache_key=key_as_dict(key),
+                    parsed=parsed_from_cache, cache_key=key_as_dict(key),
                     cache_dir=cache_dir, result_path=result_path,
                     cache_hit=True, caption_seconds=0.0,
                     model_call_count=0,
@@ -626,15 +782,20 @@ class HistoryAwareSegmentCaptioner:
 
         start, end = _segment_times(segment_id)
         transcript = str(clip_info.get("transcript") or "No transcript.")
-        prompt = (composed_prompt.prompt_text
-                  .replace("TRANSCRIPT_PLACEHOLDER", transcript)
-                  .replace("CLIP_START_TIME", _hhmmss(start))
-                  .replace("CLIP_END_TIME", _hhmmss(end)))
-        prompt += CAPTION_OUTPUT_CONTRACT
-        prompt += (
-            "\n\nFROZEN_PRECEDING_CAPTION_HISTORY_JSON:\n"
-            + str(history_snapshot["serialized_history"])
-        )
+        body = (composed_prompt.prompt_text
+                .replace("TRANSCRIPT_PLACEHOLDER", transcript)
+                .replace("CLIP_START_TIME", _hhmmss(start))
+                .replace("CLIP_END_TIME", _hhmmss(end)))
+
+        def render(contract: str) -> str:
+            text = body + contract
+            if self.caption_sees_history:
+                text += ("\n\nFROZEN_PRECEDING_CAPTION_HISTORY_JSON:\n"
+                         + str(history_snapshot["serialized_history"]))
+            return text
+
+        prompt = render(CAPTION_OUTPUT_CONTRACT)
+        plain_text_prompt = render(PLAIN_TEXT_CAPTION_OUTPUT_CONTRACT)
         frames = clip_info.get("files") or clip_info.get("frames") or ()
         if isinstance(frames, (str, os.PathLike)):
             frames = (frames,)
@@ -645,9 +806,11 @@ class HistoryAwareSegmentCaptioner:
         parsed: dict[str, Any] = {}
         raw = ""
         parse_result: dict[str, Any] = {}
+        accepted = False
         if cached_invalid is not None:
             raw = str(cached_invalid.get("raw_output") or "")
             parsed, parse_result = _parse_caption_output_with_metadata(raw)
+            accepted = _is_registry_json_parse(parsed, parse_result)
             attempts.append({
                 "schema_version": CAPTION_ATTEMPT_SCHEMA_VERSION,
                 "attempt_index": 1,
@@ -655,17 +818,24 @@ class HistoryAwareSegmentCaptioner:
                 "raw_output": raw,
                 "parse_result": parse_result,
                 "parsed_valid": bool(parsed),
+                "parse_accepted": accepted,
                 "caption_seconds": 0.0,
             })
             call_indices = (
-                () if parsed else
+                () if accepted else
                 range(1, config.CAPTION_PARSE_MAX_RETRIES + 1))
         else:
             call_indices = range(0, config.CAPTION_PARSE_MAX_RETRIES + 1)
         for retry_index in call_indices:
+            # The first CAPTION_JSON_ATTEMPTS calls ask for the canonical DVD
+            # registry JSON; the remaining calls fall back to a
+            # description-only plain-text contract, whose output is accepted
+            # as written.
+            wants_registry_json = model_call_count < config.CAPTION_JSON_ATTEMPTS
+            attempt_prompt = prompt if wants_registry_json else plain_text_prompt
             t0 = time.monotonic()
             raw = self.vlm.caption(
-                frame_paths, prompt,
+                frame_paths, attempt_prompt,
                 max_tokens=int(config.CAPTION_DECODING["max_tokens"]),
                 temperature=float(config.CAPTION_DECODING["temperature"]),
                 top_p=float(config.CAPTION_DECODING["top_p"]),
@@ -676,17 +846,23 @@ class HistoryAwareSegmentCaptioner:
             elapsed += attempt_seconds
             model_call_count += 1
             parsed, parse_result = _parse_caption_output_with_metadata(raw)
+            accepted = bool(parsed) and (
+                not wants_registry_json
+                or _is_registry_json_parse(parsed, parse_result))
             attempts.append({
                 "schema_version": CAPTION_ATTEMPT_SCHEMA_VERSION,
                 "attempt_index": len(attempts) + 1,
                 "source": "model_call",
                 "retry_index": retry_index,
+                "output_contract": (
+                    "registry_json" if wants_registry_json else "plain_text"),
                 "raw_output": raw,
                 "parse_result": parse_result,
                 "parsed_valid": bool(parsed),
+                "parse_accepted": accepted,
                 "caption_seconds": attempt_seconds,
             })
-            if parsed:
+            if accepted:
                 break
         retry_count = max(0, len(attempts) - 1)
         payload = {
@@ -698,6 +874,12 @@ class HistoryAwareSegmentCaptioner:
                 CAPTION_OUTPUT_CONTRACT_VERSION,
             "caption_output_contract_hash": sha256_text(
                 CAPTION_OUTPUT_CONTRACT),
+            "caption_plain_text_contract_hash": sha256_text(
+                PLAIN_TEXT_CAPTION_OUTPUT_CONTRACT),
+            "rendered_plain_text_prompt_hash": sha256_text(plain_text_prompt),
+            "caption_json_attempts": config.CAPTION_JSON_ATTEMPTS,
+            "caption_parse_path": parse_result.get("parse_path"),
+            "caption_parse_accepted": accepted,
             "caption_decoding_policy_version":
                 config.CAPTION_DECODING_POLICY_VERSION,
             "caption_decoding_hash": config.decoding_hash(),
@@ -711,7 +893,7 @@ class HistoryAwareSegmentCaptioner:
             "attempt_count": len(attempts),
             "retry_count": retry_count,
             "retry_exhausted": (
-                not bool(parsed)
+                not accepted
                 and retry_count >= config.CAPTION_PARSE_MAX_RETRIES),
             "attempts": attempts,
             "parse_result": parse_result,
@@ -807,34 +989,29 @@ class HistoryAwareBaselineCaptionViewBuilder:
     @classmethod
     def from_local_qwen(
         cls, *, parallel_gpus: tuple[str, ...] = (),
-        routing_mode: str = "property_bank",
+        routing_mode: str = "free_form_generator",
+        free_form_provider: str = FREE_FORM_PROVIDER_OPENAI,
+        free_form_model_id: str | None = None,
         worker_result_timeout_seconds: float = 86400.0,
         worker_health_poll_seconds: float = 1.0,
         worker_log_directory: str | None = None,
     ):
-        from surrogate_rollout.prompt_routing.policies.history_aware_vlm_router import (
-            HistoryAwareVLMRouter,
-            get_local_qwen_backend,
-        )
-
-        if routing_mode not in ("property_bank", "free_form_generator"):
+        if routing_mode != "free_form_generator":
             raise ValueError(
                 f"unknown routing_mode {routing_mode!r} "
-                "(supported: 'property_bank', 'free_form_generator')")
+                "(supported: 'free_form_generator')")
         vlm = (_LazyLocalQwenBackend() if parallel_gpus
                else get_local_qwen_backend())
-        free_form_generator = None
-        if routing_mode == "free_form_generator":
-            from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
-                VLMFreeFormInstructionGenerator,
-            )
-
-            free_form_generator = VLMFreeFormInstructionGenerator(
-                vlm, backend_id=LOCAL_QWEN_BACKEND_ID)
+        free_form_generator = build_free_form_generator(
+            free_form_provider, model_id=free_form_model_id)
+        # Static meta-prompt condition: the captioner reads only the generated
+        # prompt plus the segment's own frames. History reaches it exclusively
+        # through the generated instruction, exactly as in the baseline repo.
         builder = cls(
-            router=HistoryAwareVLMRouter(vlm, backend_id=LOCAL_QWEN_BACKEND_ID),
+            router=None,
             segment_captioner=HistoryAwareSegmentCaptioner(
-                vlm, backend_id=LOCAL_QWEN_BACKEND_ID),
+                vlm, backend_id=LOCAL_QWEN_BACKEND_ID,
+                caption_sees_history=False),
             parallel_gpus=parallel_gpus,
             free_form_generator=free_form_generator,
             worker_result_timeout_seconds=worker_result_timeout_seconds,
@@ -850,8 +1027,8 @@ class HistoryAwareBaselineCaptionViewBuilder:
         *,
         sample: Mapping[str, Any],
         clip_index: list[tuple[str, dict]],
-        prompt_bank: PromptBankSnapshot,
-        router_policy: RouterPolicySnapshot,
+        bank_version: str,
+        router_version: str,
         scaffold_policy: ScaffoldPolicySnapshot,
         scaffold_contract: ScaffoldContract,
         base_prompt_template: str,
@@ -866,7 +1043,8 @@ class HistoryAwareBaselineCaptionViewBuilder:
     ) -> HistoryAwareBaselineViewArtifact:
         kwargs = {
             "sample": sample, "clip_index": clip_index,
-            "prompt_bank": prompt_bank, "router_policy": router_policy,
+            "bank_version": bank_version,
+            "router_version": router_version,
             "scaffold_policy": scaffold_policy,
             "scaffold_contract": scaffold_contract,
             "base_prompt_template": base_prompt_template,
@@ -892,8 +1070,8 @@ class HistoryAwareBaselineCaptionViewBuilder:
         *,
         sample: Mapping[str, Any],
         clip_index: list[tuple[str, dict]],
-        prompt_bank: PromptBankSnapshot,
-        router_policy: RouterPolicySnapshot,
+        bank_version: str,
+        router_version: str,
         scaffold_policy: ScaffoldPolicySnapshot,
         scaffold_contract: ScaffoldContract,
         base_prompt_template: str,
@@ -919,9 +1097,11 @@ class HistoryAwareBaselineCaptionViewBuilder:
         work_root = os.path.abspath(work_root)
         state_dir = os.path.join(work_root, "segment_state")
         os.makedirs(state_dir, exist_ok=True)
+        if self.free_form_generator is None:
+            raise ValueError(
+                "history-aware baseline requires a free-form generator")
         scaffold = create_scaffold_applier(
             scaffold_policy, base_prompt_template=base_prompt_template)
-        bank_by_id = {entry.prompt_id: entry for entry in prompt_bank.entries}
         histories: list[dict[str, Any]] = []
         decisions = []
         composed_prompts = []
@@ -957,8 +1137,8 @@ class HistoryAwareBaselineCaptionViewBuilder:
             )
             state_identity_payload = {
                 "context": context,
-                "prompt_bank": prompt_bank,
-                "router_policy": router_policy,
+                "bank_version": bank_version,
+                "router_version": router_version,
                 "scaffold_policy": scaffold_policy,
                 "scaffold_contract": scaffold_contract,
                 "base_prompt_template_hash": sha256_text(base_prompt_template),
@@ -985,11 +1165,8 @@ class HistoryAwareBaselineCaptionViewBuilder:
                     "boundary_rule": "floor_segment_start_div_block_seconds",
                 },
             }
-            if self.free_form_generator is not None:
-                # Key added ONLY in free-form mode so property-bank state
-                # identities (and therefore resume behavior) stay byte-stable.
-                state_identity_payload["free_form_generator_identity"] = dict(
-                    self.free_form_generator.configuration_identity)
+            state_identity_payload["free_form_generator_identity"] = dict(
+                self.free_form_generator.configuration_identity)
             state_identity = sha256_text(
                 dumps_canonical(state_identity_payload))
             state_path = os.path.join(
@@ -1020,25 +1197,16 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 }
                 resumed_segments += 1
             else:
-                if self.free_form_generator is not None:
-                    from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
-                        build_free_form_selection,
-                    )
+                from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
+                    build_free_form_selection,
+                )
 
-                    decision, selected_entries, exchange = (
-                        build_free_form_selection(
-                            generator=self.free_form_generator,
-                            context=context, clip_info=clip_info,
-                            prompt_bank=prompt_bank))
-                    router_calls += 1
-                else:
-                    decision = self.router.route(
-                        context, prompt_bank, router_policy)
-                    router_calls += 1
-                    selected_entries = tuple(
-                        bank_by_id[value]
-                        for value in decision.selected_prompt_ids)
-                    exchange = getattr(self.router, "last_exchange", None)
+                decision, selected_entries, exchange = (
+                    build_free_form_selection(
+                        generator=self.free_form_generator,
+                        context=context, clip_info=clip_info,
+                        bank_version=bank_version))
+                router_calls += 1
                 composed = scaffold.apply(
                     context=context,
                     selected_entries=selected_entries,
@@ -1186,8 +1354,8 @@ class HistoryAwareBaselineCaptionViewBuilder:
         blocks: tuple[tuple[int, tuple[tuple[str, dict], ...]], ...],
         sample: Mapping[str, Any],
         clip_index: list[tuple[str, dict]],
-        prompt_bank: PromptBankSnapshot,
-        router_policy: RouterPolicySnapshot,
+        bank_version: str,
+        router_version: str,
         scaffold_policy: ScaffoldPolicySnapshot,
         scaffold_contract: ScaffoldContract,
         base_prompt_template: str,
@@ -1221,8 +1389,9 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 (block_index, block_clips, block_root, fragment_paths[gpu]))
 
         common = {
-            "sample": dict(sample), "prompt_bank": as_json_dict(prompt_bank),
-            "router_policy": as_json_dict(router_policy),
+            "sample": dict(sample),
+            "bank_version": bank_version,
+            "router_version": router_version,
             "scaffold_policy": as_json_dict(scaffold_policy),
             "scaffold_contract": as_json_dict(scaffold_contract),
             "base_prompt_template": base_prompt_template,
@@ -1240,6 +1409,9 @@ class HistoryAwareBaselineCaptionViewBuilder:
             # intentionally long-lived, so startup-time routing_mode alone is
             # not sufficient when a paired confirmation switches policies.
             common["free_form_generator_configuration"] = {
+                "provider": str(
+                    self.free_form_generator.configuration_identity.get(
+                        "provider", FREE_FORM_PROVIDER_OPENAI)),
                 "template_text": self.free_form_generator.template,
                 "meta_prompt_id": self.free_form_generator.meta_prompt_id,
                 "max_tokens": self.free_form_generator.max_tokens,
@@ -1398,9 +1570,7 @@ class HistoryAwareBaselineCaptionViewBuilder:
                 target=_parallel_history_worker,
                 args=(gpu, command_queue, self._pool_result_queue,
                       self.worker_text_backend, self.worker_use_openai_tools,
-                      ("free_form_generator"
-                       if self.free_form_generator is not None
-                       else "property_bank"),
+                      "free_form_generator",
                       (os.path.join(self.worker_log_directory,
                                     f"worker_gpu_{gpu}.jsonl")
                        if self.worker_log_directory else None)),

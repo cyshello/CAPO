@@ -25,9 +25,6 @@ from surrogate_rollout.optimization.llm_episode_feedback import (
     _model_trajectory_projection,
     _resolve_trajectory,
 )
-from surrogate_rollout.optimization.property_intervention import (
-    correctness_transition,
-)
 from surrogate_rollout.optimization.schemas import (
     InterventionClipRecord,
     InterventionEpisode,
@@ -51,42 +48,51 @@ from surrogate_rollout.references.extractor import (
 
 
 PROMPT_DELTA_PROPOSAL_REQUEST_SCHEMA_VERSION = (
-    "prompt_delta_proposal_request_v4_localized_trajectory_normalized")
+    "prompt_delta_proposal_request_v5_per_qa_isolated")
 PROMPT_DELTA_PROPOSAL_REPRESENTATION_VERSION = (
-    "trajectory_grounded_normalized_catalog_v3_localized_inspection")
+    "trajectory_grounded_per_qa_catalog_v4_localized_inspection")
 PROMPT_DELTA_PROPOSAL_EVIDENCE_SCOPE = (
     "assistant_timestamp_or_localized_frame_inspection_v1")
 PROMPT_DELTA_PROPOSAL_SPLIT_POLICY = (
-    "whole_video_then_per_qa_context_ineligible_skip_v2")
+    "always_per_qa_isolated_v1")
 PROMPT_DELTA_SEGMENT_SELECTION_POLICY = (
     "source_qa_localized_trajectory_segments_only_v1")
 PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY = (
     "frame_inspection_global_boundary_tolerance_v1")
-PROMPT_DELTA_POLICY_OUTPUT_NAMESPACE = "localized_trajectory_segments_only_v1"
+PROMPT_DELTA_POLICY_OUTPUT_NAMESPACE = (
+    "per_qa_isolated_localized_trajectory_segments_v2")
 PROMPT_DELTA_INTERVENTION_EXECUTION_NAMESPACE = (
     "dvd_strict_frame_inspect_corrective_retry_v1")
 
 
-PROMPT_DELTA_PROPOSAL_SYSTEM_INSTRUCTION = """You propose temporary prompt deltas for saved baseline QA evidence from one video.
+def correctness_transition(before: bool, after: bool) -> str:
+    if not before and after:
+        return "wrong_to_correct"
+    if before and not after:
+        return "correct_to_wrong"
+    if before and after:
+        return "correct_to_correct"
+    return "wrong_to_wrong"
 
-Each delta is an executable correction appended to an already generated
-clip-specific caption prompt. It is intervention-only evidence: it is not a
-property, reusable rule, codebook member, router label, or meta-prompt update.
 
-Use only the supplied baseline prompts, frozen histories, captions, QA
-outcomes, and stored trajectories. The request contains only assistant timestamp
-citations and localized (not global/whole-video) frame inspections from the
-baseline DVD trajectory. History snapshots and segments are
-content-addressed catalogs; resolve every QA's ordered
-intervention_candidate_segment_refs through those catalogs. Select one or more actual
-source_qa_ids.
-Express each delta as a conditional instruction based only on frames and frozen
-caption history observable by the runtime prompt generator. Training-only QA,
-correctness, and trajectory fields may justify the proposal but must not become
-runtime inputs or be copied into the executable instruction.
-Do not invent segment IDs or claim that a referenced segment caused a QA
-outcome. Do not include persistent IDs or lifecycle actions. Return only the
-strict JSON object required by the response schema."""
+_PROMPT_DIRECTORY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "prompts")
+
+
+def _load_prompt_text(filename: str) -> str:
+    path = os.path.join(_PROMPT_DIRECTORY, filename)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = handle.read().strip()
+    except OSError as exc:
+        raise RuntimeError(f"prompt-delta prompt unavailable: {path}") from exc
+    if not value:
+        raise RuntimeError(f"prompt-delta prompt is empty: {path}")
+    return value
+
+
+PROMPT_DELTA_PROPOSAL_SYSTEM_INSTRUCTION = _load_prompt_text(
+    "prompt_delta_proposer_system_v6.txt")
 
 
 class FreshPromptDeltaError(RuntimeError):
@@ -262,6 +268,25 @@ class PromptDeltaExecutionPlan:
     selection_policy: str
     frame_inspection_classification_hash: str
     global_inspection_boundary_tolerance_seconds: float
+
+
+def _source_qa_classification_hash(
+    row: Mapping[str, Any], *, tolerance_seconds: float,
+) -> str:
+    return sha256_json({
+        "policy": PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
+        "global_inspection_boundary_tolerance_seconds": tolerance_seconds,
+        "qa_classification": {
+            "qa_id": row["qa_id"],
+            "assistant_timestamp_cited_segments":
+                row["assistant_timestamp_cited_segments"],
+            "localized_frame_inspected_segments":
+                row["localized_frame_inspected_segments"],
+            "global_frame_inspected_segments":
+                row["global_frame_inspected_segments"],
+            "frame_inspect_calls": row["frame_inspect_calls"],
+        },
+    })
 
 
 def _read_json(path: str) -> dict[str, Any]:
@@ -648,11 +673,14 @@ def _qa_segment_selection_records(
 
 def build_prompt_delta_proposal_request(
     baseline_video_manifest_path: str,
-    *, parent_meta_prompt_id: str,
+    *, parent_meta_prompt_id: str, parent_meta_prompt_text: str,
     global_inspection_boundary_tolerance_seconds: float,
 ) -> tuple[str, Mapping[str, Any], str]:
     if not parent_meta_prompt_id:
         raise ValueError("parent_meta_prompt_id is required")
+    if not isinstance(parent_meta_prompt_text, str) or not \
+            parent_meta_prompt_text.strip():
+        raise ValueError("parent_meta_prompt_text is required")
     baseline = _read_json(baseline_video_manifest_path)
     routing = _read_json(baseline["routing_manifest_path"])
     prompts = _read_jsonl(routing["composed_prompts_path"])
@@ -773,6 +801,7 @@ def build_prompt_delta_proposal_request(
             row["qa_id"] for row in qa_records]},
         "video_id": baseline["video_id"],
         "parent_meta_prompt_id": parent_meta_prompt_id,
+        "parent_meta_prompt_text": parent_meta_prompt_text,
         "history_catalog": {
             "history_items": history_items,
             "snapshots": history_snapshots,
@@ -829,26 +858,26 @@ def build_prompt_delta_single_qa_request(
 
 
 class LLMPromptDeltaProposer:
-    """Use one normalized request or deterministic per-QA requests."""
+    """Generate candidates through isolated, deterministic per-QA requests."""
 
     def __init__(
         self, *, backend: PromptDeltaProposalBackend,
-        maximum_deltas_per_video: int,
+        maximum_deltas_per_qa: int,
         selection_policy: str,
         global_inspection_boundary_tolerance_seconds: float,
     ) -> None:
         if not callable(getattr(backend, "preflight", None)) or not callable(
                 getattr(backend, "generate", None)):
             raise TypeError("backend must provide preflight and generate")
-        if maximum_deltas_per_video < 1:
-            raise ValueError("maximum_deltas_per_video must be positive")
+        if maximum_deltas_per_qa not in (1, 2):
+            raise ValueError("maximum_deltas_per_qa must be 1 or 2")
         if selection_policy != PROMPT_DELTA_SEGMENT_SELECTION_POLICY:
             raise ValueError("unsupported prompt-delta selection policy")
         if global_inspection_boundary_tolerance_seconds < 0:
             raise ValueError(
                 "global inspection boundary tolerance must be non-negative")
         self.backend = backend
-        self.maximum_deltas_per_video = maximum_deltas_per_video
+        self.maximum_deltas_per_qa = maximum_deltas_per_qa
         self.selection_policy = selection_policy
         self.global_inspection_boundary_tolerance_seconds = (
             global_inspection_boundary_tolerance_seconds)
@@ -887,19 +916,21 @@ class LLMPromptDeltaProposer:
                     set(source_ids) - set(allowed_qa_ids):
                 raise FreshPromptDeltaError("delta proposal content is invalid")
             output.append({
-                "instruction": " ".join(instruction.split()),
+                "instruction": instruction,
                 "source_qa_ids": tuple(source_ids),
-                "proposer_diagnosis": diagnosis.strip(),
+                "proposer_diagnosis": diagnosis,
             })
         return tuple(output)
 
     def propose(
         self, baseline_video_manifest_path: str,
-        *, parent_meta_prompt_id: str, output_directory: str,
+        *, parent_meta_prompt_id: str, parent_meta_prompt_text: str,
+        output_directory: str,
     ) -> tuple[PromptDeltaExecutionPlan, ...]:
         system, payload, request_hash = build_prompt_delta_proposal_request(
             baseline_video_manifest_path,
             parent_meta_prompt_id=parent_meta_prompt_id,
+            parent_meta_prompt_text=parent_meta_prompt_text,
             global_inspection_boundary_tolerance_seconds=
                 self.global_inspection_boundary_tolerance_seconds)
         output = os.path.abspath(output_directory)
@@ -924,6 +955,12 @@ class LLMPromptDeltaProposer:
             } for row in selection_records],
         }
         classification_hash = sha256_json(classification_input)
+        classification_hash_by_qa = {
+            row["qa_id"]: _source_qa_classification_hash(
+                row, tolerance_seconds=
+                    self.global_inspection_boundary_tolerance_seconds)
+            for row in selection_records
+        }
         selection_summary = {
             "schema_version": "prompt_delta_segment_selection_audit_v2",
             "selection_policy": self.selection_policy,
@@ -972,7 +1009,7 @@ class LLMPromptDeltaProposer:
                     self.global_inspection_boundary_tolerance_seconds,
                 "provider_settings": _plain(
                     self.backend.configuration_identity),
-                "maximum_deltas_per_video": self.maximum_deltas_per_video,
+                "maximum_deltas_per_qa": self.maximum_deltas_per_qa,
                 "selection_policy": self.selection_policy,
             }
             identity_hash = sha256_json(identity)
@@ -999,10 +1036,9 @@ class LLMPromptDeltaProposer:
                 "plans": [],
             })
             return ()
-        full_preflight = self.backend.preflight(
-            system, dumps_canonical(payload))
         single_requests = []
         single_by_qa = {}
+        single_truncations = {}
         for qa_id in qa_ids:
             single, single_hash = build_prompt_delta_single_qa_request(
                 payload, qa_id=qa_id)
@@ -1010,11 +1046,13 @@ class LLMPromptDeltaProposer:
                 system, dumps_canonical(single))
             single_requests.append((qa_id, single, single_hash, preflight))
             single_by_qa[qa_id] = (single, single_hash, preflight)
+            single_truncations[qa_id] = None
         for row in selection_records:
             if row["qa_id"] not in single_by_qa:
                 continue
             preflight = single_by_qa[row["qa_id"]][2]
             row["token_preflight"] = asdict(preflight)
+            row["context_truncation"] = single_truncations[row["qa_id"]]
             if not preflight.fits_context:
                 row["skip"] = True
                 row["skip_reason"] = "context_ineligible"
@@ -1031,23 +1069,11 @@ class LLMPromptDeltaProposer:
 
         requests: list[tuple[Mapping[str, Any], str,
                              PromptDeltaRequestPreflight, int, int]] = []
-        if full_preflight.fits_context:
-            split_mode = "single_normalized_video_request"
-            requests.append((payload, request_hash, full_preflight, 1,
-                             self.maximum_deltas_per_video))
-        else:
-            split_mode = "deterministic_per_qa"
-            if self.maximum_deltas_per_video < len(eligible_qa_ids):
-                raise FreshPromptDeltaError(
-                    "per-QA split requires maximum_deltas_per_video to be at "
-                    "least the context-eligible QA count")
-            remaining_extra = (
-                self.maximum_deltas_per_video - len(eligible_qa_ids))
-            for index, qa_id in enumerate(eligible_qa_ids):
-                single, single_hash, preflight = single_by_qa[qa_id]
-                maximum = 1 + (remaining_extra if index == 0 else 0)
-                requests.append((
-                    single, single_hash, preflight, 1, maximum))
+        split_mode = "isolated_per_qa"
+        for qa_id in eligible_qa_ids:
+            single, single_hash, preflight = single_by_qa[qa_id]
+            requests.append((single, single_hash, preflight, 1,
+                             self.maximum_deltas_per_qa))
 
         context_ineligible = [
             (qa_id, request, digest, preflight)
@@ -1075,7 +1101,7 @@ class LLMPromptDeltaProposer:
             "global_inspection_boundary_tolerance_seconds":
                 self.global_inspection_boundary_tolerance_seconds,
             "provider_settings": provider_identity,
-            "maximum_deltas_per_video": self.maximum_deltas_per_video,
+            "maximum_deltas_per_qa": self.maximum_deltas_per_qa,
             "selection_policy": self.selection_policy,
         }
         request_identity_hash = sha256_json(request_identity)
@@ -1094,6 +1120,9 @@ class LLMPromptDeltaProposer:
                 "size_breakdown": _request_size_breakdown(request),
                 "minimum_proposals": minimum,
                 "maximum_proposals": maximum,
+                "context_truncation": (
+                    single_truncations.get(qa_scope[0])
+                    if len(qa_scope) == 1 else None),
             })
         _write_once(os.path.join(output, "request_manifest.json"), {
             "schema_version": "prompt_delta_proposal_request_manifest_v4",
@@ -1101,12 +1130,13 @@ class LLMPromptDeltaProposer:
                        "no_eligible_proposal_evidence"),
             "request_identity": request_identity,
             "request_identity_hash": request_identity_hash,
-            "full_request_preflight": asdict(full_preflight),
+            "full_request_preflight": None,
             "requests": request_rows,
             "planned_proposer_call_count": len(request_rows),
             "context_ineligible_qa_ids": [
                 qa_id for qa_id, *_rest in context_ineligible],
-            "truncation_filtering_sampling_or_intra_qa_split": False,
+            "truncation_filtering_sampling_or_intra_qa_split": any(
+                value is not None for value in single_truncations.values()),
         })
 
         if context_ineligible:
@@ -1170,24 +1200,43 @@ class LLMPromptDeltaProposer:
         candidate_rows = []
         for index, (request, digest, _preflight, minimum, maximum) in enumerate(
                 requests, 1):
-            raw = self.backend.generate(
-                system, dumps_canonical(request),
-                minimum_proposals=minimum, maximum_proposals=maximum)
-            _write_once(os.path.join(output, f"raw_response_{index:03d}.json"), {
-                "request_hash": digest, "raw_response": raw})
+            raw_path = os.path.join(output, f"raw_response_{index:03d}.json")
+            if os.path.isfile(raw_path):
+                saved_raw = _read_json(raw_path)
+                if saved_raw.get("request_hash") != digest or not isinstance(
+                        saved_raw.get("raw_response"), str):
+                    raise FreshPromptDeltaError(
+                        "saved prompt-delta raw response has different inputs")
+                raw = saved_raw["raw_response"]
+            else:
+                try:
+                    raw = self.backend.generate(
+                        system, dumps_canonical(request),
+                        minimum_proposals=minimum, maximum_proposals=maximum)
+                except Exception as exc:
+                    _write_once(os.path.join(
+                        output, f"provider_error_{index:03d}.json"), {
+                            "request_hash": digest,
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                        })
+                    raise
+                _write_once(raw_path, {
+                    "request_hash": digest, "raw_response": raw})
             allowed = tuple(request["request_scope"]["qa_ids"])
             parsed = self._parse_response(
                 raw, allowed_qa_ids=allowed,
                 minimum_proposals=minimum, maximum_proposals=maximum)
-            if split_mode == "deterministic_per_qa" and any(
-                    item["source_qa_ids"] != allowed for item in parsed):
+            if any(item["source_qa_ids"] != allowed for item in parsed):
                 raise FreshPromptDeltaError(
                     "per-QA proposal must retain exactly its source QA ID")
-            candidate_rows.extend(parsed)
+            candidate_rows.extend(
+                (item, digest, index, proposal_index)
+                for proposal_index, item in enumerate(parsed, 1))
 
         plans = []
-        seen_candidates = set()
-        for item in candidate_rows:
+        for item, candidate_request_hash, request_index, proposal_index in \
+                candidate_rows:
             instruction = item["instruction"]
             diagnosis = item["proposer_diagnosis"]
             source_ids = item["source_qa_ids"]
@@ -1198,30 +1247,25 @@ class LLMPromptDeltaProposer:
             if not selected or set(selected) - segment_ids:
                 raise FreshPromptDeltaError(
                     "source QA localized segment scope is empty or invalid")
-            candidate_key = sha256_json({
-                "canonical_instruction": instruction,
-                "source_qa_ids": source_ids,
-                "target_segment_ids": selected,
-            })
-            if candidate_key in seen_candidates:
-                continue
-            seen_candidates.add(candidate_key)
             delta_id = "prompt_delta_" + sha256_json({
                 "video_id": payload["video_id"],
                 "parent_meta_prompt_id": payload["parent_meta_prompt_id"],
                 "instruction": instruction, "source_qa_ids": source_ids,
                 "diagnosis": diagnosis,
                 "policy_version": self.backend.policy_version,
-                "request_identity_hash": request_identity_hash,
+                "candidate_request_hash": candidate_request_hash,
+                "request_index": request_index,
+                "proposal_index": proposal_index,
             })[:20]
             plans.append(PromptDeltaExecutionPlan(
                 prompt_delta=PromptDelta(
                     delta_id=delta_id, instruction=instruction,
                     source_qa_ids=source_ids,
-                    proposer_diagnosis=diagnosis.strip()),
+                    proposer_diagnosis=diagnosis),
                 selected_segment_ids=selected,
                 selection_policy=self.selection_policy,
-                frame_inspection_classification_hash=classification_hash,
+                frame_inspection_classification_hash=
+                    classification_hash_by_qa[source_ids[0]],
                 global_inspection_boundary_tolerance_seconds=
                     self.global_inspection_boundary_tolerance_seconds))
         _write_once(plan_path, {
@@ -1281,33 +1325,21 @@ class PromptDeltaInterventionRunner:
             baseline_video_manifest_path,
             global_inspection_boundary_tolerance_seconds=
                 plan.global_inspection_boundary_tolerance_seconds)
-        classification_hash = sha256_json({
-            "policy": PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
-            "global_inspection_boundary_tolerance_seconds":
-                plan.global_inspection_boundary_tolerance_seconds,
-            "qa_classifications": [{
-                "qa_id": row["qa_id"],
-                "assistant_timestamp_cited_segments":
-                    row["assistant_timestamp_cited_segments"],
-                "localized_frame_inspected_segments":
-                    row["localized_frame_inspected_segments"],
-                "global_frame_inspected_segments":
-                    row["global_frame_inspected_segments"],
-                "frame_inspect_calls": row["frame_inspect_calls"],
-            } for row in selection_records],
-        })
-        if classification_hash != plan.frame_inspection_classification_hash:
-            raise FreshPromptDeltaError(
-                "frame-inspection classification identity changed")
         scope_by_qa = {
             row["qa_id"]: tuple(row["intervention_candidate_segments"])
             for row in selection_records
         }
+        selection_by_qa = {row["qa_id"]: row for row in selection_records}
         source_qa_ids = tuple(plan.prompt_delta.source_qa_ids)
-        if not source_qa_ids or any(qa_id not in scope_by_qa
-                                    for qa_id in source_qa_ids):
+        if len(source_qa_ids) != 1 or source_qa_ids[0] not in scope_by_qa:
             raise FreshPromptDeltaError(
                 "prompt-delta source QA provenance is missing")
+        classification_hash = _source_qa_classification_hash(
+            selection_by_qa[source_qa_ids[0]], tolerance_seconds=
+                plan.global_inspection_boundary_tolerance_seconds)
+        if classification_hash != plan.frame_inspection_classification_hash:
+            raise FreshPromptDeltaError(
+                "source-QA frame-inspection classification identity changed")
         permitted = {
             segment_id for qa_id in source_qa_ids
             for segment_id in scope_by_qa[qa_id]
@@ -1400,6 +1432,12 @@ class PromptDeltaInterventionRunner:
             view_name=plan.prompt_delta.delta_id)
         if set(mixed.replaced_clip_ids) != set(selected):
             raise FreshPromptDeltaError("mixed view did not replace every clip")
+        mixed_view_identity = {
+            "delta_id": plan.prompt_delta.delta_id,
+            "captions_hash": mixed.captions_hash,
+            "selected_segment_ids": list(selected),
+            "replaced_segment_ids": list(mixed.replaced_clip_ids),
+        }
         outcomes = []
         qa_records = []
         for baseline_qa in baseline_qas:
@@ -1450,6 +1488,7 @@ class PromptDeltaInterventionRunner:
             "downstream_qa_execution_identity":
                 dvd_qa_execution_identity(self.dvd_max_iterations),
             "mixed_captions_path": mixed.captions_path,
+            "mixed_view_identity": mixed_view_identity,
             "qa_records": qa_records,
             "legacy_property_codebook_or_router_used": False,
         })
@@ -1465,7 +1504,8 @@ class PromptDeltaInterventionRunner:
             prompt_delta=plan.prompt_delta, clips=tuple(clip_records),
             qa_outcomes=tuple(outcomes),
             baseline_run_ref=os.path.abspath(baseline_video_manifest_path),
-            intervention_run_ref=run_ref)
+            intervention_run_ref=run_ref,
+            mixed_view_identity=mixed_view_identity)
         _write_once(episode_path, {
             "schema_version": "fresh_intervention_episode_envelope_v1",
             "input_identity": identity, "episode": episode})

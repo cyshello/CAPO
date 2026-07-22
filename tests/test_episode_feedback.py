@@ -26,7 +26,6 @@ from surrogate_rollout.optimization.schemas import (
 )
 from surrogate_rollout.prompt_routing.schemas import dumps_canonical
 from surrogate_rollout.schemas import sha256_json
-from test_legacy_intervention_adapter import convert, legacy_bundle
 
 
 def episode_fixture(*, episode_id: str = "episode-001") -> InterventionEpisode:
@@ -104,21 +103,6 @@ def test_synthetic_episode_generates_valid_feedback_with_exact_counts():
         "1 source QA and 3 sibling QA."
     )
     assert feedback.confidence == DETERMINISTIC_CONFIDENCE_MARKER
-
-
-def test_checkpoint_b_adapter_output_generates_feedback(tmp_path):
-    episode = convert(legacy_bundle(tmp_path))
-    feedback = generate(episode)
-
-    validate_episode_feedback(feedback, episode)
-    assert feedback.episode_id == episode.episode_id
-    assert feedback.observations[0].supporting_segment_ids == (
-        "0_10", "10_20")
-    transition_qa_ids = tuple(
-        qa_id for item in feedback.observations
-        if item.evidence_type == "qa_transition"
-        for qa_id in item.supporting_qa_ids)
-    assert transition_qa_ids == tuple(item.qa_id for item in episode.qa_outcomes)
 
 
 def test_changed_caption_observation_excludes_unchanged_clips():
@@ -232,7 +216,7 @@ def test_episode_feedback_json_round_trip():
     assert dumps_canonical(restored) == dumps_canonical(feedback)
 
 
-def test_semantic_eligibility_requires_grounding_and_nonempty_free_text():
+def test_eligibility_does_not_apply_model_output_semantic_rules():
     episode = episode_fixture()
     feedback = generate(episode)
     report = evaluate_episode_feedback_eligibility(feedback, episode)
@@ -243,23 +227,22 @@ def test_semantic_eligibility_requires_grounding_and_nonempty_free_text():
 
     empty = dataclasses.replace(feedback, generator_diagnosis="   ")
     report = evaluate_episode_feedback_eligibility(empty, episode)
-    assert report.eligible is False
-    assert "generator_diagnosis is empty" in report.reasons
+    assert report.eligible is True
+    assert report.reasons == ()
 
 
-def test_schema_rejects_transition_inconsistent_feedback_before_updater():
+def test_cross_record_validator_does_not_judge_transition_semantics():
     episode = episode_fixture()
     feedback = generate(episode)
     source = next(item for item in feedback.observations
                   if item.transition_type == "wrong_to_correct")
-    with pytest.raises(ValueError, match="supported QA transition"):
-        dataclasses.replace(source, transition_type=None)
-    with pytest.raises(ValueError, match="stored QA outcomes"):
-        validate_episode_feedback(
-            dataclasses.replace(
-                feedback,
-                observations=tuple(
-                    dataclasses.replace(item, transition_type="wrong_to_wrong")
-                    if item is source else item
-                    for item in feedback.observations)),
-            episode)
+    without_transition = dataclasses.replace(source, transition_type=None)
+    validate_episode_feedback(
+        dataclasses.replace(
+            feedback,
+            observations=tuple(
+                dataclasses.replace(item, transition_type="wrong_to_wrong")
+                if item is source else item
+                for item in feedback.observations)),
+        episode)
+    assert without_transition.transition_type is None

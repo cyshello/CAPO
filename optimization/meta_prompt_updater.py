@@ -9,67 +9,54 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from surrogate_rollout.optimization.schemas import (
+    CompactFeedbackMemoryRecord,
     EpisodeFeedback,
+    EpisodeFeedbackMemoryRecord,
     MetaPromptUpdateDecision,
     MetaPromptVersion,
     meta_prompt_update_decision_from_json,
     validate_meta_prompt_update_decision,
 )
+from surrogate_rollout.optimization.feedback_memory import (
+    build_compact_feedback_updater_projection,
+    select_historical_feedback_memories,
+)
 from surrogate_rollout.prompt_routing.schemas import dumps_canonical
 from surrogate_rollout.schemas import sha256_json
+from surrogate_rollout.optimization.context_budget import ContextTruncationResult
 
 
 META_PROMPT_UPDATE_REQUEST_SCHEMA_VERSION = "meta_prompt_update_request_v1"
 GROUNDED_META_PROMPT_UPDATE_REQUEST_SCHEMA_VERSION = \
     "meta_prompt_update_request_v2_grounded"
+COMPACT_MEMORY_META_PROMPT_UPDATE_REQUEST_SCHEMA_VERSION = \
+    "meta_prompt_update_request_v3_compact_memory"
+EPISODE_HISTORY_META_PROMPT_UPDATE_REQUEST_SCHEMA_VERSION = \
+    "meta_prompt_update_request_v5_compact_id_free_current_feedback"
 META_PROMPT_UPDATE_RESPONSE_SCHEMA_VERSION = "meta_prompt_update_response_v1"
 MOCK_META_PROMPT_UPDATER_POLICY_VERSION = "mock_meta_prompt_updater_v1"
 
-META_PROMPT_UPDATER_SYSTEM_INSTRUCTION = """You update the procedure used by a visual- and history-conditioned prompt generator.
+_PROMPT_DIRECTORY = Path(__file__).resolve().parent / "prompts"
 
-Input contains one current parent meta-prompt and an ordered list of validated episode-feedback records. Use only those records. Raw episodes, captions, trajectories, QA answers, and prompt deltas are intentionally absent.
 
-When feedback_grounding is present, it is deterministic metadata derived from
-the corresponding stored episode. If caption_change_status is unchanged,
-treat any QA flip as attribution-uncertain no-op evidence, not as direct
-caption-strategy benefit or harm. Do not override these grounding facts from
-the feedback prose.
+def _load_prompt_text(filename: str) -> str:
+    path = _PROMPT_DIRECTORY / filename
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"meta-prompt updater prompt unavailable: {path}") from exc
+    if not value:
+        raise RuntimeError(f"meta-prompt updater prompt is empty: {path}")
+    return value
 
-Your goal is not to vote over QA transition counts. Determine why caption changes helped, harmed, or had no demonstrated utility by comparing the diagnoses, observations, counterevidence, and recommended strategies across feedback records.
 
-Reason in this order:
-1. identify beneficial caption behavior supported by the feedback;
-2. identify harmful, neutral, or limiting behavior;
-3. determine whether the difference can be expressed as a condition recognizable from current frames or bounded preceding history;
-4. propose the smallest conditional change that preserves the beneficial behavior while avoiding the observed risk;
-5. return no_update when no coherent and runtime-observable condition is supported.
-
-QA transition counts are descriptive evidence, not a majority vote. Do not require every episode to improve. Harmful evidence may define when a strategy should not be applied rather than automatically ruling out an update. Mixed outcomes may support a conditional update when the feedback explains their difference. Return no_update when the records do not support a coherent mechanism, the required condition cannot be recognized from runtime inputs, or the harmful evidence cannot be addressed by a clear restriction.
-
-Treat all conclusions as provisional. Do not turn one episode into a universal rule. Clearly explain which feedback records support the proposed behavior and which records define its boundary or risk.
-
-The runtime prompt generator can use only current visual frames, bounded preceding caption history, and the current meta-prompt. Do not require QA information, correctness labels, trajectories, OCR metadata, external tools, or other unavailable inputs.
-
-Do not place QA answers, dataset-specific wording, clip IDs, segment IDs, feedback IDs, or episode IDs in the candidate meta-prompt. Express any update in new, general wording rather than reproducing an individual intervention instruction. Make only the smallest necessary change to the parent meta-prompt; do not rewrite it wholesale.
-
-A no_update decision is normal when evidence is insufficient or cannot support a safe conditional change.
-
-Return exactly one strict JSON object with:
-- decision
-- candidate_meta_prompt
-- change_summary
-- rationale
-- supporting_feedback_ids
-
-For update, candidate_meta_prompt must be a non-empty string.
-For no_update, candidate_meta_prompt must be null.
-supporting_feedback_ids may contain only exact IDs from the input.
-
-Do not return a candidate ID, request hash, status, Markdown fence, prefix, suffix, or explanatory prose outside the JSON object."""
+META_PROMPT_UPDATER_SYSTEM_INSTRUCTION = _load_prompt_text(
+    "meta_prompt_updater_system_v3.txt")
 
 _RESPONSE_FIELDS = {
     "decision", "candidate_meta_prompt", "change_summary", "rationale",
@@ -99,6 +86,10 @@ class MetaPromptUpdater(Protocol):
         feedbacks: Sequence[EpisodeFeedback],
         *,
         feedback_grounding: Sequence[Mapping[str, Any]] | None = None,
+        feedback_memories: Sequence[CompactFeedbackMemoryRecord] | None = None,
+        historical_memories: Sequence[EpisodeFeedbackMemoryRecord] | None = None,
+        current_iteration_id: str | None = None,
+        historical_memory_character_budget: int | None = None,
     ) -> "MetaPromptUpdateResult":
         ...
 
@@ -169,18 +160,100 @@ def _normalize_feedbacks(
     return values
 
 
+_SEGMENT_IDENTIFIER_RE = re.compile(r"(?<![A-Za-z0-9_])\d+_\d+(?![A-Za-z0-9_])")
+_QA_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:videomme(?:/|-)[A-Za-z0-9_/-]+|qa[-_/][A-Za-z0-9_-]+)",
+    flags=re.IGNORECASE,
+)
+
+
+def _id_free_text(value: str) -> str:
+    """Remove provenance tokens from model prose used by the updater."""
+    text = _SEGMENT_IDENTIFIER_RE.sub("a selected interval", str(value))
+    text = _QA_IDENTIFIER_RE.sub("a QA", text)
+    return " ".join(text.split())
+
+
+def _transition_counts(
+    feedback: EpisodeFeedback,
+    grounded: Mapping[str, Any] | None,
+) -> dict[str, int]:
+    if grounded is not None:
+        summary = grounded.get("qa_transition_summary")
+        if isinstance(summary, Mapping) and all(
+                isinstance(summary.get(name), list)
+                for name in (
+                    "correct_to_correct", "wrong_to_wrong",
+                    "wrong_to_correct", "correct_to_wrong")):
+            return {name: len(summary[name]) for name in (
+                "correct_to_correct", "wrong_to_wrong",
+                "wrong_to_correct", "correct_to_wrong")}
+    by_type = {
+        name: set() for name in (
+            "correct_to_correct", "wrong_to_wrong",
+            "wrong_to_correct", "correct_to_wrong")}
+    for evidence in (*feedback.observations, *feedback.counterevidence):
+        if evidence.evidence_type == "qa_transition" and \
+                evidence.transition_type in by_type:
+            by_type[evidence.transition_type].update(
+                evidence.supporting_qa_ids)
+    return {name: len(values) for name, values in by_type.items()}
+
+
+def _updater_feedback_projection(
+    feedback: EpisodeFeedback,
+    grounded: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    counts = _transition_counts(feedback, grounded)
+    improved = counts["wrong_to_correct"] > 0
+    regressed = counts["correct_to_wrong"] > 0
+    effect = (
+        "mixed" if improved and regressed else
+        "positive" if improved else
+        "negative" if regressed else "neutral")
+    evidence_statements = []
+    for evidence in (*feedback.observations, *feedback.counterevidence):
+        if evidence.evidence_type == "qa_transition":
+            continue
+        statement = _id_free_text(evidence.statement)
+        if statement and statement not in evidence_statements:
+            evidence_statements.append(statement)
+    changed = (
+        grounded.get("changed_segment_ids")
+        if isinstance(grounded, Mapping) else None)
+    return {
+        "caption_change_status": (
+            grounded.get("caption_change_status", "not_provided")
+            if isinstance(grounded, Mapping) else "not_provided"),
+        "changed_caption_count": (
+            len(changed) if isinstance(changed, list) else None),
+        "qa_transition_counts": counts,
+        "episode_effect": effect,
+        "caption_or_trajectory_evidence": evidence_statements,
+        "recommended_strategy_change": _id_free_text(
+            feedback.recommended_strategy_change),
+    }
+
+
 def build_meta_prompt_update_request(
     parent: MetaPromptVersion,
     feedbacks: Sequence[EpisodeFeedback],
     *,
     updater_policy_version: str,
     feedback_grounding: Sequence[Mapping[str, Any]] | None = None,
+    feedback_memories: Sequence[CompactFeedbackMemoryRecord] | None = None,
+    historical_memories: Sequence[EpisodeFeedbackMemoryRecord] | None = None,
+    current_iteration_id: str | None = None,
+    historical_memory_character_budget: int | None = None,
 ) -> MetaPromptUpdateRequest:
     if not isinstance(parent, MetaPromptVersion):
         raise TypeError("parent must be a MetaPromptVersion")
     if not isinstance(updater_policy_version, str) or not updater_policy_version:
         raise ValueError("updater_policy_version must be a non-empty string")
     ordered = _normalize_feedbacks(feedbacks)
+    if feedback_memories is not None and historical_memories is not None:
+        raise ValueError(
+            "legacy feedback_memories and historical_memories are mutually exclusive")
     grounding = None
     if feedback_grounding is not None:
         if isinstance(feedback_grounding, (str, bytes)):
@@ -196,16 +269,67 @@ def build_meta_prompt_update_request(
             raise ValueError(
                 "feedback_grounding order or feedback IDs do not match")
         grounding = json.loads(dumps_canonical(grounding))
+    memories = None
+    if feedback_memories is not None:
+        if isinstance(feedback_memories, (str, bytes)):
+            raise TypeError("feedback_memories must be an ordered sequence")
+        memory_records = tuple(feedback_memories)
+        if not memory_records or any(
+                not isinstance(item, CompactFeedbackMemoryRecord)
+                for item in memory_records):
+            raise TypeError(
+                "feedback_memories must contain CompactFeedbackMemoryRecord")
+        memories = build_compact_feedback_updater_projection(memory_records)
+    historical = None
+    if historical_memories is not None:
+        if not isinstance(current_iteration_id, str) or not current_iteration_id:
+            raise ValueError(
+                "current_iteration_id is required with historical_memories")
+        history_records = tuple(historical_memories)
+        if any(not isinstance(item, EpisodeFeedbackMemoryRecord)
+               for item in history_records):
+            raise TypeError(
+                "historical_memories must contain EpisodeFeedbackMemoryRecord")
+        if any(item.parent_meta_prompt_id != parent.meta_prompt_id
+               for item in history_records):
+            raise ValueError("historical memory belongs to another parent")
+        selected, selection = select_historical_feedback_memories(
+            history_records,
+            current_iteration_id=current_iteration_id,
+            maximum_serialized_characters=historical_memory_character_budget)
+        historical = {
+            "memories": [
+                {"memory_text": item["memory_text"]} for item in selected],
+            "selection": {
+                "selected_memory_count": len(selected),
+                "excluded_memory_count": len(
+                    selection["excluded_memory_ids"]),
+                "selection_policy": selection["selection_policy"],
+                "maximum_serialized_characters": (
+                    selection["maximum_serialized_characters"]),
+                "selected_serialized_characters": (
+                    selection["selected_serialized_characters"]),
+            },
+        }
+    current_feedback = [
+        _updater_feedback_projection(
+            item, grounding[index] if grounding is not None else None)
+        for index, item in enumerate(ordered)
+    ]
     payload = json.loads(dumps_canonical({
         "schema_version": (
-            GROUNDED_META_PROMPT_UPDATE_REQUEST_SCHEMA_VERSION
-            if grounding is not None else
-            META_PROMPT_UPDATE_REQUEST_SCHEMA_VERSION),
+            EPISODE_HISTORY_META_PROMPT_UPDATE_REQUEST_SCHEMA_VERSION
+            if memories is None else
+            COMPACT_MEMORY_META_PROMPT_UPDATE_REQUEST_SCHEMA_VERSION
+        ),
         "updater_policy_version": updater_policy_version,
         "parent_meta_prompt": parent,
-        "feedbacks": ordered,
-        **({"feedback_grounding": grounding}
-           if grounding is not None else {}),
+        **({
+            "current_iteration_feedback": current_feedback,
+            "historical_experience": historical,
+        } if historical is not None else
+           {"compact_feedback_memory": memories} if memories is not None else
+           {"current_iteration_feedback": current_feedback}),
     }))
     payload_hash = sha256_json(payload)
     user_request = dumps_canonical(payload)
@@ -248,6 +372,8 @@ def _contains_exact_identifier(text: str, identifier: str) -> bool:
 def validate_meta_prompt_candidate_content(
     decision: MetaPromptUpdateDecision,
     feedbacks: tuple[EpisodeFeedback, ...],
+    feedback_memories: Sequence[CompactFeedbackMemoryRecord] | None = None,
+    historical_memories: Sequence[EpisodeFeedbackMemoryRecord] | None = None,
 ) -> None:
     if decision.candidate_meta_prompt is None:
         return
@@ -265,6 +391,20 @@ def validate_meta_prompt_candidate_content(
         )
         if identifier
     }
+    if feedback_memories is not None:
+        forbidden_ids.update(
+            identifier
+            for record in feedback_memories
+            for identifier in (
+                record.memory_id, record.provenance.feedback_id,
+                record.provenance.episode_id, record.provenance.video_id,
+                *record.provenance.qa_ids, *record.provenance.segment_ids)
+            if identifier)
+    if historical_memories is not None:
+        forbidden_ids.update(
+            identifier for record in historical_memories for identifier in (
+                record.memory_id, record.feedback_id, record.episode_id,
+                record.candidate_id) if identifier)
     present = sorted(
         identifier for identifier in forbidden_ids
         if _contains_exact_identifier(
@@ -290,6 +430,8 @@ def parse_meta_prompt_update_response(
     *,
     request: MetaPromptUpdateRequest,
     feedbacks: Sequence[EpisodeFeedback],
+    feedback_memories: Sequence[CompactFeedbackMemoryRecord] | None = None,
+    historical_memories: Sequence[EpisodeFeedbackMemoryRecord] | None = None,
 ) -> tuple[MetaPromptUpdateDecision, str | None, str | None]:
     ordered = _normalize_feedbacks(feedbacks)
     try:
@@ -300,8 +442,19 @@ def parse_meta_prompt_update_response(
             raise ValueError(
                 f"response must contain exactly {sorted(_RESPONSE_FIELDS)}")
         decision = meta_prompt_update_decision_from_json(value)
-        validate_meta_prompt_update_decision(decision, ordered)
-        validate_meta_prompt_candidate_content(decision, ordered)
+        known = {item.feedback_id for item in ordered}
+        if feedback_memories is not None:
+            known.update(item.provenance.feedback_id
+                         for item in feedback_memories)
+        if historical_memories is not None:
+            known.update(item.feedback_id for item in historical_memories)
+        unknown = set(decision.supporting_feedback_ids) - known
+        if unknown:
+            raise ValueError(
+                "MetaPromptUpdateDecision references unknown feedback IDs: "
+                f"{sorted(unknown)}")
+        validate_meta_prompt_candidate_content(
+            decision, ordered, feedback_memories, historical_memories)
         restored = meta_prompt_update_decision_from_json(
             json.loads(dumps_canonical(decision)))
         if restored != decision:
@@ -360,15 +513,49 @@ class LLMMetaPromptUpdater:
         feedbacks: Sequence[EpisodeFeedback],
         *,
         feedback_grounding: Sequence[Mapping[str, Any]] | None = None,
+        feedback_memories: Sequence[CompactFeedbackMemoryRecord] | None = None,
+        historical_memories: Sequence[EpisodeFeedbackMemoryRecord] | None = None,
+        current_iteration_id: str | None = None,
+        historical_memory_character_budget: int | None = None,
     ) -> MetaPromptUpdateResult:
         ordered = _normalize_feedbacks(feedbacks)
         request = build_meta_prompt_update_request(
             parent, ordered,
             updater_policy_version=self.updater_policy_version,
-            feedback_grounding=feedback_grounding)
+            feedback_grounding=feedback_grounding,
+            feedback_memories=feedback_memories,
+            historical_memories=historical_memories,
+            current_iteration_id=current_iteration_id,
+            historical_memory_character_budget=(
+                historical_memory_character_budget))
+        fit_user_request = getattr(self.backend, "fit_user_request", None)
+        if fit_user_request is not None:
+            if not callable(fit_user_request):
+                raise TypeError("backend fit_user_request must be callable")
+            transmitted, fitted = fit_user_request(
+                request.system_instruction, request.user_request)
+            if fitted is not None:
+                if not isinstance(fitted, ContextTruncationResult):
+                    raise TypeError("invalid updater context fitting result")
+                if fitted.truncated:
+                    payload = json.loads(transmitted)
+                    request = replace(
+                        request,
+                        payload=payload,
+                        payload_hash=fitted.transmitted_payload_hash,
+                        request_id=("meta_prompt_update_request_" +
+                                    fitted.transmitted_payload_hash[:20]),
+                        messages=(
+                            {"role": "system",
+                             "content": request.system_instruction},
+                            {"role": "user", "content": transmitted},
+                        ),
+                    )
         raw = self.backend(request.system_instruction, request.user_request)
         decision, candidate_id, status = parse_meta_prompt_update_response(
-            raw, request=request, feedbacks=ordered)
+            raw, request=request, feedbacks=ordered,
+            feedback_memories=feedback_memories,
+            historical_memories=historical_memories)
         return MetaPromptUpdateResult(
             request=request,
             decision=decision,
@@ -397,13 +584,27 @@ class DeterministicMockMetaPromptUpdater:
         feedbacks: Sequence[EpisodeFeedback],
         *,
         feedback_grounding: Sequence[Mapping[str, Any]] | None = None,
+        feedback_memories: Sequence[CompactFeedbackMemoryRecord] | None = None,
+        historical_memories: Sequence[EpisodeFeedbackMemoryRecord] | None = None,
+        current_iteration_id: str | None = None,
+        historical_memory_character_budget: int | None = None,
     ) -> MetaPromptUpdateResult:
         ordered = _normalize_feedbacks(feedbacks)
         request = build_meta_prompt_update_request(
             parent, ordered,
             updater_policy_version=self.updater_policy_version,
-            feedback_grounding=feedback_grounding)
-        supporting_ids = tuple(item.feedback_id for item in ordered)
+            feedback_grounding=feedback_grounding,
+            feedback_memories=feedback_memories,
+            historical_memories=historical_memories,
+            current_iteration_id=current_iteration_id,
+            historical_memory_character_budget=(
+                historical_memory_character_budget))
+        supporting_ids = tuple(dict.fromkeys(
+            item.provenance.feedback_id for item in feedback_memories)) \
+            if feedback_memories is not None else tuple(dict.fromkeys((
+                *(item.feedback_id for item in ordered),
+                *(item.feedback_id for item in (historical_memories or ())),
+            )))
         if self.candidate_meta_prompt is None:
             decision = MetaPromptUpdateDecision(
                 decision="no_update",
@@ -427,7 +628,8 @@ class DeterministicMockMetaPromptUpdater:
                     "synthesis was performed."),
                 supporting_feedback_ids=supporting_ids,
             )
-            validate_meta_prompt_candidate_content(decision, ordered)
+            validate_meta_prompt_candidate_content(
+                decision, ordered, feedback_memories, historical_memories)
             identity = {
                 "parent_meta_prompt_id": parent.meta_prompt_id,
                 "updater_policy_version": self.updater_policy_version,
@@ -436,7 +638,8 @@ class DeterministicMockMetaPromptUpdater:
             }
             candidate_id = "meta_prompt_" + sha256_json(identity)[:20]
             status = "provisional"
-        validate_meta_prompt_update_decision(decision, ordered)
+        if feedback_memories is None and historical_memories is None:
+            validate_meta_prompt_update_decision(decision, ordered)
         return MetaPromptUpdateResult(
             request=request,
             decision=decision,

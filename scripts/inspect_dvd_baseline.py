@@ -61,7 +61,8 @@ def _environment_info() -> dict:
     import importlib.metadata as md
 
     pkgs = {}
-    for name in ("gepa", "vllm", "transformers", "torch", "openai", "sentence-transformers", "nano-vectordb"):
+    for name in ("vllm", "transformers", "torch", "openai",
+                 "sentence-transformers", "nano-vectordb"):
         try:
             pkgs[name] = md.version(name)
         except md.PackageNotFoundError:

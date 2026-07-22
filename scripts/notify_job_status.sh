@@ -19,7 +19,7 @@ DONE_FILE="${4:-}"
 STALE_MIN="${5:-30}"
 TOTAL="${6:-}"     # optional total unit count, e.g. 103, shown as done/TOTAL
 
-ENV_FILE="/home/intern/youngseo/surrogate_rollout/.env"
+ENV_FILE="${SR_PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/.env"
 TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
 CHAT="$(grep -E '^TELEGRAM_CHAT_ID=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
 if [ -z "${TOKEN:-}" ] || [ -z "${CHAT:-}" ]; then

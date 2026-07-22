@@ -9,18 +9,19 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
-PROJECT_ROOT="/home/intern/youngseo/surrogate_rollout"
+PROJECT_ROOT="${SR_PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+: "${SR_CONDA_ENV:=local_llm_vllm}"
 cd "$PROJECT_ROOT"
 
 set -a
-source "/home/intern/youngseo/surrogate_rollout/.env"
+source "$PROJECT_ROOT/.env"
 set +a
 
-export PYTHONPATH="/home/intern/youngseo${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$(dirname "$PROJECT_ROOT")${PYTHONPATH:+:$PYTHONPATH}"
 : "${OPENAI_API_KEY:?OPENAI_API_KEY is missing from the project .env}"
 
 FEEDBACK_ROOT="$(realpath "$1")"
-PARENT_META_PROMPT_ARTIFACT="/home/intern/youngseo/surrogate_rollout/runs/meta_prompt_bootstrap_20260720_074042/parent_meta_prompt.json"
+PARENT_META_PROMPT_ARTIFACT="${PARENT_META_PROMPT_ARTIFACT:-$PROJECT_ROOT/optimization/prompts/init_meta_prompt.json}"
 UPDATE_TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
 OUTPUT_DIRECTORY="$PROJECT_ROOT/runs/selected_meta_prompt_update_$UPDATE_TIMESTAMP"
 
@@ -83,7 +84,7 @@ for index in "${!FEEDBACK_ARTIFACTS[@]}"; do
       "${FEEDBACK_ARTIFACTS[$index]}: invalid run manifest $manifest_reason")
     continue
   fi
-  if conda run -n local_llm_vllm python -c '
+  if conda run -n "$SR_CONDA_ENV" python -c '
 import json
 import sys
 from pathlib import Path
@@ -119,7 +120,7 @@ if ((${#ELIGIBLE_FEEDBACK_ARTIFACTS[@]} < 2)); then
   exit 1
 fi
 
-conda run -n local_llm_vllm python -c '
+conda run -n "$SR_CONDA_ENV" python -c '
 import json
 import sys
 from pathlib import Path
@@ -145,7 +146,7 @@ for feedback_artifact in "${ELIGIBLE_FEEDBACK_ARTIFACTS[@]}"; do
   FEEDBACK_ARGS+=(--feedback-artifact "$feedback_artifact")
 done
 
-conda run --no-capture-output -n local_llm_vllm \
+conda run --no-capture-output -n "$SR_CONDA_ENV" \
   python "$PROJECT_ROOT/scripts/run_meta_prompt_update_once.py" \
   --provider openai_api \
   --api-endpoint https://api.openai.com/v1/chat/completions \
@@ -155,6 +156,7 @@ conda run --no-capture-output -n local_llm_vllm \
   --updater-policy-version meta_prompt_updater_e2_grounded_multi_episode_v2 \
   --temperature 0.0 \
   --maximum-output-tokens 4096 \
+  --context-limit 128000 \
   --candidate-created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --output-dir "$OUTPUT_DIRECTORY" \
   --timeout-seconds 600

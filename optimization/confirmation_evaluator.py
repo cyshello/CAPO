@@ -26,8 +26,6 @@ from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
     free_form_router_version,
 )
 from surrogate_rollout.prompt_routing.schemas import (
-    PromptBankSnapshot,
-    RouterPolicySnapshot,
     ScaffoldContract,
     ScaffoldPolicySnapshot,
     as_json_dict,
@@ -148,7 +146,7 @@ def _transition(before: bool, after: bool) -> str:
 
 
 class HistoryAwareDVDConfirmationEvaluator:
-    """Evaluate parent and candidate on one immutable two-video input bundle."""
+    """Evaluate parent and candidate on one immutable held-out input bundle."""
 
     policy_version = "history_aware_dvd_confirmation_v1"
 
@@ -334,10 +332,11 @@ class HistoryAwareDVDConfirmationEvaluator:
         scaffold: ScaffoldPolicySnapshot, contract: ScaffoldContract,
         output_dir: str,
     ) -> tuple[str, Mapping[str, Any]]:
-        if len(confirmation_videos) != 2 or len({
-                item.video_id for item in confirmation_videos}) != 2:
+        if not confirmation_videos or len({
+                item.video_id for item in confirmation_videos}) != len(
+                    confirmation_videos):
             raise ConfirmationEvaluationError(
-                "confirmation requires exactly two unique videos")
+                "confirmation requires non-empty unique videos")
         runtime = self._runtime_configuration(scaffold, contract)
         videos = []
         for record in confirmation_videos:
@@ -446,7 +445,7 @@ class HistoryAwareDVDConfirmationEvaluator:
 
     def _caption_state(
         self, *, state_name: str, bundle: Mapping[str, Any],
-        bank: PromptBankSnapshot, router: RouterPolicySnapshot,
+        bank_version: str, router_version: str,
         scaffold: ScaffoldPolicySnapshot, contract: ScaffoldContract,
         output_dir: str,
         free_form_generator: Any = _FREE_FORM_GENERATOR_UNSET,
@@ -466,7 +465,8 @@ class HistoryAwareDVDConfirmationEvaluator:
                 view = self.builder.build(
                     sample=dict(video["qas"][0]["sample"]),
                     clip_index=self._clip_index(video),
-                    prompt_bank=bank, router_policy=router,
+                    bank_version=bank_version,
+                    router_version=router_version,
                     scaffold_policy=scaffold, scaffold_contract=contract,
                     base_prompt_template=self.base_prompt_template,
                     merge_prompt=self.merge_prompt, work_root=work_root,
@@ -506,8 +506,8 @@ class HistoryAwareDVDConfirmationEvaluator:
                 expected_router_version = (
                     free_form_router_version(active_generator.identity_hash)
                     if active_generator is not None else
-                    router.router_version)
-                if key["bank_version"] != bank.bank_version or \
+                    router_version)
+                if key["bank_version"] != bank_version or \
                         key["router_version"] != expected_router_version or \
                         key["scaffold_version"] != scaffold.scaffold_version or \
                         key["contract_version"] != contract.contract_version or \
@@ -550,10 +550,10 @@ class HistoryAwareDVDConfirmationEvaluator:
             "state_name": state_name,
             "input_bundle_hash": bundle["bundle_hash"],
             "runtime_configuration_hash": bundle["runtime_configuration_hash"],
-            "bank_version": bank.bank_version,
-            "bank_hash": sha256_json(as_json_dict(bank)),
-            "router_version": router.router_version,
-            "router_hash": sha256_json(as_json_dict(router)),
+            "bank_version": bank_version,
+            "bank_hash": sha256_text(bank_version),
+            "router_version": router_version,
+            "router_hash": sha256_text(router_version),
             "prompt_generator": (
                 as_json_dict(active_generator.configuration_identity)
                 if active_generator is not None else None),
@@ -633,151 +633,3 @@ class HistoryAwareDVDConfirmationEvaluator:
                 }
                 rows.append(row)
         return tuple(rows)
-
-    def evaluate(
-        self, *, confirmation_videos: tuple[Any, ...],
-        incumbent_bank: PromptBankSnapshot,
-        incumbent_router: RouterPolicySnapshot,
-        candidate_bank: PromptBankSnapshot,
-        candidate_router: RouterPolicySnapshot,
-        scaffold_policy: ScaffoldPolicySnapshot,
-        scaffold_contract: ScaffoldContract,
-        output_dir: str,
-    ) -> Mapping[str, Any]:
-        output_dir = os.path.abspath(output_dir)
-        evaluator_dir = os.path.join(output_dir, "history_aware_evaluator")
-        manifest_path = os.path.join(evaluator_dir, "manifest.json")
-        self._validate_live_runtime()
-        runtime = self._runtime_configuration(scaffold_policy, scaffold_contract)
-        requested_identity = {
-            "policy_version": self.policy_version,
-            "confirmation_videos": confirmation_videos,
-            "incumbent_bank": incumbent_bank,
-            "incumbent_router": incumbent_router,
-            "candidate_bank": candidate_bank,
-            "candidate_router": candidate_router,
-            "scaffold_policy": scaffold_policy,
-            "scaffold_contract": scaffold_contract,
-            "runtime_configuration": runtime,
-        }
-        request_hash = sha256_text(dumps_canonical(requested_identity))
-        if os.path.exists(manifest_path):
-            manifest = _read_json(manifest_path)
-            if manifest.get("status") != "completed" or \
-                    manifest.get("request_hash") != request_hash:
-                raise ConfirmationEvaluationConflictError(
-                    "completed confirmation belongs to different frozen inputs")
-            bundle_path = manifest.get("input_bundle_path")
-            if not bundle_path or not os.path.exists(bundle_path) or \
-                    manifest.get("input_bundle_file_hash") != \
-                    _file_hash(bundle_path):
-                raise ConfirmationEvaluationConflictError(
-                    "completed confirmation input bundle is missing or changed")
-            self._validate_bundle(_read_json(bundle_path))
-            return ConfirmationEvaluationResult(
-                manifest_path=os.path.abspath(manifest_path),
-                input_bundle_path=bundle_path,
-                input_bundle_hash=manifest["input_bundle_hash"],
-                qas=tuple(manifest["qas"]), resumed=True).as_mapping()
-
-        bundle_path, bundle = self._materialize_bundle(
-            confirmation_videos=confirmation_videos,
-            scaffold=scaffold_policy, contract=scaffold_contract,
-            output_dir=evaluator_dir)
-        parent = self._caption_state(
-            state_name="parent", bundle=bundle,
-            bank=incumbent_bank, router=incumbent_router,
-            scaffold=scaffold_policy, contract=scaffold_contract,
-            output_dir=evaluator_dir)
-        candidate = self._caption_state(
-            state_name="candidate", bundle=bundle,
-            bank=candidate_bank, router=candidate_router,
-            scaffold=scaffold_policy, contract=scaffold_contract,
-            output_dir=evaluator_dir)
-        self._validate_live_runtime()
-        self._validate_bundle(bundle)
-        self._validate_paired_states(parent, candidate, bundle)
-        parent_qas = self._run_qas(
-            state_name="parent", bundle=bundle, state=parent,
-            output_dir=evaluator_dir)
-        candidate_qas = self._run_qas(
-            state_name="candidate", bundle=bundle, state=candidate,
-            output_dir=evaluator_dir)
-        before = {row["question_id"]: row for row in parent_qas}
-        after = {row["question_id"]: row for row in candidate_qas}
-        expected_ids = tuple(
-            qa["question_id"] for video in bundle["videos"] for qa in video["qas"])
-        if set(before) != set(expected_ids) or set(after) != set(expected_ids):
-            raise ConfirmationEvaluationError(
-                "confirmation did not evaluate all six paired QAs")
-        paired = tuple({
-            "video_id": before[question_id]["video_id"],
-            "question_id": question_id,
-            "provider_index": before[question_id]["provider_index"],
-            "incumbent_prediction": before[question_id]["prediction"],
-            "candidate_prediction": after[question_id]["prediction"],
-            "incumbent_score": before[question_id]["score"],
-            "candidate_score": after[question_id]["score"],
-            "transition": _transition(
-                before[question_id]["is_correct"],
-                after[question_id]["is_correct"]),
-            "incumbent_errors": before[question_id]["errors"],
-            "candidate_errors": after[question_id]["errors"],
-            "error": (before[question_id]["errors"] or
-                      after[question_id]["errors"] or None),
-            "parent_caption_view_hash":
-                before[question_id]["caption_view_hash"],
-            "candidate_caption_view_hash":
-                after[question_id]["caption_view_hash"],
-        } for question_id in expected_ids)
-        regressions = tuple(row["question_id"] for row in paired
-                            if row["transition"] == "correct_to_wrong")
-        parent_accuracy = sum(row["incumbent_score"] for row in paired) / 6
-        candidate_accuracy = sum(row["candidate_score"] for row in paired) / 6
-        errors = tuple(row["question_id"] for row in paired if row["error"])
-        criterion = {
-            "all_six_qas_present": len(paired) == 6,
-            "all_evaluations_error_free": not errors,
-            "zero_correct_to_wrong": not regressions,
-            "candidate_mean_accuracy_not_lower":
-                candidate_accuracy >= parent_accuracy,
-            "accepted": not errors and not regressions and
-                        candidate_accuracy >= parent_accuracy,
-        }
-        manifest = {
-            "schema_version": "history_aware_dvd_confirmation_manifest_v1",
-            "status": "completed", "request_hash": request_hash,
-            "input_bundle_path": bundle_path,
-            "input_bundle_file_hash": _file_hash(bundle_path),
-            "input_bundle_hash": bundle["bundle_hash"],
-            "runtime_configuration": runtime,
-            "runtime_configuration_hash": bundle["runtime_configuration_hash"],
-            "parent": parent, "candidate": candidate,
-            "component_versions": {
-                "parent_bank": incumbent_bank.bank_version,
-                "parent_router": incumbent_router.router_version,
-                "candidate_bank": candidate_bank.bank_version,
-                "candidate_router": candidate_router.router_version,
-                "scaffold": scaffold_policy.scaffold_version,
-                "contract": scaffold_contract.contract_version,
-            },
-            "component_hashes": {
-                "parent_bank": sha256_json(as_json_dict(incumbent_bank)),
-                "parent_router": sha256_json(as_json_dict(incumbent_router)),
-                "candidate_bank": sha256_json(as_json_dict(candidate_bank)),
-                "candidate_router": sha256_json(as_json_dict(candidate_router)),
-                "scaffold": sha256_json(as_json_dict(scaffold_policy)),
-                "contract": sha256_json(as_json_dict(scaffold_contract)),
-            },
-            "parent_qas": parent_qas, "candidate_qas": candidate_qas,
-            "qas": paired, "criterion": criterion,
-            "parent_accuracy": parent_accuracy,
-            "candidate_accuracy": candidate_accuracy,
-            "correct_to_wrong_question_ids": regressions,
-            "proposals_generated": 0, "interventions": 0,
-            "feedback_calls": 0,
-        }
-        completed_path = _write_immutable(manifest_path, manifest)
-        return ConfirmationEvaluationResult(
-            manifest_path=completed_path, input_bundle_path=bundle_path,
-            input_bundle_hash=bundle["bundle_hash"], qas=paired).as_mapping()

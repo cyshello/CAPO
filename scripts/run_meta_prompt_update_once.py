@@ -22,7 +22,13 @@ from surrogate_rollout.optimization.meta_prompt_update_execution import (
     OpenAICompatibleMetaPromptUpdaterBackend,
     execute_meta_prompt_update_once,
 )
+from surrogate_rollout.optimization.meta_prompt_defaults import (
+    resolve_meta_prompt_artifact_path,
+)
 from surrogate_rollout.prompt_routing.schemas import dumps_canonical
+from surrogate_rollout.optimization.policies.episode_feedback_provider import (
+    ExactProviderInputTokenCount,
+)
 
 
 class ProviderTransportError(RuntimeError):
@@ -91,13 +97,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--provider", required=True, choices=("openai_api",))
     parser.add_argument("--api-endpoint", required=True)
     parser.add_argument("--model-id", required=True)
-    parser.add_argument("--parent-meta-prompt", required=True)
+    parser.add_argument(
+        "--parent-meta-prompt",
+        help=("MetaPromptVersion JSON. Omit to use "
+              "optimization/prompts/init_meta_prompt.json."))
     parser.add_argument(
         "--feedback-artifact", required=True, action="append",
         help="Ordered EpisodeFeedback JSON; repeat to preserve input order.")
     parser.add_argument("--updater-policy-version", required=True)
     parser.add_argument("--temperature", required=True, type=float)
     parser.add_argument("--maximum-output-tokens", required=True, type=int)
+    parser.add_argument("--context-limit", required=True, type=int)
     parser.add_argument("--candidate-created-at", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--timeout-seconds", required=True, type=int)
@@ -112,16 +122,37 @@ def main(argv: list[str] | None = None) -> int:
             api_key=os.environ.get("OPENAI_API_KEY", ""),
             timeout_seconds=args.timeout_seconds,
         )
+        try:
+            import tiktoken
+            encoding = tiktoken.encoding_for_model(args.model_id)
+        except Exception as exc:
+            raise ValueError(
+                f"exact tokenizer is unavailable for {args.model_id!r}: {exc}") \
+                from exc
+
+        def exact_counter(messages):
+            system = len(encoding.encode(messages[0]["content"]))
+            user = len(encoding.encode(messages[1]["content"]))
+            total = 3 + sum(
+                3 + len(encoding.encode(item["role"])) +
+                len(encoding.encode(item["content"])) for item in messages)
+            return ExactProviderInputTokenCount(system, user, total)
+
         backend = OpenAICompatibleMetaPromptUpdaterBackend(
             provider=args.provider,
             model_id=args.model_id,
             maximum_output_tokens=args.maximum_output_tokens,
             generation_settings={"temperature": args.temperature},
             updater_policy_version=args.updater_policy_version,
+            tokenizer_identity=encoding.name,
+            exact_token_counter=exact_counter,
+            context_limit=args.context_limit,
             response_transport=transport,
         )
+        parent_path = resolve_meta_prompt_artifact_path(
+            args.parent_meta_prompt)
         result = execute_meta_prompt_update_once(
-            parent_artifact_path=args.parent_meta_prompt,
+            parent_artifact_path=parent_path,
             feedback_artifact_paths=args.feedback_artifact,
             output_directory=args.output_dir,
             backend=backend,

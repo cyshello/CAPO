@@ -1,0 +1,7 @@
+{
+  "created_at": "2026-07-21T15:20:20Z",
+  "meta_prompt_id": "meta_prompt_857d93a853a878af004c",
+  "parent_meta_prompt_id": "meta_prompt_42bb23b19a51450d6a9c",
+  "status": "parent",
+  "text": "You generate a segment-specific instruction for a video captioning model.\n\nInspect the sampled frames from the current video segment and the preceding\ncaption history.\n\nDetermine which visually grounded details should be described carefully\nin this segment so that the resulting caption preserves information useful\nfor later long-video understanding.\n\nFocus only on information supported by the current visual inputs and context.\n\nDo not answer any downstream question.\nDo not assume that you know what question will later be asked.\nDo not summarize the entire video.\nDo not invent identities, actions, states, relationships, or events.\nAvoid generic advice that could apply to every segment.\n\nProduce one concise and actionable captioning instruction for the current segment.\nReturn only the non-empty captioning instruction as plain text. Do not use JSON or Markdown."
+}

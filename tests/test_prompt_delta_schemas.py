@@ -158,18 +158,16 @@ def test_feedback_with_valid_supporting_ids_is_accepted():
     validate_episode_feedback(feedback(), episode())
 
 
-def test_feedback_rejects_unknown_supporting_segment_id():
+def test_feedback_validator_does_not_judge_supporting_segment_id():
     bad = feedback(observations=(evidence(
         supporting_segment_ids=("missing-segment",)),))
-    with pytest.raises(ValueError, match="unknown segment IDs"):
-        validate_episode_feedback(bad, episode())
+    validate_episode_feedback(bad, episode())
 
 
-def test_feedback_rejects_unknown_supporting_qa_id():
+def test_feedback_validator_does_not_judge_supporting_qa_id():
     bad = feedback(counterevidence=(evidence(
         supporting_qa_ids=("missing-qa",)),))
-    with pytest.raises(ValueError, match="unknown QA IDs"):
-        validate_episode_feedback(bad, episode())
+    validate_episode_feedback(bad, episode())
 
 
 def test_unavailable_trajectory_references_round_trip_as_null():
@@ -192,13 +190,12 @@ def test_invalid_evidence_type_rejected():
         evidence(evidence_type="visual_guess")
 
 
-def test_transition_type_is_structurally_tied_to_qa_transition_evidence():
-    with pytest.raises(ValueError, match="supported QA transition"):
-        evidence(
-            evidence_type="qa_transition", transition_type=None,
-            supporting_segment_ids=())
-    with pytest.raises(ValueError, match="must be None"):
-        evidence(transition_type="wrong_to_correct")
+def test_transition_type_is_not_semantically_tied_to_evidence_type():
+    assert evidence(
+        evidence_type="qa_transition", transition_type=None,
+        supporting_segment_ids=()).transition_type is None
+    assert evidence(transition_type="wrong_to_correct").transition_type == \
+        "wrong_to_correct"
 
 
 def test_prompt_delta_has_no_legacy_property_fields():

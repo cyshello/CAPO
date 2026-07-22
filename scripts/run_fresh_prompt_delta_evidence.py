@@ -26,6 +26,8 @@ if str(ROOT.parent) not in sys.path:
 from surrogate_rollout import config
 from surrogate_rollout.captioning.history_aware_baseline import (
     HistoryAwareBaselineCaptionViewBuilder,
+    FREE_FORM_PROVIDER_OPENAI,
+    build_free_form_generator,
 )
 from surrogate_rollout.optimization.baseline_phase import (
     BaselinePhaseRunner,
@@ -48,11 +50,11 @@ from surrogate_rollout.optimization.fresh_prompt_delta_evidence import (
 from surrogate_rollout.optimization.schemas import (
     intervention_episode_from_json, meta_prompt_version_from_json,
 )
-from surrogate_rollout.optimization.train_roles import (
-    EvidenceCoverageState, derive_train_roles,
+from surrogate_rollout.optimization.meta_prompt_defaults import (
+    resolve_meta_prompt_artifact_path,
 )
-from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
-    VLMFreeFormInstructionGenerator,
+from surrogate_rollout.optimization.train_roles import (
+    EvidenceCoverageState, TrainVideoRecord, derive_train_roles,
 )
 from surrogate_rollout.prompt_routing.persistence import (
     _atomic_write_text, scaffold_contract_from_json,
@@ -60,7 +62,7 @@ from surrogate_rollout.prompt_routing.persistence import (
 )
 from surrogate_rollout.prompt_routing.schemas import (
     Phase4Config, Phase4OptimizationConfig, PostInterventionMode,
-    PromptBankSnapshot, RouterPolicySnapshot, dumps_canonical,
+    dumps_canonical,
 )
 
 
@@ -94,9 +96,16 @@ def _write_once(path: Path, value) -> str:
 def _args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--prepared-inputs", required=True)
-    p.add_argument("--parent-meta-prompt", required=True)
+    p.add_argument(
+        "--parent-meta-prompt",
+        help=("MetaPromptVersion JSON. Omit to use "
+              "optimization/prompts/init_meta_prompt.json."))
     p.add_argument("--split-manifest", required=True)
     p.add_argument("--output-dir", required=True)
+    p.add_argument(
+        "--baseline-resume-dir",
+        help=("Optional completed baseline root to validate and reuse read-only. "
+              "A missing or incomplete external baseline fails closed."))
     p.add_argument("--source-revision", required=True)
     p.add_argument("--worker-result-timeout-seconds", required=True, type=float)
     p.add_argument(
@@ -109,7 +118,7 @@ def _args(argv=None):
     p.add_argument(
         "--global-inspection-boundary-tolerance-seconds-override", type=float)
     p.add_argument("--proposer-maximum-calls-override", type=int)
-    p.add_argument("--maximum-deltas-per-video-override", type=int)
+    p.add_argument("--maximum-deltas-per-qa-override", type=int)
     return p.parse_args(argv)
 
 
@@ -118,12 +127,21 @@ def main(argv=None) -> int:
     prepared = Path(a.prepared_inputs).resolve()
     input_manifest = _object(prepared / "manifest.json")
     component = _object(prepared / "component_config.json")
-    parent_path = Path(a.parent_meta_prompt).resolve()
+    parent_path = resolve_meta_prompt_artifact_path(a.parent_meta_prompt)
     split_path = Path(a.split_manifest).resolve()
     parent = meta_prompt_version_from_json(_object(parent_path))
     if parent.meta_prompt_id != input_manifest["parent_meta_prompt_id"]:
         raise ValueError("prepared input parent differs")
     selected = tuple(input_manifest["selected_video_ids"])
+    explicit_selected_records = tuple(TrainVideoRecord(
+        video_id=str(item["video_id"]),
+        provider_indices=tuple(int(value) for value in item["provider_indices"]),
+        question_ids=tuple(str(value) for value in item["question_ids"]),
+        previously_cached=bool(item.get("previously_cached", False)),
+    ) for item in input_manifest.get("selected_video_records") or ())
+    if explicit_selected_records and tuple(
+            item.video_id for item in explicit_selected_records) != selected:
+        raise ValueError("prepared selected-video records are out of order")
     previous = tuple(input_manifest["previous_update_video_ids"])
     roles = derive_train_roles(_object(split_path))
     output = Path(a.output_dir).resolve()
@@ -152,6 +170,12 @@ def main(argv=None) -> int:
         if not identity or any(word in str(identity).lower()
                                for word in ("mock", "fixture", "stub")):
             raise ValueError(f"{name} is not a reviewed real model identity")
+    if runtime["prompt_generator_model_id"] != \
+            config.PROMPT_GENERATOR_MODEL_ID or \
+            runtime["prompt_generator_backend_id"] != \
+            config.PROMPT_GENERATOR_BACKEND_ID:
+        raise ValueError(
+            "fresh prompt-delta requires the active OpenAI prompt generator")
     api_key = os.environ.get(provider_cfg["api_key_environment_variable"])
     if not api_key:
         raise ValueError("configured provider API key environment variable is absent")
@@ -161,6 +185,8 @@ def main(argv=None) -> int:
     components = _object(Path(runtime["scaffold_components_path"]))
     scaffold = scaffold_policy_from_json(components["scaffold_policy"])
     contract = scaffold_contract_from_json(components["scaffold_contract"])
+    if scaffold.policy_type != "replace_body":
+        raise ValueError("fresh prompt-delta requires replace_body composition")
     for path in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
         if path not in sys.path:
             sys.path.insert(0, path)
@@ -186,23 +212,18 @@ def main(argv=None) -> int:
     prompts = get_prompts()
     builder = HistoryAwareBaselineCaptionViewBuilder.from_local_qwen(
         parallel_gpus=gpus, routing_mode="free_form_generator",
+        free_form_provider=FREE_FORM_PROVIDER_OPENAI,
+        free_form_model_id=runtime["prompt_generator_model_id"],
         worker_result_timeout_seconds=a.worker_result_timeout_seconds,
         worker_log_directory=str(output / "worker_logs"))
-    builder.free_form_generator = VLMFreeFormInstructionGenerator(
-        builder.router.vlm,
+    builder.free_form_generator = build_free_form_generator(
+        FREE_FORM_PROVIDER_OPENAI,
         max_tokens=int(runtime["prompt_generator_max_tokens"]),
         template_text=parent.text, meta_prompt_id=parent.meta_prompt_id,
         model_id=runtime["prompt_generator_model_id"],
         backend_id=runtime["prompt_generator_backend_id"])
-    neutral_bank = PromptBankSnapshot(
-        bank_version="bank_v9999", entries=(), max_selected_entries=1,
-        created_at=parent.created_at, created_by="prompt_delta_compatibility",
-        provenance={"legacy_property_codebook_used": False})
-    neutral_router = RouterPolicySnapshot(
-        router_version="router_v9999", policy_type="history_aware_vlm",
-        max_selected_entries=1,
-        configuration={"routing_mode": "free_form_generator"},
-        provenance={"legacy_property_router_used": False})
+    bank_version = "bank_v9999"
+    router_version = "router_v9999"
     coverage = EvidenceCoverageState(
         rotation_order=tuple(item.video_id for item in roles.evidence_videos),
         used_since_confirmation=tuple(
@@ -229,10 +250,10 @@ def main(argv=None) -> int:
             "global inspection boundary tolerance must be configured")
     proposer_maximum_calls = (
         a.proposer_maximum_calls_override or proposer_cfg["maximum_calls"])
-    maximum_deltas_per_video = (
-        a.maximum_deltas_per_video_override or
-        proposer_cfg["maximum_deltas_per_video"])
-    if proposer_maximum_calls <= 0 or maximum_deltas_per_video <= 0:
+    maximum_deltas_per_qa = (
+        a.maximum_deltas_per_qa_override or
+        proposer_cfg["maximum_deltas_per_qa"])
+    if proposer_maximum_calls <= 0 or maximum_deltas_per_qa not in (1, 2):
         raise ValueError("effective proposer call/delta limits must be positive")
     for key, expected_value in (
             ("representation_version",
@@ -268,25 +289,35 @@ def main(argv=None) -> int:
             response_transport=transport.request,
             tokenizer_identity=proposer_tokenizer_identity,
             maximum_calls=proposer_maximum_calls),
-        maximum_deltas_per_video=int(maximum_deltas_per_video),
+        maximum_deltas_per_qa=int(maximum_deltas_per_qa),
         selection_policy=selection_policy,
         global_inspection_boundary_tolerance_seconds=float(
             global_inspection_tolerance))
+    baseline_root = (Path(a.baseline_resume_dir).resolve()
+                     if a.baseline_resume_dir else output / "baseline")
+    external_baseline = a.baseline_resume_dir is not None
     try:
         baseline = load_completed_baseline_for_read_only_resume(
-            str(output / "baseline"), selected_video_ids=selected)
+            str(baseline_root), selected_video_ids=selected)
         baseline_resume_mode = (
-            "validated_completed_immutable_baseline"
+            ("validated_external_completed_immutable_baseline"
+             if external_baseline else
+             "validated_completed_immutable_baseline")
             if baseline is not None else "fresh_strict_dvd_execution")
         if baseline is None:
+            if external_baseline:
+                raise RuntimeError(
+                    "external baseline resume root is incomplete or incompatible")
             baseline = BaselinePhaseRunner(history_aware_builder=builder).run(
                 roles=roles, coverage_state=coverage,
-                sample_loader=provider_data.__getitem__, prompt_bank=neutral_bank,
-                router_policy=neutral_router, scaffold_policy=scaffold,
+                sample_loader=provider_data.__getitem__,
+                bank_version=bank_version,
+                router_version=router_version,
+                scaffold_policy=scaffold,
                 scaffold_contract=contract, phase4_config=phase,
                 base_prompt_template=prompts.caption_prompt,
                 merge_prompt=prompts.merge_prompt,
-                output_dir=str(output / "baseline"),
+                output_dir=str(baseline_root),
                 parent_confirmed_checkpoint_id=parent.meta_prompt_id,
                 history_block_seconds=float(runtime["history_block_seconds"]),
                 max_history_captions=int(runtime["max_history_captions"]),
@@ -295,11 +326,12 @@ def main(argv=None) -> int:
                 caption_cache_root=str(
                     Path(runtime["cache_root"]) / "evidence"),
                 cache_manifest_path=runtime["cache_manifest_path"],
-                worker_gpus=gpus)
+                worker_gpus=gpus,
+                explicit_selected_records=(explicit_selected_records or None))
         if tuple(baseline.selected_video_ids) != selected:
             raise RuntimeError(
                 f"coverage selected {baseline.selected_video_ids}, expected {selected}")
-        baseline_source_hashes_before = _tree_hashes(output / "baseline")
+        baseline_source_hashes_before = _tree_hashes(baseline_root)
         intervention = PromptDeltaInterventionRunner(
             segment_captioner=builder.segment_captioner,
             sample_loader=provider_data.__getitem__,
@@ -320,6 +352,7 @@ def main(argv=None) -> int:
                                PROMPT_DELTA_POLICY_OUTPUT_NAMESPACE / video_id)
             plans = proposer.propose(
                 video_manifest, parent_meta_prompt_id=parent.meta_prompt_id,
+                parent_meta_prompt_text=parent.text,
                 output_directory=str(proposal_output))
             selection_audits.append(_object(
                 proposal_output / "selection_audit.json"))
@@ -350,7 +383,7 @@ def main(argv=None) -> int:
     resolved_component["prompt_delta_proposer"].update({
         "policy_version": proposer_policy_version,
         "maximum_calls": proposer_maximum_calls,
-        "maximum_deltas_per_video": maximum_deltas_per_video,
+        "maximum_deltas_per_qa": maximum_deltas_per_qa,
         "selection_policy": selection_policy,
         "frame_inspection_classification_policy":
             PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
@@ -362,9 +395,6 @@ def main(argv=None) -> int:
         "split_policy": PROMPT_DELTA_PROPOSAL_SPLIT_POLICY,
         "tokenizer_identity": proposer_tokenizer_identity,
     })
-    resolved_component["feedback"]["maximum_calls"] = max(
-        int(resolved_component["feedback"]["maximum_calls"]),
-        len(episode_paths))
     resolved_component["runtime"].update({
         "dvd_frame_inspect_tool_contract_version":
             config.DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION,
@@ -376,7 +406,7 @@ def main(argv=None) -> int:
     source_after = {str(path): _sha(path) for path in sources}
     if source_before != source_after:
         raise RuntimeError("source artifact changed during fresh evidence run")
-    baseline_source_hashes_after = _tree_hashes(output / "baseline")
+    baseline_source_hashes_after = _tree_hashes(baseline_root)
     if baseline_source_hashes_before != baseline_source_hashes_after:
         raise RuntimeError(
             "completed baseline artifacts changed during proposal/intervention")
@@ -413,6 +443,7 @@ def main(argv=None) -> int:
         "status": run_status, "parent_meta_prompt_id": parent.meta_prompt_id,
         "selected_video_ids": selected,
         "baseline_manifest_path": baseline.manifest_path,
+        "baseline_resume_root": str(baseline_root),
         "baseline_resume_mode": baseline_resume_mode,
         "intervention_execution_namespace":
             PROMPT_DELTA_INTERVENTION_EXECUTION_NAMESPACE,
@@ -428,7 +459,7 @@ def main(argv=None) -> int:
         "proposer_configuration": {
             "policy_version": proposer_policy_version,
             "maximum_calls": proposer_maximum_calls,
-            "maximum_deltas_per_video": maximum_deltas_per_video,
+            "maximum_deltas_per_qa": maximum_deltas_per_qa,
             "selection_policy": selection_policy,
             "frame_inspection_classification_policy":
                 PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,

@@ -20,6 +20,9 @@ from surrogate_rollout.optimization.prompt_delta_iteration import (
     PromptDeltaIterationOrchestrator,
     build_feedback_grounding,
 )
+from surrogate_rollout.optimization.feedback_memory import (
+    load_parent_feedback_memory_bank,
+)
 from surrogate_rollout.optimization.schemas import MetaPromptVersion
 from surrogate_rollout.prompt_routing.schemas import dumps_canonical
 from test_episode_feedback import episode_fixture
@@ -61,11 +64,21 @@ class CountingUpdater:
         self.calls = 0
         self.grounding = None
 
-    def update(self, parent, feedbacks, *, feedback_grounding=None):
+    def update(self, parent, feedbacks, *, feedback_grounding=None,
+               feedback_memories=None, historical_memories=None,
+               current_iteration_id=None,
+               historical_memory_character_budget=None):
         self.calls += 1
         self.grounding = feedback_grounding
+        self.memories = feedback_memories
+        self.historical_memories = historical_memories
         return self.inner.update(
-            parent, feedbacks, feedback_grounding=feedback_grounding)
+            parent, feedbacks, feedback_grounding=feedback_grounding,
+            feedback_memories=feedback_memories,
+            historical_memories=historical_memories,
+            current_iteration_id=current_iteration_id,
+            historical_memory_character_budget=(
+                historical_memory_character_budget))
 
 
 class CountingFeedback:
@@ -112,6 +125,7 @@ def run(tmp_path, *, candidate=CANDIDATE, accepted=True, noop_flip=False,
         candidate_created_at="2026-07-20T01:00:00Z",
         output_directory=str(tmp_path / output_name),
         state_directory=str(tmp_path / "state"),
+        feedback_memory_bank_directory=str(tmp_path / "memory_bank"),
         initialize_parent_pointer=True)
     return result, updater, feedback, evaluator
 
@@ -124,6 +138,19 @@ def test_no_update_stops_without_confirmation_and_preserves_parent_pointer(tmp_p
     pointer = json.loads((tmp_path / "state/current_meta_prompt.json").read_text())
     assert pointer["active_meta_prompt_id"] == "meta-parent"
     assert not (tmp_path / "run/provisional_meta_prompt.json").exists()
+    assert updater.historical_memories == ()
+    request = json.loads((tmp_path / "run/updater_result.json").read_text())[
+        "request"]
+    assert len(request["current_iteration_feedback"]) == 1
+    assert request["historical_experience"]["memories"] == []
+    assert "compact_memory_text" not in request[
+        "current_iteration_feedback"][0]
+    assert "feedback_id" not in request["current_iteration_feedback"][0]
+    assert "episode_id" not in request["current_iteration_feedback"][0]
+    bank = load_parent_feedback_memory_bank(
+        str(tmp_path / "memory_bank"), "meta-parent")
+    assert len(bank) == 1
+    assert bank[0].iteration_id == "iteration-1"
 
 
 def test_update_writes_provisional_then_confirmation_pass_promotes(tmp_path):
@@ -138,6 +165,12 @@ def test_update_writes_provisional_then_confirmation_pass_promotes(tmp_path):
     confirmed = json.loads(open(pointer["artifact_path"]).read())
     assert confirmed["status"] == "confirmed"
     assert confirmed["parent_meta_prompt_id"] == "meta-parent"
+    final = json.loads((tmp_path / "run/iteration_result.json").read_text())
+    assert final["archived_parent_feedback_memory_bank"] is not None
+    assert load_parent_feedback_memory_bank(
+        str(tmp_path / "memory_bank"), "meta-parent")
+    assert load_parent_feedback_memory_bank(
+        str(tmp_path / "memory_bank"), provisional["meta_prompt_id"]) == ()
 
 
 def test_confirmation_failure_rolls_back_without_pointer_change(tmp_path):
@@ -147,6 +180,8 @@ def test_confirmation_failure_rolls_back_without_pointer_change(tmp_path):
     assert pointer["active_meta_prompt_id"] == "meta-parent"
     rejected = json.loads((tmp_path / "run/rejected_meta_prompt.json").read_text())
     assert rejected["status"] == "rejected"
+    assert len(load_parent_feedback_memory_bank(
+        str(tmp_path / "memory_bank"), "meta-parent")) == 1
 
 
 def test_identical_caption_qa_flip_is_uncertain_noop_not_benefit_or_harm(tmp_path):
@@ -159,7 +194,7 @@ def test_identical_caption_qa_flip_is_uncertain_noop_not_benefit_or_harm(tmp_pat
     assert result.status == "promoted"
 
 
-def test_feedback_grounding_marks_unchanged_episode_as_noop():
+def test_feedback_grounding_marks_unchanged_improvement_as_positive_signal():
     episode = episode_fixture()
     unchanged = dataclasses.replace(
         episode,
@@ -171,7 +206,44 @@ def test_feedback_grounding_marks_unchanged_episode_as_noop():
     assert grounding["caption_change_status"] == "unchanged"
     assert grounding["changed_segment_ids"] == []
     assert grounding["qa_flip_attribution"] == \
-        "uncertain_noop_no_caption_change"
+        "positive_episode_signal_without_caption_change"
+
+
+def test_next_iteration_uses_previous_parent_memory_not_current_memory(tmp_path):
+    first, _, _, _ = run(
+        tmp_path, candidate=None, output_name="iteration-one")
+    assert first.status == "no_update"
+    original = episode_fixture()
+    second_episode = dataclasses.replace(
+        original, episode_id="episode-002", video_id="video-002",
+        prompt_delta=dataclasses.replace(
+            original.prompt_delta, delta_id="delta-002"))
+    updater = CountingUpdater(None)
+    feedback = CountingFeedback()
+    result = PromptDeltaIterationOrchestrator(
+        feedback_generator=feedback, updater=updater,
+        confirmation_evaluator=DeterministicMockMetaPromptConfirmationEvaluator(
+            ())).run(
+        iteration_id="iteration-2", parent=parent(),
+        update_episodes=(second_episode,), confirmation_cases=cases(),
+        criterion=criterion(), model_identity="model",
+        decoding_settings={"temperature": 0}, cache_reset_identity="reset",
+        evaluation_pipeline_identity="pipeline", candidate_created_at="now",
+        output_directory=str(tmp_path / "iteration-two"),
+        state_directory=str(tmp_path / "state"),
+        feedback_memory_bank_directory=str(tmp_path / "memory_bank"),
+        initialize_parent_pointer=True)
+    assert result.status == "no_update"
+    assert len(updater.historical_memories) == 1
+    request = json.loads(
+        (tmp_path / "iteration-two/updater_result.json").read_text())["request"]
+    memories = request["historical_experience"]["memories"]
+    assert len(memories) == 1
+    assert set(memories[0]) == {"memory_text"}
+    assert "iteration-1" not in dumps_canonical(request)
+    assert "iteration-2" not in dumps_canonical(request)
+    assert len(load_parent_feedback_memory_bank(
+        str(tmp_path / "memory_bank"), "meta-parent")) == 2
 
 
 def test_parent_candidate_pairing_and_update_confirmation_overlap_rejected(tmp_path):
@@ -190,6 +262,7 @@ def test_parent_candidate_pairing_and_update_confirmation_overlap_rejected(tmp_p
             cache_reset_identity="reset", evaluation_pipeline_identity="pipeline",
             candidate_created_at="now", output_directory=str(tmp_path / "out"),
             state_directory=str(tmp_path / "state"),
+            feedback_memory_bank_directory=str(tmp_path / "memory_bank"),
             initialize_parent_pointer=True)
 
 
@@ -227,6 +300,7 @@ def test_source_episode_is_not_mutated(tmp_path):
         cache_reset_identity="reset", evaluation_pipeline_identity="pipeline",
         candidate_created_at="now", output_directory=str(tmp_path / "immutable"),
         state_directory=str(tmp_path / "immutable_state"),
+        feedback_memory_bank_directory=str(tmp_path / "memory_bank"),
         initialize_parent_pointer=True)
     assert dumps_canonical(episode) == before
 
@@ -237,11 +311,11 @@ def test_cli_dry_run_executes_complete_mock_path(tmp_path):
     fixtures = Path(__file__).parent / "fixtures/prompt_delta_iteration"
     code = main([
         "--iteration-id", "cli-dry-run",
-        "--parent-meta-prompt", str(fixtures / "parent.json"),
         "--update-episode", str(fixtures / "update_episode.json"),
         "--confirmation-cases", str(fixtures / "confirmation_cases.json"),
         "--output-dir", str(tmp_path / "output"),
         "--state-dir", str(tmp_path / "state"),
+        "--feedback-memory-bank-dir", str(tmp_path / "memory_bank"),
         "--candidate-created-at", "2026-07-20T02:00:00Z",
         "--model-identity", "fixture-model-not-called",
         "--decoding-settings", str(fixtures / "decoding_settings.json"),
@@ -259,3 +333,10 @@ def test_cli_dry_run_executes_complete_mock_path(tmp_path):
     assert code == 0
     result = json.loads((tmp_path / "output/iteration_result.json").read_text())
     assert result["status"] == "promoted"
+    pointer = json.loads((tmp_path / "state/current_meta_prompt.json").read_text())
+    assert pointer["active_meta_prompt_id"] == \
+        result["active_meta_prompt_id"]
+    identity = json.loads((tmp_path / "output/input_identity.json").read_text())
+    # the repository-owned parent (optimization/prompts/init_meta_prompt.json)
+    assert identity["parent"]["meta_prompt_id"] == \
+        "meta_prompt_4e7ca02d27e84339e6e5"

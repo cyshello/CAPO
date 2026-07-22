@@ -27,12 +27,10 @@ from surrogate_rollout.optimization.prompt_delta_iteration import (
     PairedMetaPromptConfirmationResult,
 )
 from surrogate_rollout.optimization.schemas import MetaPromptVersion
-from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
-    VLMFreeFormInstructionGenerator,
+from surrogate_rollout.prompt_routing.policies.openai_free_form_generator import (
+    OpenAIFreeFormInstructionGenerator,
 )
 from surrogate_rollout.prompt_routing.schemas import (
-    PromptBankSnapshot,
-    RouterPolicySnapshot,
     ScaffoldContract,
     ScaffoldPolicySnapshot,
     as_json_dict,
@@ -78,8 +76,8 @@ class DVDMetaPromptConfirmationEvaluator:
     def __init__(
         self, *, evaluator: HistoryAwareDVDConfirmationEvaluator,
         confirmation_videos: Sequence[DVDMetaPromptConfirmationVideo],
-        compatibility_bank: PromptBankSnapshot,
-        compatibility_router: RouterPolicySnapshot,
+        bank_version: str,
+        router_version: str,
         scaffold_policy: ScaffoldPolicySnapshot,
         scaffold_contract: ScaffoldContract,
         prompt_generator_model_id: str,
@@ -92,12 +90,13 @@ class DVDMetaPromptConfirmationEvaluator:
     ) -> None:
         self.evaluator = evaluator
         self.confirmation_videos = tuple(confirmation_videos)
-        if len(self.confirmation_videos) != 2 or len({
-                item.video_id for item in self.confirmation_videos}) != 2:
+        if not self.confirmation_videos or len({
+                item.video_id for item in self.confirmation_videos}) != len(
+                    self.confirmation_videos):
             raise ValueError(
-                "active confirmation policy requires exactly two videos")
-        self.bank = compatibility_bank
-        self.router = compatibility_router
+                "confirmation policy requires non-empty unique videos")
+        self.bank_version = bank_version
+        self.router_version = router_version
         self.scaffold = scaffold_policy
         self.contract = scaffold_contract
         for name, value in (
@@ -151,7 +150,7 @@ class DVDMetaPromptConfirmationEvaluator:
         if observed != tuple((video_id, qa_id)
                              for video_id, qa_id, _ in expected_cases):
             raise ConfirmationEvaluationConflictError(
-                "confirmation request does not match the frozen two-video/six-QA manifest")
+                "confirmation request does not match the frozen video/QA manifest")
         if request.model_identity != self.model_identity or \
                 dumps_canonical(request.decoding_settings) != \
                 dumps_canonical(self.decoding_settings) or \
@@ -161,9 +160,10 @@ class DVDMetaPromptConfirmationEvaluator:
             raise ConfirmationEvaluationConflictError(
                 "confirmation request/runtime identity mismatch")
 
-    def _generator(self, version: MetaPromptVersion) -> VLMFreeFormInstructionGenerator:
-        return VLMFreeFormInstructionGenerator(
-            self.evaluator.builder.router.vlm,
+    def _generator(
+        self, version: MetaPromptVersion,
+    ) -> OpenAIFreeFormInstructionGenerator:
+        return OpenAIFreeFormInstructionGenerator(
             max_tokens=self.prompt_generator_max_tokens,
             template_text=version.text,
             meta_prompt_id=version.meta_prompt_id,
@@ -279,12 +279,14 @@ class DVDMetaPromptConfirmationEvaluator:
             scaffold=self.scaffold, contract=self.contract,
             output_dir=evaluator_dir)
         parent_state = self.evaluator._caption_state(
-            state_name="parent", bundle=bundle, bank=self.bank,
-            router=self.router, scaffold=self.scaffold, contract=self.contract,
+            state_name="parent", bundle=bundle,
+            bank_version=self.bank_version, router_version=self.router_version,
+            scaffold=self.scaffold, contract=self.contract,
             output_dir=evaluator_dir, free_form_generator=self._generator(parent))
         candidate_state = self.evaluator._caption_state(
-            state_name="candidate", bundle=bundle, bank=self.bank,
-            router=self.router, scaffold=self.scaffold, contract=self.contract,
+            state_name="candidate", bundle=bundle,
+            bank_version=self.bank_version, router_version=self.router_version,
+            scaffold=self.scaffold, contract=self.contract,
             output_dir=evaluator_dir,
             free_form_generator=self._generator(candidate))
         self.evaluator._validate_paired_states(

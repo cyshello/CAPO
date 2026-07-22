@@ -1,4 +1,4 @@
-"""Checkpoint D2 explicit provider and exact-token inspection boundary.
+"""Lean episode-feedback provider and exact-token inspection boundary.
 
 This module formats an OpenAI-compatible strict-JSON chat request, but never
 selects a provider, model, tokenizer, context window, decoding setting, or
@@ -16,15 +16,16 @@ from typing import Any, Protocol
 from surrogate_rollout.optimization.llm_episode_feedback import (
     EpisodeFeedbackArtifactResolver,
     EpisodeFeedbackBackendConfigurationError,
-    ModelCompactEpisodeFeedbackRequest,
-    build_model_compact_episode_feedback_request,
+    LeanEpisodeFeedbackRequest,
+    build_lean_episode_feedback_request,
 )
 from surrogate_rollout.optimization.schemas import InterventionEpisode
 from surrogate_rollout.prompt_routing.schemas import dumps_canonical
 from surrogate_rollout.schemas import sha256_json
 
 
-EPISODE_FEEDBACK_STRICT_SCHEMA_NAME = "episode_feedback_response_v2_grounded"
+EPISODE_FEEDBACK_STRICT_SCHEMA_NAME = \
+    "episode_feedback_response_v5_mixed_view_memory"
 
 
 class EpisodeFeedbackProviderNotConfiguredError(
@@ -105,7 +106,7 @@ class PreparedEpisodeFeedbackProviderRequest:
 
 @dataclass(frozen=True)
 class EpisodeFeedbackRequestInspection:
-    model_compact_request: ModelCompactEpisodeFeedbackRequest
+    lean_request: LeanEpisodeFeedbackRequest
     prepared_request: PreparedEpisodeFeedbackProviderRequest
     token_statistics: ExactEpisodeFeedbackTokenStatistics
     fits_context: bool
@@ -125,24 +126,14 @@ def episode_feedback_response_json_schema() -> dict[str, Any]:
         "additionalProperties": False,
         "required": [
             "statement", "supporting_segment_ids", "supporting_qa_ids",
-            "evidence_type", "transition_type", "confidence",
+            "evidence_type", "confidence",
         ],
         "properties": {
             "statement": {"type": "string"},
             "supporting_segment_ids": string_array,
             "supporting_qa_ids": string_array,
             "evidence_type": {"type": "string", "enum": [
-                "caption_change", "trajectory", "qa_transition", "mixed"]},
-            "transition_type": {
-                "type": ["string", "null"],
-                "enum": [
-                    "correct_to_correct", "wrong_to_wrong",
-                    "wrong_to_correct", "correct_to_wrong", None,
-                ],
-                "description": (
-                    "The exact stored QA transition for qa_transition "
-                    "evidence; null for every other evidence type."),
-            },
+                "caption_change", "trajectory", "mixed"]},
             # Provider JSON is a string while its vocabulary remains opaque.
             "confidence": dict(confidence),
         },
@@ -155,6 +146,12 @@ def episode_feedback_response_json_schema() -> dict[str, Any]:
         "generator_diagnosis": {"type": "string"},
         "recommended_strategy_change": {"type": "string"},
         "confidence": dict(confidence),
+        "compact_memory_text": {
+            "type": ["string", "null"],
+            "description": (
+                "A short provider-authored experience for historical memory; "
+                "null only when no non-empty memory can be supplied."),
+        },
     }
     return {
         "type": "object",
@@ -193,6 +190,7 @@ class OpenAICompatibleEpisodeFeedbackProviderAdapter:
         generation_settings: Mapping[str, Any] | None = None,
         feedback_policy_version: str | None = None,
         response_transport: EpisodeFeedbackResponseTransport | None = None,
+        context_safety_margin_tokens: int = 0,
     ) -> None:
         self.provider = _configured_string(provider, "provider")
         self.model_id = _configured_string(model_id, "model_id")
@@ -206,6 +204,12 @@ class OpenAICompatibleEpisodeFeedbackProviderAdapter:
             context_limit, "context_limit")
         self.maximum_output_tokens = _configured_positive_int(
             maximum_output_tokens, "maximum_output_tokens")
+        if not isinstance(context_safety_margin_tokens, int) or isinstance(
+                context_safety_margin_tokens, bool) or \
+                context_safety_margin_tokens < 0:
+            raise EpisodeFeedbackProviderNotConfiguredError(
+                "context_safety_margin_tokens must be a non-negative integer")
+        self.context_safety_margin_tokens = context_safety_margin_tokens
         if not isinstance(generation_settings, Mapping) or not \
                 generation_settings:
             raise EpisodeFeedbackProviderNotConfiguredError(
@@ -268,7 +272,7 @@ class OpenAICompatibleEpisodeFeedbackProviderAdapter:
             reserved_output_tokens=self.maximum_output_tokens,
             context_limit=self.context_limit,
             remaining_tokens=remaining,
-            fits_context=(remaining >= 0),
+            fits_context=(remaining >= self.context_safety_margin_tokens),
         )
         identity_input = {
             "provider": self.provider,
@@ -304,8 +308,7 @@ class OpenAICompatibleEpisodeFeedbackProviderAdapter:
         return statistics.total_input_tokens
 
     def __call__(self, system_instruction: str, user_payload: str) -> str:
-        prepared, statistics = self.preflight(
-            system_instruction, user_payload)
+        prepared, statistics = self.preflight(system_instruction, user_payload)
         self.call_count += 1
         raw_response = self.response_transport(prepared.request_body)
         if not isinstance(raw_response, str):
@@ -345,17 +348,17 @@ def prepare_and_measure(
     provider_adapter: OpenAICompatibleEpisodeFeedbackProviderAdapter,
     artifact_resolver: EpisodeFeedbackArtifactResolver,
 ) -> EpisodeFeedbackRequestInspection:
-    """Build and exactly measure model_compact without calling transport."""
+    """Build and exactly measure the lean request without calling transport."""
     if not isinstance(
             provider_adapter, OpenAICompatibleEpisodeFeedbackProviderAdapter):
         raise TypeError(
             "provider_adapter must be an explicit episode feedback adapter")
-    request = build_model_compact_episode_feedback_request(
+    request = build_lean_episode_feedback_request(
         episode, artifact_resolver=artifact_resolver)
     prepared, statistics = provider_adapter.prepare_messages(
         request.system_instruction, request.user_request)
     return EpisodeFeedbackRequestInspection(
-        model_compact_request=request,
+        lean_request=request,
         prepared_request=prepared,
         token_statistics=statistics,
         fits_context=statistics.fits_context,

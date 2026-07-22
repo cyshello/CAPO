@@ -37,10 +37,9 @@ class ProvisionalIterationState:
     input_versions: ComponentVersions
     provisional_versions: ComponentVersions
     baseline_manifest_path: str
-    property_proposal_paths: tuple[str, ...]
+    prompt_delta_source_paths: tuple[str, ...]
     coverage_state_before_hash: str
     coverage_state_after_hash: str
-    property_retrieval_paths: tuple[str, ...] = ()
     accumulated_provisional_iteration_ids: tuple[str, ...] = ()
     status: str = "provisional"
 
@@ -50,8 +49,10 @@ class ProvisionalIterationState:
         if not self.selected_video_ids or \
                 len(self.selected_video_ids) != len(set(self.selected_video_ids)):
             raise ValueError("provisional state requires unique evidence videos")
-        if len(self.property_proposal_paths) != len(self.selected_video_ids):
-            raise ValueError("provisional state requires one proposal artifact per video")
+        if len(self.prompt_delta_source_paths) != len(self.selected_video_ids):
+            raise ValueError(
+                "provisional state requires one prompt-delta source artifact "
+                "per video")
         if self.accumulated_provisional_iteration_ids and \
                 self.iteration_id not in self.accumulated_provisional_iteration_ids:
             raise ValueError(

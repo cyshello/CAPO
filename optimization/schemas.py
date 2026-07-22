@@ -8,6 +8,7 @@ their records are property-bank entries or router inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
@@ -67,6 +68,13 @@ QA_TRANSITION_TYPES = (
     "correct_to_wrong",
 )
 META_PROMPT_UPDATE_DECISIONS = ("update", "no_update")
+COMPACT_FEEDBACK_EFFECTS = (
+    "wrong_to_correct", "correct_to_wrong", "correct_to_correct",
+    "wrong_to_wrong", "mixed", "no_effect",
+)
+COMPACT_FEEDBACK_ATTRIBUTIONS = (
+    "direct", "indirect", "unresolved", "no_op", "invalid",
+)
 
 
 def _freeze_json(value: Any, where: str) -> Any:
@@ -116,6 +124,19 @@ def _freeze_opaque_json(record: Any, name: str) -> None:
 def _require_optional_str(value: str | None, name: str) -> None:
     if value is not None and not isinstance(value, str):
         raise TypeError(f"{name} must be str or None")
+
+
+def _require_compact_memory_text(value: str, name: str) -> None:
+    _require_nonempty_str(value, name)
+    if len(re.findall(r"\b[\w'-]+\b", value, flags=re.UNICODE)) > 30:
+        raise ValueError(f"{name} exceeds 30 words")
+    if "\n" in value or re.search(r"(?:```|^\s*[-*#>]\s)", value):
+        raise ValueError(f"{name} must be one plain-text sentence")
+    if len(re.findall(r"[.!?](?=\s|$)", value)) > 1:
+        raise ValueError(f"{name} must contain at most one sentence")
+    if re.search(r"\b(?:caused|led\s+to|corrected|resulted\s+in)\b",
+                 value, flags=re.IGNORECASE):
+        raise ValueError(f"{name} contains prohibited causal wording")
 
 
 @dataclass(frozen=True)
@@ -234,6 +255,7 @@ class InterventionEpisode:
     qa_outcomes: tuple[QAInterventionOutcome, ...]
     baseline_run_ref: str
     intervention_run_ref: str
+    mixed_view_identity: Any | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -254,6 +276,8 @@ class InterventionEpisode:
                 for item in self.qa_outcomes):
             raise TypeError(
                 "InterventionEpisode.qa_outcomes must contain QAInterventionOutcome")
+        if self.mixed_view_identity is not None:
+            _freeze_opaque_json(self, "mixed_view_identity")
 
 
 @dataclass(frozen=True)
@@ -283,15 +307,10 @@ class EpisodeFeedbackEvidence:
             "EpisodeFeedbackEvidence.supporting_qa_ids")
         if self.evidence_type not in EPISODE_EVIDENCE_TYPES:
             raise ValueError("EpisodeFeedbackEvidence.evidence_type is invalid")
-        if self.evidence_type == "qa_transition":
-            if self.transition_type not in QA_TRANSITION_TYPES:
-                raise ValueError(
-                    "EpisodeFeedbackEvidence.transition_type must be a "
-                    "supported QA transition for qa_transition evidence")
-        elif self.transition_type is not None:
+        if self.transition_type is not None and \
+                self.transition_type not in QA_TRANSITION_TYPES:
             raise ValueError(
-                "EpisodeFeedbackEvidence.transition_type must be None for "
-                "non-qa_transition evidence")
+                "EpisodeFeedbackEvidence.transition_type is invalid")
         # The specification deliberately leaves the confidence scale undefined.
         # Preserve any JSON value without assigning a range or threshold.
         _freeze_opaque_json(self, "confidence")
@@ -307,6 +326,7 @@ class EpisodeFeedback:
     generator_diagnosis: str
     recommended_strategy_change: str
     confidence: Any
+    compact_memory_text: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.feedback_id, "EpisodeFeedback.feedback_id")
@@ -326,6 +346,102 @@ class EpisodeFeedback:
                     f"EpisodeFeedback.{name} must contain "
                     "EpisodeFeedbackEvidence")
         _freeze_opaque_json(self, "confidence")
+        memory = self.compact_memory_text
+        if memory is not None:
+            if not isinstance(memory, str):
+                raise TypeError(
+                    "EpisodeFeedback.compact_memory_text must be a string or None")
+            memory = memory.strip() or None
+            object.__setattr__(self, "compact_memory_text", memory)
+
+
+@dataclass(frozen=True)
+class EpisodeFeedbackMemoryRecord:
+    """One provider-authored episode memory with separate provenance."""
+
+    memory_id: str
+    parent_meta_prompt_id: str
+    iteration_id: str
+    episode_id: str
+    candidate_id: str
+    feedback_id: str
+    memory_text: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in (
+                "memory_id", "parent_meta_prompt_id", "iteration_id",
+                "episode_id", "candidate_id", "feedback_id"):
+            _require_nonempty_str(
+                getattr(self, name), f"EpisodeFeedbackMemoryRecord.{name}")
+        _require_nonempty_str(
+            self.memory_text, "EpisodeFeedbackMemoryRecord.memory_text")
+        object.__setattr__(self, "memory_text", self.memory_text.strip())
+        _freeze_mapping(self, "metadata")
+
+
+@dataclass(frozen=True)
+class CompactFeedbackMemory:
+    """Short updater-facing semantic memory; provenance lives separately."""
+
+    runtime_condition: str
+    description_change: str
+    effect: Literal[
+        "wrong_to_correct", "correct_to_wrong", "correct_to_correct",
+        "wrong_to_wrong", "mixed", "no_effect"]
+    attribution: Literal[
+        "direct", "indirect", "unresolved", "no_op", "invalid"]
+
+    def __post_init__(self) -> None:
+        _require_compact_memory_text(
+            self.runtime_condition, "CompactFeedbackMemory.runtime_condition")
+        _require_compact_memory_text(
+            self.description_change,
+            "CompactFeedbackMemory.description_change")
+        if self.effect not in COMPACT_FEEDBACK_EFFECTS:
+            raise ValueError("CompactFeedbackMemory.effect is invalid")
+        if self.attribution not in COMPACT_FEEDBACK_ATTRIBUTIONS:
+            raise ValueError("CompactFeedbackMemory.attribution is invalid")
+
+
+@dataclass(frozen=True)
+class CompactFeedbackProvenance:
+    parent_meta_prompt_id: str
+    iteration_id: str
+    episode_id: str
+    video_id: str
+    qa_ids: tuple[str, ...]
+    segment_ids: tuple[str, ...]
+    feedback_id: str
+
+    def __post_init__(self) -> None:
+        for name in (
+                "parent_meta_prompt_id", "iteration_id", "episode_id",
+                "video_id", "feedback_id"):
+            _require_nonempty_str(
+                getattr(self, name), f"CompactFeedbackProvenance.{name}")
+        _require_str_tuple(self.qa_ids, "CompactFeedbackProvenance.qa_ids")
+        _require_str_tuple(
+            self.segment_ids, "CompactFeedbackProvenance.segment_ids")
+        if not self.qa_ids:
+            raise ValueError("CompactFeedbackProvenance.qa_ids is required")
+
+
+@dataclass(frozen=True)
+class CompactFeedbackMemoryRecord:
+    memory_id: str
+    memory: CompactFeedbackMemory
+    provenance: CompactFeedbackProvenance
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(
+            self.memory_id, "CompactFeedbackMemoryRecord.memory_id")
+        if not isinstance(self.memory, CompactFeedbackMemory):
+            raise TypeError("CompactFeedbackMemoryRecord.memory is invalid")
+        if not isinstance(self.provenance, CompactFeedbackProvenance):
+            raise TypeError("CompactFeedbackMemoryRecord.provenance is invalid")
+        _freeze_mapping(self, "metadata")
 
 
 @dataclass(frozen=True)
@@ -408,7 +524,8 @@ def intervention_episode_from_json(
         qa_outcomes=tuple(qa_intervention_outcome_from_json(item)
                           for item in data["qa_outcomes"]),
         baseline_run_ref=data["baseline_run_ref"],
-        intervention_run_ref=data["intervention_run_ref"])
+        intervention_run_ref=data["intervention_run_ref"],
+        mixed_view_identity=data.get("mixed_view_identity"))
 
 
 def episode_feedback_evidence_from_json(
@@ -433,7 +550,46 @@ def episode_feedback_from_json(data: Mapping[str, Any]) -> EpisodeFeedback:
                               for item in data["counterevidence"]),
         generator_diagnosis=data["generator_diagnosis"],
         recommended_strategy_change=data["recommended_strategy_change"],
-        confidence=data["confidence"])
+        confidence=data["confidence"],
+        compact_memory_text=data.get("compact_memory_text"))
+
+
+def episode_feedback_memory_record_from_json(
+    data: Mapping[str, Any],
+) -> EpisodeFeedbackMemoryRecord:
+    return EpisodeFeedbackMemoryRecord(
+        memory_id=data["memory_id"],
+        parent_meta_prompt_id=data["parent_meta_prompt_id"],
+        iteration_id=data["iteration_id"],
+        episode_id=data["episode_id"],
+        candidate_id=data["candidate_id"],
+        feedback_id=data["feedback_id"],
+        memory_text=data["memory_text"],
+        metadata=data.get("metadata", {}),
+    )
+
+
+def compact_feedback_memory_record_from_json(
+    data: Mapping[str, Any],
+) -> CompactFeedbackMemoryRecord:
+    memory = data["memory"]
+    provenance = data["provenance"]
+    return CompactFeedbackMemoryRecord(
+        memory_id=data["memory_id"],
+        memory=CompactFeedbackMemory(
+            runtime_condition=memory["runtime_condition"],
+            description_change=memory["description_change"],
+            effect=memory["effect"], attribution=memory["attribution"]),
+        provenance=CompactFeedbackProvenance(
+            parent_meta_prompt_id=provenance["parent_meta_prompt_id"],
+            iteration_id=provenance["iteration_id"],
+            episode_id=provenance["episode_id"],
+            video_id=provenance["video_id"],
+            qa_ids=tuple(provenance["qa_ids"]),
+            segment_ids=tuple(provenance["segment_ids"]),
+            feedback_id=provenance["feedback_id"]),
+        metadata=data.get("metadata", {}),
+    )
 
 
 def meta_prompt_update_decision_from_json(
@@ -470,575 +626,11 @@ def validate_episode_feedback(
     feedback: EpisodeFeedback,
     episode: InterventionEpisode,
 ) -> None:
-    """Validate only cross-record identity references required by Checkpoint A."""
+    """Validate only the episode identity; do not judge evidence semantics."""
+    if not isinstance(feedback, EpisodeFeedback):
+        raise TypeError("feedback must be an EpisodeFeedback")
+    if not isinstance(episode, InterventionEpisode):
+        raise TypeError("episode must be an InterventionEpisode")
     if feedback.episode_id != episode.episode_id:
         raise ValueError(
             "EpisodeFeedback.episode_id does not match InterventionEpisode")
-    segment_ids = {clip.segment_id for clip in episode.clips}
-    qa_ids = {outcome.qa_id for outcome in episode.qa_outcomes}
-    transition_by_qa_id = {}
-    for outcome in episode.qa_outcomes:
-        before = outcome.baseline_correct
-        after = outcome.intervention_correct
-        if not isinstance(before, bool) or not isinstance(after, bool):
-            continue
-        transition_by_qa_id[outcome.qa_id] = (
-            "correct_to_correct" if before and after else
-            "correct_to_wrong" if before and not after else
-            "wrong_to_correct" if not before and after else
-            "wrong_to_wrong")
-    for collection_name in ("observations", "counterevidence"):
-        for index, item in enumerate(getattr(feedback, collection_name)):
-            unknown_segments = set(item.supporting_segment_ids) - segment_ids
-            if unknown_segments:
-                raise ValueError(
-                    f"EpisodeFeedback.{collection_name}[{index}] references "
-                    f"unknown segment IDs: {sorted(unknown_segments)}")
-            unknown_qas = set(item.supporting_qa_ids) - qa_ids
-            if unknown_qas:
-                raise ValueError(
-                    f"EpisodeFeedback.{collection_name}[{index}] references "
-                    f"unknown QA IDs: {sorted(unknown_qas)}")
-            if item.evidence_type == "qa_transition":
-                mismatched = {
-                    qa_id: transition_by_qa_id.get(qa_id)
-                    for qa_id in item.supporting_qa_ids
-                    if transition_by_qa_id.get(qa_id) != item.transition_type
-                }
-                if mismatched:
-                    raise ValueError(
-                        f"EpisodeFeedback.{collection_name}[{index}] "
-                        "transition_type conflicts with stored QA outcomes: "
-                        f"{mismatched}")
-
-
-@dataclass(frozen=True)
-class CaptionDifference:
-    segment_id: str
-    baseline_caption: str
-    candidate_caption: str
-    difference_summary: str | None
-    structured_differences: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if not self.segment_id:
-            raise ValueError("CaptionDifference.segment_id must be non-empty")
-        if not isinstance(self.baseline_caption, str) or \
-                not isinstance(self.candidate_caption, str):
-            raise TypeError("CaptionDifference captions must be strings")
-        _freeze_mapping(self, "structured_differences")
-
-
-@dataclass(frozen=True)
-class CounterfactualEvidence:
-    evidence_id: str
-    video_id: str
-    question_id: str
-    ground_truth: str | None
-
-    baseline_bank_version: str
-    baseline_router_version: str
-    baseline_scaffold_version: str
-    candidate_bank_version: str
-    candidate_router_version: str
-    candidate_scaffold_version: str
-
-    baseline_selected_prompt_ids: Mapping[str, tuple[str, ...]]
-    candidate_selected_prompt_ids: Mapping[str, tuple[str, ...]]
-    baseline_composed_prompt_refs: Mapping[str, str]
-    candidate_composed_prompt_refs: Mapping[str, str]
-
-    baseline_answer: str | None
-    candidate_answer: str | None
-    baseline_score: float
-    candidate_score: float
-    score_delta: float
-    outcome_transition: Literal[
-        "correct_to_correct",
-        "correct_to_wrong",
-        "wrong_to_correct",
-        "wrong_to_wrong",
-        "unknown",
-    ]
-
-    segment_ids: tuple[str, ...]
-    caption_differences: tuple[CaptionDifference, ...]
-    baseline_trajectory_refs: tuple[str, ...]
-    candidate_trajectory_refs: tuple[str, ...]
-    rollout_artifact_refs: Mapping[str, str]
-    metadata: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        for name in (
-            "evidence_id", "video_id", "question_id",
-            "baseline_bank_version", "baseline_router_version",
-            "baseline_scaffold_version", "candidate_bank_version",
-            "candidate_router_version", "candidate_scaffold_version",
-        ):
-            if not getattr(self, name):
-                raise ValueError(f"CounterfactualEvidence.{name} must be non-empty")
-        if self.outcome_transition not in OUTCOME_TRANSITIONS:
-            raise ValueError(
-                f"invalid outcome_transition {self.outcome_transition!r}")
-        if abs(self.score_delta - (
-                self.candidate_score - self.baseline_score)) > 1e-12:
-            raise ValueError("score_delta must equal candidate_score - baseline_score")
-        for name in (
-            "segment_ids", "baseline_trajectory_refs",
-            "candidate_trajectory_refs",
-        ):
-            _require_str_tuple(getattr(self, name), name)
-        if len(self.segment_ids) != len(set(self.segment_ids)):
-            raise ValueError("CounterfactualEvidence.segment_ids contains duplicates")
-        if not isinstance(self.caption_differences, tuple) or any(
-                not isinstance(item, CaptionDifference)
-                for item in self.caption_differences):
-            raise TypeError("caption_differences must contain CaptionDifference records")
-        for name in (
-            "baseline_selected_prompt_ids", "candidate_selected_prompt_ids",
-            "baseline_composed_prompt_refs", "candidate_composed_prompt_refs",
-            "rollout_artifact_refs", "metadata",
-        ):
-            _freeze_mapping(self, name)
-
-
-@dataclass(frozen=True)
-class FailureAttribution:
-    attribution_id: str
-    evidence_ids: tuple[str, ...]
-    targets: tuple[Literal[
-        "prompt_bank", "router", "scaffold", "multiple",
-        "insufficient_evidence",
-    ], ...]
-    prompt_bank_issues: tuple[str, ...]
-    router_issues: tuple[str, ...]
-    scaffold_issues: tuple[str, ...]
-    supporting_facts: tuple[str, ...]
-    confidence: float
-    rationale: str
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.attribution_id, "attribution_id")
-        for name in (
-            "evidence_ids", "targets", "prompt_bank_issues", "router_issues",
-            "scaffold_issues", "supporting_facts",
-        ):
-            _require_str_tuple(getattr(self, name), name)
-        if not self.evidence_ids:
-            raise ValueError("FailureAttribution.evidence_ids must not be empty")
-        if not self.targets or any(target not in ATTRIBUTION_TARGETS
-                                   for target in self.targets):
-            raise ValueError("FailureAttribution.targets contains an invalid target")
-        if len(self.targets) != len(set(self.targets)):
-            raise ValueError("FailureAttribution.targets contains duplicates")
-        _require_confidence(self.confidence, "FailureAttribution.confidence")
-        if not isinstance(self.rationale, str):
-            raise TypeError("FailureAttribution.rationale must be a string")
-
-
-@dataclass(frozen=True)
-class FeedbackItem:
-    feedback_id: str
-    evidence_ids: tuple[str, ...]
-    attribution_id: str
-    target_components: tuple[str, ...]
-    failure_modes: tuple[str, ...]
-    successful_behaviors: tuple[str, ...]
-    desired_behaviors: tuple[str, ...]
-    avoid_behaviors: tuple[str, ...]
-    applicable_segment_traits: Mapping[str, Any]
-    confidence: float
-    rationale: str
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.feedback_id, "feedback_id")
-        _require_nonempty_str(self.attribution_id, "attribution_id")
-        for name in (
-            "evidence_ids", "target_components", "failure_modes",
-            "successful_behaviors", "desired_behaviors", "avoid_behaviors",
-        ):
-            _require_str_tuple(getattr(self, name), name)
-        if not self.evidence_ids:
-            raise ValueError("FeedbackItem.evidence_ids must not be empty")
-        allowed = {"prompt_bank", "router", "scaffold", "insufficient_evidence"}
-        if not self.target_components or any(
-                target not in allowed for target in self.target_components):
-            raise ValueError("FeedbackItem.target_components contains an invalid target")
-        if len(self.target_components) != len(set(self.target_components)):
-            raise ValueError("FeedbackItem.target_components contains duplicates")
-        _freeze_mapping(self, "applicable_segment_traits")
-        _require_confidence(self.confidence, "FeedbackItem.confidence")
-        if not isinstance(self.rationale, str):
-            raise TypeError("FeedbackItem.rationale must be a string")
-
-
-@dataclass(frozen=True)
-class FeedbackBatch:
-    feedback_policy: str
-    feedback_policy_version: str
-    input_evidence_ids: tuple[str, ...]
-    attributions: tuple[FailureAttribution, ...]
-    items: tuple[FeedbackItem, ...]
-    raw_response_artifact: str | None
-    parse_errors: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.feedback_policy, "feedback_policy")
-        _require_nonempty_str(
-            self.feedback_policy_version, "feedback_policy_version")
-        _require_str_tuple(self.input_evidence_ids, "input_evidence_ids")
-        _require_str_tuple(self.parse_errors, "parse_errors")
-        if len(self.input_evidence_ids) != len(set(self.input_evidence_ids)):
-            raise ValueError("FeedbackBatch.input_evidence_ids contains duplicates")
-        if not isinstance(self.attributions, tuple) or any(
-                not isinstance(item, FailureAttribution) for item in self.attributions):
-            raise TypeError("FeedbackBatch.attributions must contain FailureAttribution")
-        if not isinstance(self.items, tuple) or any(
-                not isinstance(item, FeedbackItem) for item in self.items):
-            raise TypeError("FeedbackBatch.items must contain FeedbackItem")
-        if self.raw_response_artifact is not None and not isinstance(
-                self.raw_response_artifact, str):
-            raise TypeError("FeedbackBatch.raw_response_artifact must be str or None")
-
-
-@dataclass(frozen=True)
-class MetaKnowledgeItem:
-    knowledge_id: str
-    knowledge_type: Literal[
-        "successful_behavior", "failure_pattern", "routing_pattern",
-        "composition_pattern", "rejected_update", "accepted_update", "conflict",
-    ]
-    condition: Mapping[str, Any]
-    principle: str
-    positive_support_ids: tuple[str, ...]
-    negative_support_ids: tuple[str, ...]
-    distinct_video_ids: tuple[str, ...]
-    scope: Literal["local_prompt", "routing", "global_scaffold", "meta_only"]
-    confidence: float
-    status: Literal["candidate", "confirmed", "rejected", "deprecated"]
-    provenance: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.knowledge_id, "knowledge_id")
-        _require_nonempty_str(self.principle, "principle")
-        if self.knowledge_type not in KNOWLEDGE_TYPES:
-            raise ValueError("MetaKnowledgeItem.knowledge_type is invalid")
-        if self.scope not in KNOWLEDGE_SCOPES:
-            raise ValueError("MetaKnowledgeItem.scope is invalid")
-        if self.status not in KNOWLEDGE_STATUSES:
-            raise ValueError("MetaKnowledgeItem.status is invalid")
-        for name in (
-            "positive_support_ids", "negative_support_ids", "distinct_video_ids",
-        ):
-            value = getattr(self, name)
-            _require_str_tuple(value, name)
-            if len(value) != len(set(value)):
-                raise ValueError(f"MetaKnowledgeItem.{name} contains duplicates")
-        _freeze_mapping(self, "condition")
-        _freeze_mapping(self, "provenance")
-        _require_confidence(self.confidence, "MetaKnowledgeItem.confidence")
-
-
-@dataclass(frozen=True)
-class PromptBankOperation:
-    operation_id: str
-    operation_type: Literal[
-        "add_entry", "revise_entry", "merge_entries", "retire_entry", "no_op",
-    ]
-    target_ids: tuple[str, ...]
-    payload: Mapping[str, Any]
-    source_feedback_ids: tuple[str, ...]
-    confidence: float
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.operation_id, "operation_id")
-        if self.operation_type not in PROMPT_BANK_OPERATION_TYPES:
-            raise ValueError("PromptBankOperation.operation_type is invalid")
-        _require_str_tuple(self.target_ids, "target_ids")
-        _require_str_tuple(self.source_feedback_ids, "source_feedback_ids")
-        if not self.source_feedback_ids:
-            raise ValueError("PromptBankOperation.source_feedback_ids must not be empty")
-        if self.operation_type == "add_entry" and self.target_ids:
-            raise ValueError("add_entry must not specify existing target_ids")
-        if self.operation_type == "revise_entry" and len(self.target_ids) != 1:
-            raise ValueError("revise_entry requires exactly one target_id")
-        if self.operation_type == "merge_entries" and len(self.target_ids) < 2:
-            raise ValueError("merge_entries requires at least two target_ids")
-        if self.operation_type == "retire_entry" and not self.target_ids:
-            raise ValueError("retire_entry requires target_ids")
-        _freeze_mapping(self, "payload")
-        _require_confidence(self.confidence, "PromptBankOperation.confidence")
-
-
-@dataclass(frozen=True)
-class PromptBankUpdateProposal:
-    proposal_id: str
-    input_bank_version: str
-    operations: tuple[PromptBankOperation, ...]
-    validation_errors: tuple[str, ...]
-    is_valid: bool
-    provenance: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.proposal_id, "proposal_id")
-        validate_component_version(
-            "bank", self.input_bank_version,
-            field_name="PromptBankUpdateProposal.input_bank_version")
-        if not isinstance(self.operations, tuple) or any(
-                not isinstance(item, PromptBankOperation) for item in self.operations):
-            raise TypeError("operations must contain PromptBankOperation records")
-        _require_str_tuple(self.validation_errors, "validation_errors")
-        if self.is_valid and self.validation_errors:
-            raise ValueError("valid bank proposal cannot contain validation_errors")
-        if not self.is_valid and not self.validation_errors:
-            raise ValueError("invalid bank proposal requires validation_errors")
-        _freeze_mapping(self, "provenance")
-
-
-@dataclass(frozen=True)
-class RouterUpdateProposal:
-    proposal_id: str
-    input_router_version: str
-    operations: tuple[Mapping[str, Any], ...]
-    source_feedback_ids: tuple[str, ...]
-    validation_errors: tuple[str, ...]
-    is_valid: bool
-    provenance: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.proposal_id, "proposal_id")
-        validate_component_version(
-            "router", self.input_router_version,
-            field_name="RouterUpdateProposal.input_router_version")
-        if not isinstance(self.operations, tuple) or any(
-                not isinstance(item, Mapping) for item in self.operations):
-            raise TypeError("RouterUpdateProposal.operations must contain mappings")
-        object.__setattr__(self, "operations", _freeze_json(
-            self.operations, "RouterUpdateProposal.operations"))
-        _require_str_tuple(self.source_feedback_ids, "source_feedback_ids")
-        _require_str_tuple(self.validation_errors, "validation_errors")
-        if self.is_valid and self.validation_errors:
-            raise ValueError("valid router proposal cannot contain validation_errors")
-        if not self.is_valid and not self.validation_errors:
-            raise ValueError("invalid router proposal requires validation_errors")
-        _freeze_mapping(self, "provenance")
-
-
-@dataclass(frozen=True)
-class ScaffoldUpdateProposal:
-    proposal_id: str
-    input_scaffold_version: str
-    candidate_policy: ScaffoldPolicySnapshot | None
-    source_feedback_ids: tuple[str, ...]
-    validation_errors: tuple[str, ...]
-    is_valid: bool
-    skipped_reason: Literal[
-        "disabled_by_config", "no_scaffold_attribution",
-        "insufficient_support", "none",
-    ]
-    provenance: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.proposal_id, "proposal_id")
-        validate_component_version(
-            "scaffold", self.input_scaffold_version,
-            field_name="ScaffoldUpdateProposal.input_scaffold_version")
-        if self.candidate_policy is not None and not isinstance(
-                self.candidate_policy, ScaffoldPolicySnapshot):
-            raise TypeError("candidate_policy must be ScaffoldPolicySnapshot or None")
-        _require_str_tuple(self.source_feedback_ids, "source_feedback_ids")
-        _require_str_tuple(self.validation_errors, "validation_errors")
-        if self.skipped_reason not in SCAFFOLD_SKIP_REASONS:
-            raise ValueError("ScaffoldUpdateProposal.skipped_reason is invalid")
-        if self.skipped_reason != "none" and self.candidate_policy is not None:
-            raise ValueError("skipped scaffold proposal cannot carry candidate_policy")
-        if self.is_valid and self.validation_errors:
-            raise ValueError("valid scaffold proposal cannot contain validation_errors")
-        if not self.is_valid and not self.validation_errors:
-            raise ValueError("invalid scaffold proposal requires validation_errors")
-        _freeze_mapping(self, "provenance")
-
-
-@dataclass(frozen=True)
-class UpdateReview:
-    review_id: str
-    component: Literal["prompt_bank", "router", "scaffold"]
-    proposal_id: str
-    decision: Literal["accept_for_validation", "revise", "reject", "defer"]
-    recommended_scope: Literal[
-        "local_prompt", "routing", "global_scaffold", "meta_only",
-    ]
-    conflicts: tuple[str, ...]
-    required_confirmations: tuple[str, ...]
-    supporting_knowledge_ids: tuple[str, ...]
-    rationale: str
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.review_id, "review_id")
-        _require_nonempty_str(self.proposal_id, "proposal_id")
-        if self.component not in UPDATE_COMPONENTS:
-            raise ValueError("UpdateReview.component is invalid")
-        if self.decision not in REVIEW_DECISIONS:
-            raise ValueError("UpdateReview.decision is invalid")
-        if self.recommended_scope not in KNOWLEDGE_SCOPES:
-            raise ValueError("UpdateReview.recommended_scope is invalid")
-        for name in (
-            "conflicts", "required_confirmations", "supporting_knowledge_ids",
-        ):
-            _require_str_tuple(getattr(self, name), name)
-        if not isinstance(self.rationale, str):
-            raise TypeError("UpdateReview.rationale must be a string")
-
-
-@dataclass(frozen=True)
-class ComponentValidationResult:
-    validation_id: str
-    component: Literal["prompt_bank", "router", "scaffold"]
-    incumbent_version: str
-    candidate_version: str | None
-    evidence_example_ids: tuple[str, ...]
-    confirmation_example_ids: tuple[str, ...]
-    regression_example_ids: tuple[str, ...]
-    incumbent_metrics: Mapping[str, float]
-    candidate_metrics: Mapping[str, float]
-    regressions: tuple[str, ...]
-    decision: Literal["accept", "reject", "defer", "evaluation_failed"]
-    reasons: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        _require_nonempty_str(self.validation_id, "validation_id")
-        _require_nonempty_str(self.incumbent_version, "incumbent_version")
-        if self.component not in UPDATE_COMPONENTS:
-            raise ValueError("ComponentValidationResult.component is invalid")
-        kind = {"prompt_bank": "bank", "router": "router",
-                "scaffold": "scaffold"}[self.component]
-        validate_component_version(
-            kind, self.incumbent_version,
-            field_name="ComponentValidationResult.incumbent_version")
-        validate_component_version(
-            kind, self.candidate_version,
-            field_name="ComponentValidationResult.candidate_version",
-            allow_none=True)
-        if self.decision not in VALIDATION_DECISIONS:
-            raise ValueError("ComponentValidationResult.decision is invalid")
-        if self.candidate_version is not None and not isinstance(
-                self.candidate_version, str):
-            raise TypeError("candidate_version must be str or None")
-        for name in (
-            "evidence_example_ids", "confirmation_example_ids",
-            "regression_example_ids", "regressions", "reasons",
-        ):
-            _require_str_tuple(getattr(self, name), name)
-        for name in ("incumbent_metrics", "candidate_metrics"):
-            metrics = getattr(self, name)
-            if not isinstance(metrics, Mapping) or any(
-                    not isinstance(value, (int, float)) or isinstance(value, bool)
-                    for value in metrics.values()):
-                raise TypeError(f"{name} must map strings to numeric values")
-            _freeze_mapping(self, name)
-
-
-@dataclass(frozen=True)
-class NoChangeEvaluationResult:
-    status: Literal["no_change"]
-    reason: Literal["equivalent_components_and_composed_prompts"]
-    component_equivalence: Mapping[str, bool]
-    incumbent_composed_prompt_hashes: Mapping[str, tuple[str, ...]]
-    candidate_composed_prompt_hashes: Mapping[str, tuple[str, ...]]
-    candidate_dvd_executed: bool
-    eligible_for_validation: bool
-    eligible_for_regression_evidence: bool
-
-    def __post_init__(self) -> None:
-        if self.status != "no_change":
-            raise ValueError("NoChangeEvaluationResult.status must be no_change")
-        if self.reason != "equivalent_components_and_composed_prompts":
-            raise ValueError("NoChangeEvaluationResult.reason is invalid")
-        expected = {"prompt_bank", "router", "scaffold", "contract"}
-        if set(self.component_equivalence) != expected or any(
-                not isinstance(value, bool)
-                for value in self.component_equivalence.values()):
-            raise ValueError(
-                "component_equivalence must contain four boolean component flags")
-        for name in (
-            "incumbent_composed_prompt_hashes",
-            "candidate_composed_prompt_hashes",
-        ):
-            values = getattr(self, name)
-            if any(not isinstance(video_id, str)
-                   or not isinstance(hashes, tuple)
-                   or any(not isinstance(value, str) for value in hashes)
-                   for video_id, hashes in values.items()):
-                raise TypeError(f"{name} must map video IDs to prompt-hash tuples")
-            _freeze_mapping(self, name)
-        for name in (
-            "candidate_dvd_executed", "eligible_for_validation",
-            "eligible_for_regression_evidence",
-        ):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"{name} must be bool")
-        if self.candidate_dvd_executed or self.eligible_for_validation or \
-                self.eligible_for_regression_evidence:
-            raise ValueError("a no-change result cannot be evaluated or reused")
-        _freeze_mapping(self, "component_equivalence")
-
-
-@dataclass(frozen=True)
-class OptimizationIterationResult:
-    iteration_id: str
-    input_bank_version: str
-    input_router_version: str
-    input_scaffold_version: str
-    optimize_prompt_bank: bool
-    optimize_router: bool
-    optimize_scaffold: bool
-    evidence_artifact: str
-    feedback_artifact: str
-    meta_knowledge_artifact: str
-    bank_proposal_artifact: str | None
-    router_proposal_artifact: str | None
-    scaffold_proposal_artifact: str | None
-    review_artifacts: Mapping[str, str]
-    validation_artifacts: Mapping[str, str]
-    committed_bank_version: str | None
-    committed_router_version: str | None
-    committed_scaffold_version: str | None
-    status: Literal[
-        "dry_run", "partially_committed", "committed", "all_rejected",
-        "evaluation_failed",
-    ]
-    errors: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        for name in (
-            "iteration_id", "evidence_artifact", "feedback_artifact",
-            "meta_knowledge_artifact",
-        ):
-            _require_nonempty_str(getattr(self, name), name)
-        validate_component_version(
-            "bank", self.input_bank_version,
-            field_name="OptimizationIterationResult.input_bank_version")
-        validate_component_version(
-            "router", self.input_router_version,
-            field_name="OptimizationIterationResult.input_router_version")
-        validate_component_version(
-            "scaffold", self.input_scaffold_version,
-            field_name="OptimizationIterationResult.input_scaffold_version")
-        for name in (
-            "optimize_prompt_bank", "optimize_router", "optimize_scaffold",
-        ):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"{name} must be bool")
-        for name in (
-            "bank_proposal_artifact", "router_proposal_artifact",
-            "scaffold_proposal_artifact", "committed_bank_version",
-            "committed_router_version", "committed_scaffold_version",
-        ):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, str):
-                raise TypeError(f"{name} must be str or None")
-        if self.status not in ITERATION_STATUSES:
-            raise ValueError("OptimizationIterationResult.status is invalid")
-        _require_str_tuple(self.errors, "errors")
-        _freeze_mapping(self, "review_artifacts")
-        _freeze_mapping(self, "validation_artifacts")

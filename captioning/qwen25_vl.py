@@ -1,7 +1,14 @@
-"""Qwen2.5-VL-7B-Instruct captioner backed by vLLM."""
+"""Qwen VL captioner backed by vLLM (Qwen2.5-VL by default).
+
+Model is overridable per host via ``SR_CAPTION_MODEL_ID`` (e.g. set it to
+``Qwen/Qwen3-VL-8B-Instruct`` on the 5090 measurement box). The loaded model
+and the caption-cache key (``config.CAPTION_MODEL_ID``) read the SAME env var,
+so they never disagree; a different model yields a different cache key.
+"""
 
 from __future__ import annotations
 
+import os
 from typing import Any, Mapping
 
 from .base import (
@@ -13,7 +20,7 @@ from .base import (
     resolve_local_model,
 )
 
-_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+_MODEL_ID = os.environ.get("SR_CAPTION_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
 VLLM_MM_CACHE_POLICY_VERSION = "qwen25_vl_mm_cache_disabled_v1"
 VLLM_MM_PROCESSOR_CACHE_GB = 0.0
 VLLM_PREFIX_CACHING_ENABLED = False
