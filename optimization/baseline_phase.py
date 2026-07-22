@@ -1,0 +1,623 @@
+"""Reusable fresh prompt-delta baseline phase."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Sequence
+
+from surrogate_rollout.captioning.candidate_captions import build_clip_index
+from surrogate_rollout.captioning.history_aware_baseline import (
+    DEFAULT_HISTORY_BLOCK_SECONDS,
+    DEFAULT_MAX_HISTORY_CAPTIONS,
+    HistoryAwareBaselineCaptionViewBuilder,
+)
+from surrogate_rollout.evaluation.dvd_qa import (
+    dvd_qa_execution_identity,
+    run_dvd_qa,
+)
+from surrogate_rollout.optimization.iteration_state import (
+    ComponentVersions,
+    ProvisionalIterationState,
+)
+from surrogate_rollout.optimization.stage_logging import StageLogger, emit_stage
+from surrogate_rollout.optimization.train_roles import (
+    EvidenceCoverageState,
+    TrainRoleAssignment,
+    TrainVideoRecord,
+    records_for_video_ids,
+    select_evidence_batch,
+)
+from surrogate_rollout.prompt_routing.persistence import _atomic_write_text
+from surrogate_rollout.prompt_routing.schemas import (
+    Phase4Config,
+    ScaffoldContract,
+    ScaffoldPolicySnapshot,
+    as_json_dict,
+    dumps_canonical,
+)
+from surrogate_rollout.schemas import QAExample, sha256_text
+
+
+def _write(path: str, value: object) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _atomic_write_text(path, dumps_canonical(value) + "\n")
+    return os.path.abspath(path)
+
+
+def _read_json(path: str) -> dict[str, Any]:
+    with open(path) as f:
+        return json.load(f)
+
+
+def _coverage_from_json(value: Mapping[str, Any]) -> EvidenceCoverageState:
+    return EvidenceCoverageState(
+        rotation_order=tuple(value["rotation_order"]),
+        used_since_confirmation=tuple(value.get("used_since_confirmation") or ()),
+        rotation_cursor=int(value.get("rotation_cursor", 0)),
+        coverage_cycle=int(value.get("coverage_cycle", 0)),
+        iterations_since_confirmation=int(
+            value.get("iterations_since_confirmation", 0)),
+        confirmation_due=bool(value.get("confirmation_due", False)),
+    )
+
+
+def _video_id(sample: Mapping[str, Any]) -> str:
+    return str(sample.get("extra", {}).get("videoID") or sample["sample_id"])
+
+
+def _caption_text(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("caption") or "")
+    return value if isinstance(value, str) else ""
+
+
+def _valid_caption_segment_ids(
+    segment_ids: tuple[str, ...], captions: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return only source-ordered segments with an actual incumbent caption."""
+    return tuple(
+        segment_id for segment_id in segment_ids
+        if _caption_text(captions.get(segment_id)).strip())
+
+
+def _frame_references(clip_index: list[tuple[str, dict]]) -> dict[str, tuple[str, ...]]:
+    output = {}
+    for segment_id, info in clip_index:
+        files = info.get("files") or info.get("frames") or ()
+        if isinstance(files, (str, os.PathLike)):
+            files = (files,)
+        output[segment_id] = tuple(os.path.abspath(os.fspath(item)) for item in files)
+    return output
+
+
+def _history_snapshots(
+    segment_ids: tuple[str, ...], captions: Mapping[str, Any], block_size: int,
+) -> tuple[dict[str, Any], ...]:
+    if block_size < 1:
+        raise ValueError("history_block_size must be positive")
+    output = []
+    for index, segment_id in enumerate(segment_ids):
+        block_start = (index // block_size) * block_size
+        preceding_ids = segment_ids[block_start:index]
+        preceding = tuple({"segment_id": value,
+                           "caption": _caption_text(captions.get(value))}
+                          for value in preceding_ids)
+        identity = {"block_start_index": block_start, "preceding": preceding}
+        output.append({
+            "segment_id": segment_id,
+            "block_index": index // block_size,
+            "preceding_segment_ids": preceding_ids,
+            "history": preceding,
+            "history_hash": sha256_text(dumps_canonical(identity)),
+            "source": "frozen_incumbent_caption_view",
+        })
+    return tuple(output)
+
+
+def _reference_sets(result: Any) -> dict[str, tuple[str, ...]]:
+    refs = result.references
+    names = ("retrieved_segments", "returned_segments",
+             "frame_inspected_segments", "explicitly_cited_segments",
+             "consumed_segments")
+    return {name: tuple(sorted(getattr(refs, name, ()) or ())) for name in names}
+
+
+def _used_segments(reference_sets: Mapping[str, tuple[str, ...]]) -> tuple[str, ...]:
+    consumed = reference_sets.get("consumed_segments") or ()
+    if consumed:
+        return tuple(consumed)
+    fallback = set(reference_sets.get("frame_inspected_segments") or ())
+    fallback.update(reference_sets.get("explicitly_cited_segments") or ())
+    fallback.update(reference_sets.get("returned_segments") or ())
+    return tuple(sorted(fallback))
+
+
+def qa_execution_failure_reasons(value: Mapping[str, Any]) -> tuple[str, ...]:
+    """Separate evaluator/runtime failure from a valid incorrect prediction."""
+    reasons = []
+    if value.get("errors"):
+        reasons.append("runtime_or_parse_errors")
+    prediction = value.get("prediction")
+    if prediction is None or not str(prediction).strip():
+        reasons.append("null_prediction")
+    parsed = value.get("parsed_answer")
+    if parsed is None or not str(parsed).strip():
+        reasons.append("parse_failure")
+    return tuple(reasons)
+
+
+@dataclass(frozen=True)
+class BaselinePhaseResult:
+    run_id: str
+    output_dir: str
+    selected_video_ids: tuple[str, ...]
+    baseline_qa_count: int
+    video_manifest_paths: tuple[str, ...]
+    prompt_delta_source_paths: tuple[str, ...]
+    provisional_state_path: str
+    manifest_path: str
+    next_coverage_state: EvidenceCoverageState
+    resumed: bool = False
+
+
+def load_completed_baseline_for_read_only_resume(
+    baseline_root: str, *, selected_video_ids: tuple[str, ...],
+) -> BaselinePhaseResult | None:
+    """Validate and reuse an immutable completed baseline at one exact root.
+
+    This compatibility boundary is for a downstream-only execution-contract
+    change. It never rewrites the saved baseline or treats an incomplete or
+    invalid QA result as reusable source evidence.
+    """
+    root = os.path.abspath(baseline_root)
+    manifest_path = os.path.join(root, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return None
+    manifest = _read_json(manifest_path)
+    if manifest.get("status") != "completed":
+        raise RuntimeError("saved baseline manifest is not completed")
+    if tuple(manifest.get("selected_video_ids") or ()) != selected_video_ids:
+        raise RuntimeError("saved baseline has different selected videos")
+    video_paths = tuple(os.path.abspath(path) for path in
+                        manifest.get("video_manifest_paths") or ())
+    if len(video_paths) != len(selected_video_ids):
+        raise RuntimeError("saved baseline video manifest count differs")
+    qa_count = 0
+    for expected_video_id, video_path in zip(selected_video_ids, video_paths):
+        if os.path.commonpath((root, video_path)) != root:
+            raise RuntimeError(
+                "saved baseline video manifest escapes baseline root")
+        video = _read_json(video_path)
+        if video.get("video_id") != expected_video_id:
+            raise RuntimeError("saved baseline video order or identity differs")
+        required = (
+            "routing_manifest_path", "caption_view_path", "captions_path",
+            "frames_path", "frozen_histories_path", "baseline_qas_path",
+        )
+        missing = [name for name in required
+                   if not os.path.isfile(str(video.get(name, "")))]
+        if missing:
+            raise RuntimeError(
+                f"saved baseline {expected_video_id} is incomplete: {missing}")
+        with open(video["baseline_qas_path"], encoding="utf-8") as handle:
+            qa_rows = [json.loads(line) for line in handle if line.strip()]
+        if len(qa_rows) != int(video.get("qa_count", -1)):
+            raise RuntimeError(
+                f"saved baseline {expected_video_id} QA count differs")
+        for qa in qa_rows:
+            if qa.get("errors") or not str(qa.get("prediction") or "").strip() \
+                    or not str(qa.get("parsed_answer") or "").strip():
+                raise RuntimeError(
+                    f"saved baseline QA is invalid: {qa.get('question_id')}")
+            trajectory = qa.get("trajectory_path")
+            if not isinstance(trajectory, str) or not os.path.isfile(trajectory):
+                raise RuntimeError(
+                    f"saved baseline QA trajectory is absent: "
+                    f"{qa.get('question_id')}")
+        qa_count += len(qa_rows)
+    if qa_count != int(manifest.get("baseline_qa_count", -1)):
+        raise RuntimeError("saved baseline aggregate QA count differs")
+    provisional_path = os.path.abspath(str(
+        manifest.get("provisional_state_path", "")))
+    if not os.path.isfile(provisional_path):
+        raise RuntimeError("saved baseline provisional state is absent")
+    return BaselinePhaseResult(
+        run_id=str(manifest["run_id"]), output_dir=root,
+        selected_video_ids=selected_video_ids, baseline_qa_count=qa_count,
+        video_manifest_paths=video_paths,
+        prompt_delta_source_paths=tuple(
+            os.path.abspath(path) for path in
+            manifest.get("prompt_delta_source_paths") or ()),
+        provisional_state_path=provisional_path,
+        manifest_path=manifest_path,
+        next_coverage_state=_coverage_from_json(
+            manifest["next_coverage_state"]), resumed=True,
+    )
+
+
+class BaselinePhaseRunner:
+    """Materialize each selected incumbent video once, then run all its QAs."""
+
+    def __init__(
+        self,
+        *,
+        qa_fn: Callable[..., Any] = run_dvd_qa,
+        clip_index_fn: Callable[..., list[tuple[str, dict]]] = build_clip_index,
+        history_aware_builder: Any | None = None,
+    ) -> None:
+        self.qa_fn = qa_fn
+        self.clip_index_fn = clip_index_fn
+        self.history_aware_builder = history_aware_builder
+
+    def _history_builder(self) -> Any:
+        if self.history_aware_builder is None:
+            self.history_aware_builder = (
+                HistoryAwareBaselineCaptionViewBuilder.from_local_qwen())
+        return self.history_aware_builder
+
+    def run(
+        self,
+        *,
+        roles: TrainRoleAssignment,
+        coverage_state: EvidenceCoverageState,
+        sample_loader: Callable[[int], Mapping[str, Any]],
+        bank_version: str,
+        router_version: str,
+        scaffold_policy: ScaffoldPolicySnapshot,
+        scaffold_contract: ScaffoldContract,
+        phase4_config: Phase4Config,
+        base_prompt_template: str,
+        merge_prompt: str,
+        output_dir: str,
+        parent_confirmed_checkpoint_id: str,
+        history_block_size: int | None = None,
+        history_block_seconds: float = DEFAULT_HISTORY_BLOCK_SECONDS,
+        max_history_captions: int = DEFAULT_MAX_HISTORY_CAPTIONS,
+        source_revision: str = "unknown",
+        gpu: str | None = None,
+        dvd_max_iterations: int = 10,
+        caption_cache_root: str | None = None,
+        cache_manifest_path: str | None = None,
+        worker_gpus: tuple[str, ...] | None = None,
+        stage_logger: StageLogger | None = None,
+        explicit_selected_records: Sequence[TrainVideoRecord] | None = None,
+    ) -> BaselinePhaseResult:
+        if explicit_selected_records is not None:
+            selected = tuple(explicit_selected_records)
+            selected_ids = tuple(item.video_id for item in selected)
+            if not selected or len(selected_ids) != len(set(selected_ids)):
+                raise ValueError(
+                    "explicit baseline selection must be non-empty and unique")
+            next_coverage = coverage_state
+            execution_scope = "explicit_prompt_delta_video_batch"
+        else:
+            selected_ids, next_coverage = select_evidence_batch(coverage_state)
+            execution_scope = "production_three_video_iteration"
+            selected = records_for_video_ids(roles, selected_ids)
+        output_dir = os.path.abspath(output_dir)
+        versions = ComponentVersions(
+            bank_version=bank_version,
+            router_version=router_version,
+            scaffold_version=scaffold_policy.scaffold_version,
+            contract_version=scaffold_contract.contract_version,
+        )
+        input_identity = {
+            "selected_video_ids": selected_ids,
+            "coverage_state": coverage_state,
+            "components": {
+                "bank_version": bank_version,
+                "router_version": router_version,
+                "scaffold_policy": scaffold_policy,
+                "scaffold_contract": scaffold_contract,
+            },
+            "phase4_config": {
+                key: value for key, value in as_json_dict(phase4_config).items()
+                if key != "post_intervention_mode"
+            },
+            "base_prompt_template_hash": sha256_text(base_prompt_template),
+            "merge_prompt_hash": sha256_text(merge_prompt),
+            "source_revision": source_revision,
+            "proposal_policy_version": "fresh_prompt_delta_external_proposer",
+            "parent_confirmed_checkpoint_id": parent_confirmed_checkpoint_id,
+            "downstream_qa": dvd_qa_execution_identity(dvd_max_iterations),
+        }
+        if explicit_selected_records is not None:
+            input_identity["execution_scope"] = execution_scope
+        if caption_cache_root is not None or cache_manifest_path is not None:
+            input_identity["caption_cache_root"] = (
+                os.path.abspath(caption_cache_root) if caption_cache_root else None)
+            input_identity["cache_manifest_path"] = (
+                os.path.abspath(cache_manifest_path) if cache_manifest_path else None)
+        if worker_gpus is not None:
+            input_identity["worker_gpus"] = tuple(worker_gpus)
+        input_identity["history_policy"] = {
+            "mode": "free_form_generator",
+            "history_block_seconds": history_block_seconds,
+            "max_history_captions": max_history_captions,
+            "captioner_configuration": as_json_dict(
+                self._history_builder().segment_captioner
+                .configuration_identity),
+        }
+        input_fingerprint = sha256_text(dumps_canonical(input_identity))
+        run_id = "baseline_" + input_fingerprint[:24]
+        manifest_path = os.path.join(output_dir, "manifest.json")
+        if os.path.exists(manifest_path):
+            manifest = _read_json(manifest_path)
+            if manifest.get("input_fingerprint") != input_fingerprint:
+                raise RuntimeError("baseline output exists for different frozen inputs")
+            if manifest.get("status") != "completed":
+                raise RuntimeError("baseline manifest exists but is not completed")
+            return BaselinePhaseResult(
+                run_id=manifest["run_id"], output_dir=output_dir,
+                selected_video_ids=tuple(manifest["selected_video_ids"]),
+                baseline_qa_count=int(manifest["baseline_qa_count"]),
+                video_manifest_paths=tuple(manifest["video_manifest_paths"]),
+                prompt_delta_source_paths=tuple(
+                    manifest["prompt_delta_source_paths"]),
+                provisional_state_path=manifest["provisional_state_path"],
+                manifest_path=manifest_path,
+                next_coverage_state=_coverage_from_json(
+                    manifest["next_coverage_state"]),
+                resumed=True)
+
+        _write(os.path.join(output_dir, "policy_snapshot", "lineage.json"), {
+            "schema_version": "fresh_prompt_delta_lineage_v1",
+            "bank_version": bank_version,
+            "router_version": router_version,
+            "legacy_property_codebook_or_router_used": False,
+        })
+        _write(os.path.join(output_dir, "policy_snapshot", "scaffold_policy.json"),
+               scaffold_policy)
+        _write(os.path.join(output_dir, "policy_snapshot", "scaffold_contract.json"),
+               scaffold_contract)
+        _write(os.path.join(output_dir, "coverage", "before.json"), coverage_state)
+        _write(os.path.join(output_dir, "coverage", "after.json"), next_coverage)
+
+        video_manifests = []
+        source_paths = []
+        total_qas = 0
+        total_router_calls = 0
+        for record in selected:
+            video_dir = os.path.join(output_dir, "baseline", record.video_id)
+            complete_path = os.path.join(video_dir, "video_complete.json")
+            video_fingerprint = sha256_text(dumps_canonical({
+                "run": input_fingerprint, "video": record,
+            }))
+            if os.path.exists(complete_path):
+                complete = _read_json(complete_path)
+                if complete.get("video_fingerprint") != video_fingerprint:
+                    raise RuntimeError(
+                        f"completed video has stale inputs: {record.video_id}")
+                required = (
+                    "routing_manifest_path", "caption_view_path", "captions_path",
+                    "frames_path", "frozen_histories_path", "baseline_qas_path",
+                    "prompt_delta_source_path",
+                )
+                missing = [name for name in required
+                           if not os.path.exists(complete.get(name, ""))]
+                if missing:
+                    raise RuntimeError(
+                        f"completed video is missing artifacts: {record.video_id}: "
+                        f"{missing}")
+                video_manifests.append(os.path.abspath(complete_path))
+                source_paths.append(complete["prompt_delta_source_path"])
+                total_qas += int(complete["qa_count"])
+                total_router_calls += int(complete.get("real_vlm_router_calls", 0))
+                for stage, message, details in (
+                    ("baseline_captioning", "baseline captioning artifact 재사용", {
+                        "caption_path": complete["captions_path"]}),
+                    ("baseline_qa", "baseline QA 평가 artifact 재사용", {
+                        "qa_count": complete["qa_count"]}),
+                ):
+                    emit_stage(
+                        stage_logger, event="RESUME", stage=stage,
+                        message=f"[{record.video_id}] {message}",
+                        video_id=record.video_id, **details)
+                continue
+
+            emit_stage(
+                stage_logger, event="START", stage="baseline_captioning",
+                message=f"[{record.video_id}] baseline captioning 시작",
+                video_id=record.video_id, worker_gpus=worker_gpus)
+            samples = tuple(sample_loader(index) for index in record.provider_indices)
+            if any(_video_id(sample) != record.video_id for sample in samples):
+                raise RuntimeError(f"provider video changed for {record.video_id}")
+            clip_index = self.clip_index_fn(samples[0], record.video_id)
+            segment_ids = tuple(segment_id for segment_id, _ in clip_index)
+            frames = _frame_references(clip_index)
+            caption_view = self._history_builder().build(
+                sample=dict(samples[0]),
+                clip_index=clip_index,
+                bank_version=bank_version,
+                router_version=router_version,
+                scaffold_policy=scaffold_policy,
+                scaffold_contract=scaffold_contract,
+                base_prompt_template=base_prompt_template,
+                merge_prompt=merge_prompt,
+                work_root=os.path.join(video_dir, "history_aware_baseline"),
+                history_block_seconds=history_block_seconds,
+                max_history_captions=max_history_captions,
+                candidate_cache_root=caption_cache_root,
+                cache_manifest_path=cache_manifest_path,
+                worker_gpus=worker_gpus,
+            )
+            routing_manifest_path = caption_view.routing_manifest_path
+            frames_path = caption_view.frames_path
+            histories_path = caption_view.frozen_histories_path
+            histories = caption_view.histories
+
+            emit_stage(
+                stage_logger, event="END", stage="baseline_captioning",
+                message=f"[{record.video_id}] baseline captioning 끝",
+                video_id=record.video_id,
+                segment_count=len(segment_ids),
+                router_calls=int(getattr(caption_view, "router_call_count", 0)),
+                caption_calls=int(getattr(caption_view, "caption_call_count", 0)))
+
+            with open(caption_view.captions_path) as f:
+                captions = json.load(f)
+            valid_caption_segment_ids = _valid_caption_segment_ids(
+                tuple(caption_view.segment_ids), captions)
+
+            emit_stage(
+                stage_logger, event="START", stage="baseline_qa",
+                message=f"[{record.video_id}] baseline QA 평가 시작",
+                video_id=record.video_id, qa_count=len(record.question_ids))
+            qa_rows = []
+            for question_id, provider_index, sample in zip(
+                    record.question_ids, record.provider_indices, samples):
+                example = QAExample(
+                    video_id=record.video_id, question_id=question_id,
+                    question=str(sample["question"]),
+                    ground_truth=str(sample.get("answer") or ""),
+                    provider_index=provider_index,
+                    options=tuple(sample.get("options") or ()),
+                    subtitle_available=bool(
+                        sample.get("extra", {}).get("subtitle_path")),
+                )
+                qa_dir = os.path.join(
+                    video_dir, "qa", question_id.replace("/", "-"))
+                result = self.qa_fn(
+                    captions_path=caption_view.captions_path,
+                    sample=dict(sample), run_dir=qa_dir,
+                    question_id=question_id,
+                    database_path=caption_view.database_path,
+                    max_iterations=dvd_max_iterations, gpu=gpu)
+                references = _reference_sets(result)
+                row = {
+                    "video_id": record.video_id,
+                    "question_id": question_id,
+                    "provider_index": provider_index,
+                    "question": example.question,
+                    "options": example.options,
+                    "ground_truth": result.ground_truth,
+                    "prediction": result.prediction,
+                    "parsed_answer": result.parsed_answer,
+                    "score": float(result.score),
+                    "is_correct": float(result.score) > 0.0,
+                    "used_segments": _used_segments(references),
+                    "reference_sets": references,
+                    "trajectory_path": os.path.join(qa_dir, "trajectory.jsonl"),
+                    "references_path": os.path.join(qa_dir, "references.json"),
+                    "result_path": os.path.join(qa_dir, "result.json"),
+                    "errors": tuple(result.errors),
+                    "latency_seconds": float(result.latency_seconds),
+                }
+                _write(os.path.join(qa_dir, "baseline_record.json"), row)
+                qa_rows.append(row)
+            emit_stage(
+                stage_logger, event="END", stage="baseline_qa",
+                message=f"[{record.video_id}] baseline QA 평가 끝",
+                video_id=record.video_id,
+                results=tuple({
+                    "question_id": item["question_id"],
+                    "prediction": item["prediction"],
+                    "correct": item["is_correct"],
+                    "runtime_valid": not bool(
+                        qa_execution_failure_reasons(item)),
+                } for item in qa_rows))
+            qa_path = os.path.join(video_dir, "baseline_qas.jsonl")
+            _atomic_write_text(qa_path, "".join(
+                dumps_canonical(item) + "\n" for item in qa_rows))
+
+            qa_failures = tuple({
+                "question_id": item["question_id"],
+                "reasons": qa_execution_failure_reasons(item),
+                "errors": item["errors"],
+            } for item in qa_rows if qa_execution_failure_reasons(item))
+            if qa_failures:
+                failure_path = _write(os.path.join(
+                    video_dir, "baseline_qa_failures.json"), {
+                        "schema_version": "baseline_qa_execution_failure_v1",
+                        "status": "failed_before_prompt_delta_source",
+                        "video_id": record.video_id,
+                        "qa_failures": qa_failures,
+                        "prompt_delta_proposer_called": False,
+                    })
+                raise RuntimeError(
+                    "baseline QA execution failed before prompt-delta source: "
+                    + failure_path)
+
+            source_path = _write(os.path.join(
+                output_dir, "prompt_delta_proposal_source",
+                f"{record.video_id}.json"), {
+                    "schema_version": "fresh_prompt_delta_source_video_v1",
+                    "video_id": record.video_id,
+                    "baseline_run_id": run_id,
+                    "baseline_qa_ids": record.question_ids,
+                    "proposer_stage": "external_per_qa_prompt_delta",
+                })
+            complete = {
+                "video_id": record.video_id,
+                "video_fingerprint": video_fingerprint,
+                "qa_count": len(qa_rows),
+                "routing_manifest_path": routing_manifest_path,
+                "caption_view_path": caption_view.routed_view_path,
+                "captions_path": caption_view.captions_path,
+                "frames_path": frames_path,
+                "frozen_histories_path": os.path.abspath(histories_path),
+                "baseline_qas_path": os.path.abspath(qa_path),
+                "prompt_delta_source_path": source_path,
+                "caption_materializations": 1,
+                "history_mode": "free_form_generator",
+                "real_vlm_router_calls": int(getattr(
+                    caption_view, "router_call_count", 0)),
+                "component_versions": as_json_dict(versions),
+            }
+            _write(complete_path, complete)
+            video_manifests.append(os.path.abspath(complete_path))
+            source_paths.append(source_path)
+            total_qas += len(qa_rows)
+            total_router_calls += int(getattr(
+                caption_view, "router_call_count", 0))
+
+        expected_qas = 3 * len(selected_ids)
+        if total_qas != expected_qas:
+            raise RuntimeError(
+                f"baseline phase requires {expected_qas} QAs, got {total_qas}")
+        before_hash = sha256_text(dumps_canonical(coverage_state))
+        after_hash = sha256_text(dumps_canonical(next_coverage))
+        provisional = ProvisionalIterationState(
+            iteration_id=run_id,
+            coverage_cycle=coverage_state.coverage_cycle,
+            selected_video_ids=selected_ids,
+            parent_confirmed_checkpoint_id=parent_confirmed_checkpoint_id,
+            input_versions=versions, provisional_versions=versions,
+            baseline_manifest_path=manifest_path,
+            prompt_delta_source_paths=tuple(source_paths),
+            coverage_state_before_hash=before_hash,
+            coverage_state_after_hash=after_hash)
+        state_name = "provisional.json"
+        provisional_path = _write(os.path.join(
+            output_dir, "iteration_state", state_name), provisional)
+        manifest = {
+            "schema_version": "fresh_prompt_delta_baseline_v1",
+            "status": "completed", "run_id": run_id,
+            "input_fingerprint": input_fingerprint,
+            "selected_video_ids": selected_ids,
+            "baseline_qa_count": total_qas,
+            "video_manifest_paths": tuple(video_manifests),
+            "prompt_delta_source_paths": tuple(source_paths),
+            "provisional_state_path": provisional_path,
+            "next_coverage_state": next_coverage,
+            "calls": {
+                "video_caption_materializations": len(selected_ids),
+                "dvd_reasoning": expected_qas,
+                "prompt_delta_proposal_policy": 0,
+                "real_vlm_router": total_router_calls,
+                "interventional_feedback_models": 0,
+                "confirmation_evaluations": 0,
+            },
+        }
+        _write(manifest_path, manifest)
+        return BaselinePhaseResult(
+            run_id=run_id, output_dir=output_dir,
+            selected_video_ids=selected_ids, baseline_qa_count=total_qas,
+            video_manifest_paths=tuple(video_manifests),
+            prompt_delta_source_paths=tuple(source_paths),
+            provisional_state_path=provisional_path,
+            manifest_path=os.path.abspath(manifest_path),
+            next_coverage_state=next_coverage)

@@ -1,0 +1,209 @@
+"""Free-form instruction generator on a hosted OpenAI vision model.
+
+Implements the shared `FreeFormPromptGenerator` interface (`generate`,
+`configuration_identity`, `identity_hash`, `last_exchange`), so
+`build_free_form_selection` and the history-aware builder are untouched.
+
+Why it exists: the local 7B captioner cannot hold the "write an instruction,
+not a caption" role. Measured 2026-07-22 on five mid-video segments, its
+generated instruction and the resulting caption became byte-identical on four of
+them, and the same text repeated across segments — the condition collapsed into
+one caption per block. A hosted model keeps the two roles separate.
+
+Paid: normally one vision request per segment (up to three identical transport
+attempts under the configured retry policy). Frames follow the shared frame
+policy — a 0.5 fps subset at half resolution — so a generator request carries
+five small images instead of ten full-size ones at the current 1 FPS decode.
+"""
+from __future__ import annotations
+
+import base64
+import mimetypes
+import os
+import time
+from typing import Any, Mapping, Sequence
+
+from surrogate_rollout.prompt_routing import static_meta_replace_body as smrb
+from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
+    FREE_FORM_ROUTING_MODE,
+    GeneratedCaptionInstruction,
+    GeneratorExchange,
+    FreeFormGenerationError,
+)
+from surrogate_rollout.prompt_routing.schemas import SegmentContext, dumps_canonical
+from surrogate_rollout.schemas import sha256_text
+
+DEFAULT_MODEL_ID = "gpt-4o-mini"
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_RETRIES = 2
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_TIMEOUT_SECONDS = 300
+PROVIDER = "openai"
+
+
+def _data_url(path: str) -> str:
+    mime, _ = mimetypes.guess_type(path)
+    with open(path, "rb") as handle:
+        payload = base64.b64encode(handle.read()).decode("utf-8")
+    return f"data:{mime or 'image/jpeg'};base64,{payload}"
+
+
+class OpenAIFreeFormInstructionGenerator:
+    """Replace-body instruction generator over an OpenAI-compatible endpoint."""
+
+    def __init__(
+        self,
+        *,
+        model_id: str = DEFAULT_MODEL_ID,
+        base_url: str = DEFAULT_BASE_URL,
+        api_key: str | None = None,
+        max_tokens: int = smrb.DEFAULT_GENERATOR_MAX_TOKENS,
+        caption_fps: float = 1.0,
+        retries: int = DEFAULT_RETRIES,
+        temperature: float = DEFAULT_TEMPERATURE,
+        timeout: int = DEFAULT_TIMEOUT_SECONDS,
+        template_text: str | None = None,
+        meta_prompt_id: str | None = None,
+        backend_id: str | None = None,
+    ) -> None:
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        self.model_id = model_id
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.max_tokens = max_tokens
+        self.caption_fps = caption_fps
+        self.retries = retries
+        self.temperature = temperature
+        self.timeout = timeout
+        self.template = template_text or smrb.META_PROMPT_TEXT
+        if not self.template.strip():
+            raise ValueError("template_text must be non-empty")
+        self.template_version = smrb.META_PROMPT_VERSION
+        self.meta_prompt_id = meta_prompt_id or smrb.META_PROMPT_ID
+        self.backend_id = backend_id or f"{PROVIDER}:{model_id}"
+        self.last_exchange: GeneratorExchange | None = None
+
+    # ----------------------------- identity ------------------------------- #
+    @property
+    def configuration_identity(self) -> Mapping[str, Any]:
+        return {
+            "mode": FREE_FORM_ROUTING_MODE,
+            "composition": "replace_body",
+            "provider": PROVIDER,
+            "model": self.model_id,
+            "backend": self.backend_id,
+            "base_url": self.base_url,
+            "template_version": self.template_version,
+            "template_hash": sha256_text(self.template),
+            "meta_prompt_id": self.meta_prompt_id,
+            "max_tokens": self.max_tokens,
+            "parser_version": smrb.PARSER_VERSION,
+            "composition_version": smrb.COMPOSITION_VERSION,
+            "request_schema_version": smrb.REQUEST_SCHEMA_VERSION,
+            "generator_sample_fps": smrb.GENERATOR_SAMPLE_FPS,
+            "caption_source_fps": self.caption_fps,
+            "generator_image_scale": smrb.GENERATOR_IMAGE_SCALE,
+            "real_model": True,
+        }
+
+    @property
+    def identity_hash(self) -> str:
+        return sha256_text(dumps_canonical(self.configuration_identity))
+
+    # ------------------------------ calls --------------------------------- #
+    def _complete(self, frames: Sequence[str], prompt: str) -> str:
+        import requests
+
+        if not self.api_key:
+            raise FreeFormGenerationError(
+                "the OpenAI free-form generator requires OPENAI_API_KEY")
+
+        content: list[dict[str, Any]] = [
+            {"type": "image_url", "image_url": {"url": _data_url(path)}}
+            for path in frames
+        ]
+        content.append({"type": "text", "text": prompt})
+        payload = {
+            "model": self.model_id,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        }
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.api_key}"}
+
+        last_error: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                response = requests.post(
+                    f"{self.base_url}/chat/completions", headers=headers,
+                    json=payload, timeout=self.timeout)
+                if response.status_code != 200:
+                    raise FreeFormGenerationError(
+                        f"HTTP {response.status_code}: {response.text[:300]}")
+                text = (response.json()["choices"][0]["message"]["content"]
+                        or "").strip()
+                if text:
+                    return text
+                last_error = FreeFormGenerationError("empty completion")
+            except Exception as exc:  # noqa: BLE001 - network/quota/5xx
+                last_error = exc
+            if attempt < self.retries:
+                time.sleep(2 ** attempt)
+        raise FreeFormGenerationError(
+            f"OpenAI free-form generator failed after {self.retries + 1} "
+            f"attempts: {type(last_error).__name__}: {last_error}")
+
+    def generate(
+        self,
+        context: SegmentContext,
+        clip_info: Mapping[str, Any],
+    ) -> GeneratedCaptionInstruction:
+        frames = context.segment_features.get("frame_references") or ()
+        if isinstance(frames, str):
+            frames = (frames,)
+        frames = [str(item) for item in frames]
+        if not frames:
+            raise FreeFormGenerationError("current segment frames are required")
+        if not context.history_summary:
+            raise FreeFormGenerationError(
+                "serialized caption history is required")
+
+        generator_frames = smrb.prepare_generator_frames(
+            frames, caption_fps=self.caption_fps)
+        try:
+            request = smrb.build_generator_request(
+                video_id=context.video_id, segment_id=context.segment_id,
+                frame_references=generator_frames,
+                serialized_history=context.history_summary,
+                generator_max_tokens=self.max_tokens,
+                meta_prompt_id=self.meta_prompt_id,
+                meta_prompt_version=self.template_version,
+                meta_prompt_text=self.template)
+        except smrb.StaticMetaPromptError as exc:
+            raise FreeFormGenerationError(str(exc)) from exc
+        prompt = smrb.render_generator_prompt(
+            request, meta_prompt_text=self.template)
+        request_hash = sha256_text(prompt)
+
+        started = time.monotonic()
+        raw = self._complete(generator_frames, prompt)
+        elapsed = time.monotonic() - started
+
+        self.last_exchange = GeneratorExchange(
+            request=request, request_hash=request_hash,
+            raw_output=str(raw), output_hash=sha256_text(str(raw)))
+        try:
+            instruction = smrb.parse_generated_instruction(raw)
+        except smrb.StaticMetaPromptError as exc:
+            raise FreeFormGenerationError(str(exc)) from exc
+        return GeneratedCaptionInstruction(
+            instruction=instruction,
+            raw_response=str(raw),
+            model_id=self.model_id,
+            template_version=self.template_version,
+            parser_path="plain_text",
+            request_hash=request_hash,
+            generation_seconds=elapsed,
+        )

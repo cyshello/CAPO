@@ -1,0 +1,24 @@
+# Meta-prompt optimization pipeline. Versions are the ones the reference runs
+# used; the captioner side (vllm/torch/transformers) is the version-sensitive
+# part, the rest is ordinary.
+vllm==0.11.2
+torch==2.9.0
+transformers==4.57.6
+qwen-vl-utils==0.0.14
+opencv-python-headless==4.13.0.92
+numpy==2.2.6
+pandas==3.0.3
+pyarrow==24.0.0
+requests==2.34.2
+tqdm==4.68.3
+pydantic==2.13.4
+tiktoken==0.13.0
+openai==2.44.0
+
+# DVD retrieval database
+nano-vectordb==0.0.4.3
+sentence-transformers==5.6.0
+
+# vendor/dvd_stack/dvd/dvd/utils.py imports this at module import time even
+# though the OpenAI (non-Azure) path is the one this pipeline uses.
+azure-identity==1.25.3

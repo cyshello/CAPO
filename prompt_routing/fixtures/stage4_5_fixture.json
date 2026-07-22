@@ -1,0 +1,135 @@
+{
+  "base_prompt_template": "You caption one video clip.\nClip start: CLIP_START_TIME\nClip end: CLIP_END_TIME\nTranscript:\nTRANSCRIPT_PLACEHOLDER\n\nROUTED_INSTRUCTIONS_PLACEHOLDER\n\noutput_json_template:\n{\"clip_start_time\": \"\", \"clip_end_time\": \"\", \"subject_registry\": {}, \"clip_description\": \"\"}\n",
+  "phase4_config": {
+    "commit": false,
+    "dry_run": true,
+    "optimization": {
+      "max_iterations": 1,
+      "max_new_entries_per_iteration": 2,
+      "max_router_operations_per_iteration": 4,
+      "min_feedback_confidence": 0.7,
+      "optimize_prompt_bank": true,
+      "optimize_router": true,
+      "optimize_scaffold": false
+    },
+    "seed": 0
+  },
+  "prompt_bank": {
+    "bank_version": "bank_v0001",
+    "created_at": "2026-07-16T00:00:00+09:00",
+    "created_by": "stage4_5_fixture",
+    "default_entry_ids": ["preserve_temporal_order"],
+    "entries": [
+      {
+        "applicability_traits": {"motion": true},
+        "conflicts_with": [],
+        "created_at": "2026-07-16T00:00:00+09:00",
+        "created_by": "stage4_5_fixture",
+        "description": "Retain action ordering.",
+        "name": "Temporal order",
+        "parent_prompt_ids": [],
+        "prompt_hash": "2a5b846171ac3127ecb1693a86e986d7e031335253314b6bc453f17a64f9482e",
+        "prompt_id": "preserve_temporal_order",
+        "prompt_text": "Preserve the exact temporal order of visible actions.",
+        "provenance": {"fixture": "stage4_5"},
+        "status": "active",
+        "tags": ["temporal"]
+      },
+      {
+        "applicability_traits": {"text_visible": true},
+        "conflicts_with": [],
+        "created_at": "2026-07-16T00:00:00+09:00",
+        "created_by": "stage4_5_fixture",
+        "description": "Retain brief visible text.",
+        "name": "On-screen text",
+        "parent_prompt_ids": [],
+        "prompt_hash": "c1d7d52b4108bb8dda13b9422e8634de0a42eafd27ff24c89abd811a8ad75406",
+        "prompt_id": "transcribe_visible_text",
+        "prompt_text": "Transcribe brief on-screen text exactly when legible.",
+        "provenance": {"fixture": "stage4_5"},
+        "status": "active",
+        "tags": ["text"]
+      }
+    ],
+    "max_selected_entries": 2,
+    "parent_bank_version": null,
+    "provenance": {"fixture": "stage4_5"}
+  },
+  "router_policy": {
+    "configuration": {"question_conditioned": false},
+    "created_at": "2026-07-16T00:00:00+09:00",
+    "fallback_prompt_ids": ["preserve_temporal_order"],
+    "max_selected_entries": 2,
+    "parent_router_version": null,
+    "policy_type": "rule_based",
+    "provenance": {"fixture": "stage4_5"},
+    "router_version": "router_v0001",
+    "rules": [
+      {
+        "conditions": {"motion": true},
+        "enabled": true,
+        "priority": 10,
+        "provenance": {"fixture": "stage4_5"},
+        "rule_id": "motion_rule",
+        "target_prompt_ids": ["preserve_temporal_order"]
+      },
+      {
+        "conditions": {"text_visible": true},
+        "enabled": true,
+        "priority": 20,
+        "provenance": {"fixture": "stage4_5"},
+        "rule_id": "text_rule",
+        "target_prompt_ids": ["transcribe_visible_text"]
+      }
+    ]
+  },
+  "scaffold_contract": {
+    "contract_version": "contract_v0001",
+    "forbidden_patterns": [],
+    "max_prompt_tokens": 256,
+    "metadata": {"fixture": "stage4_5"},
+    "output_schema": {
+      "required": ["clip_start_time", "clip_end_time", "subject_registry", "clip_description"],
+      "type": "object"
+    },
+    "required_placeholders": ["TRANSCRIPT_PLACEHOLDER", "CLIP_START_TIME", "CLIP_END_TIME"],
+    "required_sections": ["output_json_template"]
+  },
+  "scaffold_policy": {
+    "composition_instruction": "Preserve selected instructions verbatim.",
+    "compression_policy": "omit_lowest_priority_if_over_limit",
+    "configuration": {
+      "bullet_prefix": "- ",
+      "instructions_header": "Additional instructions:"
+    },
+    "conflict_resolution_rules": ["earlier_selection_wins"],
+    "created_at": "2026-07-16T00:00:00+09:00",
+    "ordering_policy": "router_selection_order",
+    "parent_scaffold_version": null,
+    "policy_type": "deterministic",
+    "provenance": {"fixture": "stage4_5"},
+    "scaffold_version": "scaffold_v0001"
+  },
+  "segment_contexts": [
+    {
+      "history_summary": null,
+      "metadata": {"fixture": "stage4_5"},
+      "question": null,
+      "segment_features": {"motion": true, "text_visible": true},
+      "segment_id": "0_10",
+      "timestamp_end": 10.0,
+      "timestamp_start": 0.0,
+      "video_id": "fixture_video"
+    },
+    {
+      "history_summary": null,
+      "metadata": {"fixture": "stage4_5"},
+      "question": null,
+      "segment_features": {"motion": false, "text_visible": false},
+      "segment_id": "10_20",
+      "timestamp_end": 20.0,
+      "timestamp_start": 10.0,
+      "video_id": "fixture_video"
+    }
+  ]
+}

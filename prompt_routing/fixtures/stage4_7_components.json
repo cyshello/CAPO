@@ -1,0 +1,119 @@
+{
+  "phase4_config": {
+    "commit": false,
+    "dry_run": true,
+    "optimization": {
+      "max_iterations": 1,
+      "max_new_entries_per_iteration": 2,
+      "max_router_operations_per_iteration": 4,
+      "min_feedback_confidence": 0.7,
+      "optimize_prompt_bank": true,
+      "optimize_router": true,
+      "optimize_scaffold": false
+    },
+    "seed": 0
+  },
+  "prompt_bank": {
+    "bank_version": "bank_v0002",
+    "created_at": "2026-07-16T00:00:00+09:00",
+    "created_by": "stage4_7_smoke",
+    "default_entry_ids": ["pe_default"],
+    "entries": [
+      {
+        "applicability_traits": {},
+        "conflicts_with": [],
+        "created_at": "2026-07-16T00:00:00+09:00",
+        "created_by": "stage4_7_smoke",
+        "description": "Default visually grounded caption behavior.",
+        "name": "Visual grounding",
+        "parent_prompt_ids": [],
+        "prompt_hash": "f1a27d18cde5779ba7a77a746a226f0d2c31c3f6b3d51e12e7ba62774d4bccc4",
+        "prompt_id": "pe_default",
+        "prompt_text": "Describe only visually supported events and entities precisely.",
+        "provenance": {"fixture": "stage4_7"},
+        "status": "active",
+        "tags": ["default", "grounding"]
+      },
+      {
+        "applicability_traits": {"temporal": true},
+        "conflicts_with": [],
+        "created_at": "2026-07-16T00:00:00+09:00",
+        "created_by": "stage4_7_smoke",
+        "description": "Preserve action and state-change order.",
+        "name": "Temporal order",
+        "parent_prompt_ids": [],
+        "prompt_hash": "8f5c7bebf6a3e987d179f9865a6111ef2d9968807b2d042ae3fdd58c93e262b2",
+        "prompt_id": "pe_temporal",
+        "prompt_text": "Preserve the exact temporal order of actions and meaningful state changes.",
+        "provenance": {"fixture": "stage4_7"},
+        "status": "active",
+        "tags": ["temporal"]
+      },
+      {
+        "applicability_traits": {"text_visible": true},
+        "conflicts_with": [],
+        "created_at": "2026-07-16T00:00:00+09:00",
+        "created_by": "stage4_7_smoke",
+        "description": "Retain brief visible text.",
+        "name": "On-screen text",
+        "parent_prompt_ids": [],
+        "prompt_hash": "c1d7d52b4108bb8dda13b9422e8634de0a42eafd27ff24c89abd811a8ad75406",
+        "prompt_id": "pe_text",
+        "prompt_text": "Transcribe brief on-screen text exactly when legible.",
+        "provenance": {"fixture": "stage4_7"},
+        "status": "active",
+        "tags": ["text"]
+      }
+    ],
+    "max_selected_entries": 3,
+    "parent_bank_version": null,
+    "provenance": {"fixture": "stage4_7"}
+  },
+  "router_policy": {
+    "configuration": {"question_conditioned": false},
+    "created_at": "2026-07-16T00:00:00+09:00",
+    "fallback_prompt_ids": ["pe_default"],
+    "max_selected_entries": 3,
+    "parent_router_version": null,
+    "policy_type": "rule_based",
+    "provenance": {"fixture": "stage4_7"},
+    "router_version": "router_v0002",
+    "rules": [
+      {
+        "conditions": {"smoke_route": "multi_entry"},
+        "enabled": true,
+        "priority": 10,
+        "provenance": {"fixture": "stage4_7"},
+        "rule_id": "stage4_7_multi_entry",
+        "target_prompt_ids": ["pe_default", "pe_temporal", "pe_text"]
+      }
+    ]
+  },
+  "scaffold_contract": {
+    "contract_version": "contract_v0002",
+    "forbidden_patterns": [],
+    "max_prompt_tokens": 256,
+    "metadata": {"fixture": "stage4_7"},
+    "output_schema": {
+      "required": ["clip_start_time", "clip_end_time", "subject_registry", "clip_description"],
+      "type": "object"
+    },
+    "required_placeholders": ["TRANSCRIPT_PLACEHOLDER", "CLIP_START_TIME", "CLIP_END_TIME"],
+    "required_sections": []
+  },
+  "scaffold_policy": {
+    "composition_instruction": "Preserve selected instructions verbatim.",
+    "compression_policy": "omit_lowest_priority_if_over_limit",
+    "configuration": {
+      "bullet_prefix": "- ",
+      "instructions_header": "Additional routed caption instructions:"
+    },
+    "conflict_resolution_rules": ["earlier_selection_wins"],
+    "created_at": "2026-07-16T00:00:00+09:00",
+    "ordering_policy": "router_selection_order",
+    "parent_scaffold_version": null,
+    "policy_type": "deterministic",
+    "provenance": {"fixture": "stage4_7"},
+    "scaffold_version": "scaffold_v0002"
+  }
+}

@@ -1,0 +1,626 @@
+{
+  "benchmark": "videomme",
+  "benchmark_split": "long",
+  "seed": 0,
+  "videos_per_split": 10,
+  "generated_at": "2026-07-14T01:14:15.969147+09:00",
+  "pinned_previously_cached": [
+    "0RxMZBLeqRI",
+    "7D-gxaie6UI",
+    "GLW9omJfAdk",
+    "TGom0uiW130",
+    "pU_yyadYgG8",
+    "w0Wmc8C0Eq0",
+    "wCkQ138sg6M",
+    "xKiRmesHWIA"
+  ],
+  "excluded_videos": {},
+  "splits": {
+    "train": [
+      {
+        "video_id": "0RxMZBLeqRI",
+        "previously_cached": true,
+        "subtitle_available": true,
+        "provider_indices": [
+          9,
+          10,
+          11
+        ],
+        "sample_ids": [
+          "604-1",
+          "604-2",
+          "604-3"
+        ],
+        "question_ids": [
+          "videomme/long/9",
+          "videomme/long/10",
+          "videomme/long/11"
+        ]
+      },
+      {
+        "video_id": "7D-gxaie6UI",
+        "previously_cached": true,
+        "subtitle_available": true,
+        "provider_indices": [
+          6,
+          7,
+          8
+        ],
+        "sample_ids": [
+          "603-1",
+          "603-2",
+          "603-3"
+        ],
+        "question_ids": [
+          "videomme/long/6",
+          "videomme/long/7",
+          "videomme/long/8"
+        ]
+      },
+      {
+        "video_id": "GLW9omJfAdk",
+        "previously_cached": true,
+        "subtitle_available": true,
+        "provider_indices": [
+          33,
+          34,
+          35
+        ],
+        "sample_ids": [
+          "612-1",
+          "612-2",
+          "612-3"
+        ],
+        "question_ids": [
+          "videomme/long/33",
+          "videomme/long/34",
+          "videomme/long/35"
+        ]
+      },
+      {
+        "video_id": "TGom0uiW130",
+        "previously_cached": true,
+        "subtitle_available": true,
+        "provider_indices": [
+          0,
+          1,
+          2
+        ],
+        "sample_ids": [
+          "601-1",
+          "601-2",
+          "601-3"
+        ],
+        "question_ids": [
+          "videomme/long/0",
+          "videomme/long/1",
+          "videomme/long/2"
+        ]
+      },
+      {
+        "video_id": "pU_yyadYgG8",
+        "previously_cached": true,
+        "subtitle_available": true,
+        "provider_indices": [
+          90,
+          91,
+          92
+        ],
+        "sample_ids": [
+          "631-1",
+          "631-2",
+          "631-3"
+        ],
+        "question_ids": [
+          "videomme/long/90",
+          "videomme/long/91",
+          "videomme/long/92"
+        ]
+      },
+      {
+        "video_id": "w0Wmc8C0Eq0",
+        "previously_cached": true,
+        "subtitle_available": true,
+        "provider_indices": [
+          3,
+          4,
+          5
+        ],
+        "sample_ids": [
+          "602-1",
+          "602-2",
+          "602-3"
+        ],
+        "question_ids": [
+          "videomme/long/3",
+          "videomme/long/4",
+          "videomme/long/5"
+        ]
+      },
+      {
+        "video_id": "wCkQ138sg6M",
+        "previously_cached": true,
+        "subtitle_available": true,
+        "provider_indices": [
+          39,
+          40,
+          41
+        ],
+        "sample_ids": [
+          "614-1",
+          "614-2",
+          "614-3"
+        ],
+        "question_ids": [
+          "videomme/long/39",
+          "videomme/long/40",
+          "videomme/long/41"
+        ]
+      },
+      {
+        "video_id": "xKiRmesHWIA",
+        "previously_cached": true,
+        "subtitle_available": true,
+        "provider_indices": [
+          12,
+          13,
+          14
+        ],
+        "sample_ids": [
+          "605-1",
+          "605-2",
+          "605-3"
+        ],
+        "question_ids": [
+          "videomme/long/12",
+          "videomme/long/13",
+          "videomme/long/14"
+        ]
+      },
+      {
+        "video_id": "g1VFfVsZt7w",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          204,
+          205,
+          206
+        ],
+        "sample_ids": [
+          "669-1",
+          "669-2",
+          "669-3"
+        ],
+        "question_ids": [
+          "videomme/long/204",
+          "videomme/long/205",
+          "videomme/long/206"
+        ]
+      },
+      {
+        "video_id": "jIx5Zi84Z3Q",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          552,
+          553,
+          554
+        ],
+        "sample_ids": [
+          "785-1",
+          "785-2",
+          "785-3"
+        ],
+        "question_ids": [
+          "videomme/long/552",
+          "videomme/long/553",
+          "videomme/long/554"
+        ]
+      }
+    ],
+    "validation": [
+      {
+        "video_id": "2LDriAWltwM",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          846,
+          847,
+          848
+        ],
+        "sample_ids": [
+          "883-1",
+          "883-2",
+          "883-3"
+        ],
+        "question_ids": [
+          "videomme/long/846",
+          "videomme/long/847",
+          "videomme/long/848"
+        ]
+      },
+      {
+        "video_id": "K9MQATj3894",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          891,
+          892,
+          893
+        ],
+        "sample_ids": [
+          "898-1",
+          "898-2",
+          "898-3"
+        ],
+        "question_ids": [
+          "videomme/long/891",
+          "videomme/long/892",
+          "videomme/long/893"
+        ]
+      },
+      {
+        "video_id": "RwdvZLz-aSk",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          456,
+          457,
+          458
+        ],
+        "sample_ids": [
+          "753-1",
+          "753-2",
+          "753-3"
+        ],
+        "question_ids": [
+          "videomme/long/456",
+          "videomme/long/457",
+          "videomme/long/458"
+        ]
+      },
+      {
+        "video_id": "XOfeqRgaF1A",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          330,
+          331,
+          332
+        ],
+        "sample_ids": [
+          "711-1",
+          "711-2",
+          "711-3"
+        ],
+        "question_ids": [
+          "videomme/long/330",
+          "videomme/long/331",
+          "videomme/long/332"
+        ]
+      },
+      {
+        "video_id": "dLjOLXmu68M",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          618,
+          619,
+          620
+        ],
+        "sample_ids": [
+          "807-1",
+          "807-2",
+          "807-3"
+        ],
+        "question_ids": [
+          "videomme/long/618",
+          "videomme/long/619",
+          "videomme/long/620"
+        ]
+      },
+      {
+        "video_id": "hIJtZN8w03A",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          576,
+          577,
+          578
+        ],
+        "sample_ids": [
+          "793-1",
+          "793-2",
+          "793-3"
+        ],
+        "question_ids": [
+          "videomme/long/576",
+          "videomme/long/577",
+          "videomme/long/578"
+        ]
+      },
+      {
+        "video_id": "p84O3JAp_IM",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          303,
+          304,
+          305
+        ],
+        "sample_ids": [
+          "702-1",
+          "702-2",
+          "702-3"
+        ],
+        "question_ids": [
+          "videomme/long/303",
+          "videomme/long/304",
+          "videomme/long/305"
+        ]
+      },
+      {
+        "video_id": "proINILL4X4",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          858,
+          859,
+          860
+        ],
+        "sample_ids": [
+          "887-1",
+          "887-2",
+          "887-3"
+        ],
+        "question_ids": [
+          "videomme/long/858",
+          "videomme/long/859",
+          "videomme/long/860"
+        ]
+      },
+      {
+        "video_id": "sDWOsWawxPc",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          486,
+          487,
+          488
+        ],
+        "sample_ids": [
+          "763-1",
+          "763-2",
+          "763-3"
+        ],
+        "question_ids": [
+          "videomme/long/486",
+          "videomme/long/487",
+          "videomme/long/488"
+        ]
+      },
+      {
+        "video_id": "tslKtm6Le1s",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          879,
+          880,
+          881
+        ],
+        "sample_ids": [
+          "894-1",
+          "894-2",
+          "894-3"
+        ],
+        "question_ids": [
+          "videomme/long/879",
+          "videomme/long/880",
+          "videomme/long/881"
+        ]
+      }
+    ],
+    "test": [
+      {
+        "video_id": "5y5_VyEwZhc",
+        "previously_cached": false,
+        "subtitle_available": false,
+        "provider_indices": [
+          636,
+          637,
+          638
+        ],
+        "sample_ids": [
+          "813-1",
+          "813-2",
+          "813-3"
+        ],
+        "question_ids": [
+          "videomme/long/636",
+          "videomme/long/637",
+          "videomme/long/638"
+        ]
+      },
+      {
+        "video_id": "9bbWYVrQgZ8",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          105,
+          106,
+          107
+        ],
+        "sample_ids": [
+          "636-1",
+          "636-2",
+          "636-3"
+        ],
+        "question_ids": [
+          "videomme/long/105",
+          "videomme/long/106",
+          "videomme/long/107"
+        ]
+      },
+      {
+        "video_id": "9tBsMSDoDqk",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          570,
+          571,
+          572
+        ],
+        "sample_ids": [
+          "791-1",
+          "791-2",
+          "791-3"
+        ],
+        "question_ids": [
+          "videomme/long/570",
+          "videomme/long/571",
+          "videomme/long/572"
+        ]
+      },
+      {
+        "video_id": "D0ZMmQjKn2Q",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          594,
+          595,
+          596
+        ],
+        "sample_ids": [
+          "799-1",
+          "799-2",
+          "799-3"
+        ],
+        "question_ids": [
+          "videomme/long/594",
+          "videomme/long/595",
+          "videomme/long/596"
+        ]
+      },
+      {
+        "video_id": "EFQtbZQ74Eg",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          396,
+          397,
+          398
+        ],
+        "sample_ids": [
+          "733-1",
+          "733-2",
+          "733-3"
+        ],
+        "question_ids": [
+          "videomme/long/396",
+          "videomme/long/397",
+          "videomme/long/398"
+        ]
+      },
+      {
+        "video_id": "Q8AZ16uBhr8",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          288,
+          289,
+          290
+        ],
+        "sample_ids": [
+          "697-1",
+          "697-2",
+          "697-3"
+        ],
+        "question_ids": [
+          "videomme/long/288",
+          "videomme/long/289",
+          "videomme/long/290"
+        ]
+      },
+      {
+        "video_id": "U9-Qy3H_UBY",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          420,
+          421,
+          422
+        ],
+        "sample_ids": [
+          "741-1",
+          "741-2",
+          "741-3"
+        ],
+        "question_ids": [
+          "videomme/long/420",
+          "videomme/long/421",
+          "videomme/long/422"
+        ]
+      },
+      {
+        "video_id": "YEok4Ykw204",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          792,
+          793,
+          794
+        ],
+        "sample_ids": [
+          "865-1",
+          "865-2",
+          "865-3"
+        ],
+        "question_ids": [
+          "videomme/long/792",
+          "videomme/long/793",
+          "videomme/long/794"
+        ]
+      },
+      {
+        "video_id": "_T2Avd3tFHc",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          780,
+          781,
+          782
+        ],
+        "sample_ids": [
+          "861-1",
+          "861-2",
+          "861-3"
+        ],
+        "question_ids": [
+          "videomme/long/780",
+          "videomme/long/781",
+          "videomme/long/782"
+        ]
+      },
+      {
+        "video_id": "wTlERUE8LVw",
+        "previously_cached": false,
+        "subtitle_available": true,
+        "provider_indices": [
+          705,
+          706,
+          707
+        ],
+        "sample_ids": [
+          "836-1",
+          "836-2",
+          "836-3"
+        ],
+        "question_ids": [
+          "videomme/long/705",
+          "videomme/long/706",
+          "videomme/long/707"
+        ]
+      }
+    ]
+  }
+}

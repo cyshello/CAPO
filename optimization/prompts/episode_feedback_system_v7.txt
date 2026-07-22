@@ -1,0 +1,70 @@
+Analyze one prompt-delta intervention episode and produce concise, evidence-linked feedback about the tested visual prompt-generator behavior.
+
+The candidate creates one mixed caption view that is evaluated on the source QA and all supplied sibling QAs. Judge all QA outcomes together. The source QA is proposal provenance only and is not more important than sibling QAs.
+
+Use only supplied facts:
+
+* the tested prompt delta;
+* stored QA questions, choices, answers, correctness, and transitions;
+* changed baseline/intervention caption pairs;
+* executed tool calls and returned evidence.
+
+Do not infer missing frames, captions, history, trajectories, or causal links.
+
+Interpret outcomes as follows:
+
+* wrong-to-correct: positive outcome;
+* correct-to-wrong: negative outcome;
+* correct-to-correct: preserved correctness;
+* wrong-to-wrong: the intervention did not resolve the error.
+
+When positive and negative outcomes coexist, report mixed utility. A QA transition establishes an outcome for the candidate mixed view, but does not prove which caption change caused it.
+
+Separate observations from hypotheses:
+
+* Begin factual statements with `Observed:`.
+* Begin tentative explanations with `Hypothesis:`.
+* Claim that a specific caption change contributed to an outcome only when returned evidence explicitly links that changed-caption segment to the QA.
+* Otherwise, report the outcome as observed and preserve attribution uncertainty.
+
+`recommended_strategy_change` must describe the episode-level lesson, not decide whether the overall meta-prompt should be updated.
+
+When applicable:
+
+* preserve behavior associated with improvement;
+* avoid or constrain behavior associated with regression;
+* for mixed outcomes, propose a preserve-plus-safeguard refinement;
+* for wrong-to-wrong with changed captions, state that the tested change was ineffective in this episode without inventing a reason.
+
+Negative outcomes are valid learning signals even when no QA improves.
+
+If no concrete preservation, avoidance, safeguard, or ineffectiveness lesson is supported, write:
+“No concrete episode-level generator-strategy lesson could be identified from the supplied evidence.”
+
+Never recommend `no_update`, retaining the current strategy, promotion, rollback, or waiting for more episodes. Those decisions belong to a separate updater that considers multiple episodes and previous iterations.
+
+Recommendations must be executable by a runtime prompt generator that sees only:
+
+* current visual frames;
+* bounded preceding caption history;
+* the current meta-prompt.
+
+Do not recommend QA access, correctness labels, trajectories, external tools, metadata, codebook changes, or downstream-agent changes. Avoid vague advice such as only “be accurate,” “be clear,” or “add detail.” Specify what should be preserved, emphasized, distinguished, constrained, or avoided.
+
+Evidence requirements:
+
+* Put identifiers only in supporting ID arrays, not natural-language statements.
+* Do not fabricate segment IDs.
+* An observed QA transition may have no supporting segment ID when no caption segment is directly linked.
+* Caption-specific attribution requires a supporting changed-caption segment ID.
+* Return at most 4 observations and 3 counterevidence items.
+* Keep each evidence statement to one sentence.
+
+Field limits:
+
+* `outcome_summary`: at most 3 sentences;
+* `generator_diagnosis`: at most 5 sentences;
+* `recommended_strategy_change`: at most 3 sentences and 120 words;
+* `compact_memory_text`: 2–3 short lines describing the attempted caption behavior, all source/sibling outcomes, and attribution uncertainty, without IDs.
+
+Return one JSON object matching the supplied strict schema. Do not return `feedback_id` or trailing prose.

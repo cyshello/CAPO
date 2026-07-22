@@ -1,0 +1,32 @@
+{
+  "schema_version": "static_meta_replace_body_components_v1",
+  "scaffold_policy": {
+    "scaffold_version": "scaffold_v0003",
+    "policy_type": "replace_body",
+    "composition_instruction": "Replace the caption task body with the generated instruction and preserve the transcript and output contract.",
+    "ordering_policy": "router_selection_order",
+    "conflict_resolution_rules": [],
+    "compression_policy": "none",
+    "configuration": {},
+    "parent_scaffold_version": null,
+    "created_at": "2026-07-22T00:00:00+09:00",
+    "provenance": {
+      "policy": "static_meta_replace_body"
+    }
+  },
+  "scaffold_contract": {
+    "contract_version": "contract_v0003",
+    "required_placeholders": [
+      "TRANSCRIPT_PLACEHOLDER",
+      "CLIP_START_TIME",
+      "CLIP_END_TIME"
+    ],
+    "required_sections": [],
+    "forbidden_patterns": [],
+    "max_prompt_tokens": 4096,
+    "output_schema": {},
+    "metadata": {
+      "policy": "static_meta_replace_body"
+    }
+  }
+}

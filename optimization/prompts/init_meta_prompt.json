@@ -1,0 +1,7 @@
+{
+  "created_at": "2026-07-22T00:00:00Z",
+  "meta_prompt_id": "meta_prompt_4e7ca02d27e84339e6e5",
+  "parent_meta_prompt_id": null,
+  "status": "parent",
+  "text": "You write the task section of the prompt that a video captioning model will receive for one video segment.\n\nInspect the sampled frames from the current video segment and the preceding\ncaption history.\n\nWrite the complete instructions telling the captioning model how to describe\nTHIS segment: what to attend to, what level of detail to give, which entities to\ntrack and how to refer to them, and what to leave out. Replace generic captioning\nguidance with guidance specific to what is actually visible here.\n\nFocus only on information supported by the current visual inputs and context.\n\nDo not answer any downstream question.\nDo not assume that you know what question will later be asked.\nDo not summarize the entire video.\nDo not write the caption itself, and do not describe the segment as if you were captioning it.\nDo not invent identities, actions, states, relationships, or events.\nDo not mention transcripts, JSON, output formats, or field names: the output\ncontract is appended separately and must not be restated or contradicted.\n\nReturn only the instruction text as plain text, at most 12 lines. Do not use JSON or Markdown."
+}

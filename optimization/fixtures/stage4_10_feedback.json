@@ -1,0 +1,103 @@
+{
+  "feedback": {
+    "feedback_policy": "stage4_10_deterministic_fixture",
+    "feedback_policy_version": "fixture_v0001",
+    "input_evidence_ids": ["evidence_bank", "evidence_router", "evidence_scaffold"],
+    "attributions": [
+      {
+        "attribution_id": "attribution_bank",
+        "evidence_ids": ["evidence_bank"],
+        "targets": ["prompt_bank"],
+        "prompt_bank_issues": ["missing reusable OCR instruction"],
+        "router_issues": [],
+        "scaffold_issues": [],
+        "supporting_facts": ["saved fixture support"],
+        "confidence": 0.9,
+        "rationale": "Deterministic fixture."
+      },
+      {
+        "attribution_id": "attribution_router",
+        "evidence_ids": ["evidence_router"],
+        "targets": ["router"],
+        "prompt_bank_issues": [],
+        "router_issues": ["text entry not selected for text-heavy segment"],
+        "scaffold_issues": [],
+        "supporting_facts": ["saved fixture support"],
+        "confidence": 0.9,
+        "rationale": "Deterministic fixture."
+      },
+      {
+        "attribution_id": "attribution_scaffold",
+        "evidence_ids": ["evidence_scaffold"],
+        "targets": ["scaffold"],
+        "prompt_bank_issues": [],
+        "router_issues": [],
+        "scaffold_issues": ["instruction_ordering_failure"],
+        "supporting_facts": ["complete traces and explicit composition failure"],
+        "confidence": 0.9,
+        "rationale": "Deterministic fixture."
+      }
+    ],
+    "items": [
+      {
+        "feedback_id": "feedback_bank",
+        "evidence_ids": ["evidence_bank"],
+        "attribution_id": "attribution_bank",
+        "target_components": ["prompt_bank"],
+        "failure_modes": ["missing_reusable_instruction"],
+        "successful_behaviors": [],
+        "desired_behaviors": ["Transcribe short visible text exactly when legible."],
+        "avoid_behaviors": ["invent unreadable text"],
+        "applicable_segment_traits": {"text_visible": true},
+        "confidence": 0.9,
+        "rationale": "Deterministic fixture."
+      },
+      {
+        "feedback_id": "feedback_router",
+        "evidence_ids": ["evidence_router"],
+        "attribution_id": "attribution_router",
+        "target_components": ["router"],
+        "failure_modes": ["missing_text_route"],
+        "successful_behaviors": [],
+        "desired_behaviors": ["Select the text entry for text-heavy segments."],
+        "avoid_behaviors": [],
+        "applicable_segment_traits": {
+          "routing_conditions": {"text_visible": true},
+          "target_prompt_ids": ["pe_text"]
+        },
+        "confidence": 0.9,
+        "rationale": "Deterministic fixture."
+      },
+      {
+        "feedback_id": "feedback_scaffold",
+        "evidence_ids": ["evidence_scaffold"],
+        "attribution_id": "attribution_scaffold",
+        "target_components": ["scaffold"],
+        "failure_modes": ["instruction_ordering_failure"],
+        "successful_behaviors": [],
+        "desired_behaviors": ["Group related selected instructions before applying them."],
+        "avoid_behaviors": ["alter the hard output contract"],
+        "applicable_segment_traits": {"multi_entry": true},
+        "confidence": 0.9,
+        "rationale": "Deterministic fixture."
+      }
+    ],
+    "raw_response_artifact": null,
+    "parse_errors": []
+  },
+  "meta_knowledge": [
+    {
+      "knowledge_id": "knowledge_scaffold_fixture",
+      "knowledge_type": "composition_pattern",
+      "condition": {"multi_entry": true},
+      "principle": "Group related selected instructions before applying them.",
+      "positive_support_ids": ["support_1", "support_2", "support_3"],
+      "negative_support_ids": [],
+      "distinct_video_ids": ["video_1", "video_2", "video_3"],
+      "scope": "global_scaffold",
+      "confidence": 0.9,
+      "status": "confirmed",
+      "provenance": {"fixture": "stage4_10"}
+    }
+  ]
+}
