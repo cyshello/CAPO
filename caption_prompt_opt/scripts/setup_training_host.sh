@@ -97,15 +97,20 @@ stage_env(){
 }
 
 stage_install(){
-  say "install: this repository as the 'surrogate_rollout' package"
-  conda run -n "$CONDA_ENV" pip install -e "$REPO_DIR" || die "editable install failed"
-  (cd / && py -c "import surrogate_rollout, surrogate_rollout.prompt_routing.schemas; print('  import surrogate_rollout OK')") \
-    || die "package import failed"
-  # caption_prompt_opt is a top-level package resolved via PYTHONPATH (the run
-  # scripts export REPO_PARENT:REPO_DIR); verify it imports the same way.
+  say "install: import check via PYTHONPATH (this branch has no setup.py)"
+  # capo-main ships no setup.py/pyproject, so there is nothing to `pip install`.
+  # The package resolves by NAME from its directory, with the parent on
+  # PYTHONPATH -- exactly as docs/PORTABLE_SETUP.md and every run script do
+  # (they export REPO_PARENT:REPO_DIR). The checkout dir must therefore be named
+  # 'surrogate_rollout'.
+  if [ "$(basename "$REPO_DIR")" != "surrogate_rollout" ]; then
+    die "checkout dir must be named 'surrogate_rollout' (is '$(basename "$REPO_DIR")'), else 'import surrogate_rollout' cannot resolve"
+  fi
+  (cd / && PYTHONPATH="$REPO_PARENT:$REPO_DIR" py -c "import surrogate_rollout, surrogate_rollout.prompt_routing.schemas; print('  import surrogate_rollout OK')") \
+    || die "surrogate_rollout import failed (check the checkout name and PYTHONPATH)"
   (cd / && PYTHONPATH="$REPO_PARENT:$REPO_DIR" py -c "import caption_prompt_opt.factory as f; print('  import caption_prompt_opt OK:', callable(f.build_caption_prompt_components))") \
     || die "caption_prompt_opt import failed"
-  ok "installed"
+  ok "imports resolve via PYTHONPATH"
 }
 
 stage_models(){
@@ -158,6 +163,7 @@ stage_smoke_vllm(){
   say "GATE: $CAPTION_MODEL captions eight frames on this GPU"
   local out
   out=$(SR_CAPTION_MODEL_ID="$CAPTION_MODEL" CUDA_VISIBLE_DEVICES="${GPUS%%,*}" \
+    PYTHONPATH="$REPO_PARENT:$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}" \
     conda run --no-capture-output -n "$CONDA_ENV" python -m surrogate_rollout.scripts.smoke_qwen25vl_captioner \
     --num-images 8 --max-tokens 128 2>&1) || {
       printf '%s\n' "$out" | tail -20
@@ -175,7 +181,8 @@ stage_smoke_vllm(){
 stage_smoke_tests(){
   say "smoke: unit tests (no GPU, no paid calls)"
   conda run -n "$CONDA_ENV" pip install -q pytest
-  conda run --no-capture-output -n "$CONDA_ENV" python -m pytest -q "$REPO_DIR/tests" \
+  PYTHONPATH="$REPO_PARENT:$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    conda run --no-capture-output -n "$CONDA_ENV" python -m pytest -q "$REPO_DIR/tests" \
     || die "unit tests failed -- fix before spending money on a run"
   ok "tests pass"
 }

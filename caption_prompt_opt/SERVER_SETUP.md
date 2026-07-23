@@ -55,9 +55,10 @@ so it needs no separate setup script. Stages (run one with
   auto-installs the **pre-release stack** (nightly vLLM + transformers from git
   main), because `requirements.txt` pins `vllm==0.11.2` for Qwen2.5-VL. Override
   the auto-detect with `CAPO_PRERELEASE_STACK=1|0`.
-- **install**: `pip install -e` the repo (so the checkout dir name stops
-  mattering) and verifies both `import surrogate_rollout` and
-  `import caption_prompt_opt`.
+- **install**: no `pip install` — this branch (capo-main) has no
+  setup.py/pyproject. The package resolves by name via PYTHONPATH, so the
+  checkout **must be named `surrogate_rollout`**; the stage verifies both
+  `import surrogate_rollout` and `import caption_prompt_opt`.
 - **models**: downloads the caption model + BGE embedder.
 - **data**: gates on the 20-video evidence cohort being present (does not sync;
   prints the rsync command). Confirmation videos are not needed on this host.
