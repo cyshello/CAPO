@@ -891,7 +891,8 @@ class PromptDeltaIterationOrchestrator:
             status="provisional")
         provisional_path = _write_once(
             os.path.join(output, "provisional_meta_prompt.json"), candidate)
-        if self.promotion_policy == "always_promote_measured_v1":
+        if self.promotion_policy in (
+                "always_promote_measured_v1", DEFERRED_MEASUREMENT_POLICY):
             return self._promote_and_measure(
                 iteration_id=iteration_id, parent=parent, candidate=candidate,
                 cases=cases, model_identity=model_identity,
