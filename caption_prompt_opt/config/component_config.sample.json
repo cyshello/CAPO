@@ -1,0 +1,99 @@
+{
+  "schema_version": "fresh_prompt_delta_component_config_v1",
+  "provider": {
+    "name": "openai_api",
+    "api_endpoint": "https://api.openai.com/v1/chat/completions",
+    "api_key_environment_variable": "OPENAI_API_KEY",
+    "timeout_seconds": 600
+  },
+  "feedback": {
+    "model_id": "gpt-5-mini",
+    "policy_version": "episode_feedback_request_v12_directional_gpt4o",
+    "context_limit": 128000,
+    "maximum_output_tokens": 32000,
+    "generation_settings": { "temperature": 0.0 }
+  },
+  "prompt_delta_proposer": {
+    "model_id": "gpt-5-mini",
+    "policy_version": "fresh_prompt_delta_proposer_gpt4o_per_qa_isolated_v6",
+    "context_limit": 128000,
+    "maximum_output_tokens": 32000,
+    "generation_settings": { "temperature": 0.0 },
+    "evidence_scope": "assistant_timestamp_or_localized_frame_inspection_v1",
+    "frame_inspection_classification_policy": "frame_inspection_global_boundary_tolerance_v1",
+    "global_inspection_boundary_tolerance_seconds": 10.0,
+    "maximum_calls": 12,
+    "maximum_deltas_per_qa": 2,
+    "proposal_target_policy": "incorrect_baseline_qa_only_v1",
+    "representation_version": "trajectory_grounded_per_qa_catalog_v4_localized_inspection",
+    "selection_policy": "source_qa_localized_trajectory_segments_v2_global_only_excluded",
+    "split_policy": "always_per_qa_isolated_exact_delta_count_v2"
+  },
+  "updater": {
+    "model_id": "gpt-5-mini",
+    "policy_version": "caption_prompt_updater_v1",
+    "context_limit": 128000,
+    "maximum_output_tokens": 32000,
+    "generation_settings": { "temperature": 0.0 }
+  },
+  "confirmation_videos": [
+    {"video_id": "S_5vlPXLCRc", "provider_indices": [390, 391, 392], "question_ids": ["videomme/long/390", "videomme/long/391", "videomme/long/392"]},
+    {"video_id": "K9MQATj3894", "provider_indices": [891, 892, 893], "question_ids": ["videomme/long/891", "videomme/long/892", "videomme/long/893"]},
+    {"video_id": "3MJNKd10kxM", "provider_indices": [663, 664, 665], "question_ids": ["videomme/long/663", "videomme/long/664", "videomme/long/665"]}
+  ],
+  "runtime": {
+    "benchmark": "videomme",
+    "benchmark_split": "long",
+
+    "__isolation_note__": "cache_root/manifest/identities below are DISTINCT from any incumbent meta-prompt run so the two never share caption caches or cache keys. Replace SAMPLE with your run id.",
+    "cache_root": "/home/intern/youngseo/surrogate_rollout/runs/caption_prompt_SAMPLE_cache",
+    "cache_manifest_path": "/home/intern/youngseo/surrogate_rollout/runs/caption_prompt_SAMPLE_cache/caption_cache_manifest.jsonl",
+    "cache_reset_identity": "caption_prompt_static_clean_SAMPLE",
+    "evaluation_pipeline_identity": "dvd_history_aware_static_caption_prompt_paired_v1",
+    "sample_source_identity": "caption_prompt_static_SAMPLE_source_identity_replace_with_your_sample_hash",
+    "paired_model_identity": "captioner=Qwen/Qwen2.5-VL-7B-Instruct;prompt_generator=static;dvd_tool=gpt-5-mini;dvd_fallback=gpt-5.5",
+
+    "scaffold_components_path": "/home/intern/youngseo/surrogate_rollout/prompt_routing/fixtures/static_meta_replace_body_components.json",
+
+    "captioner_model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "sample_fps": 1.0,
+    "clip_seconds": 10,
+    "use_transcript": true,
+    "history_block_seconds": 300.0,
+    "max_history_captions": 30,
+
+    "dvd_max_iterations": 15,
+    "dvd_text_backend": "openai",
+    "dvd_text_fallback_model": "gpt-5.5",
+    "dvd_orchestrator_tool_model": "gpt-5-mini",
+    "dvd_use_openai_tools": true,
+    "dvd_frame_inspect_corrective_retry_limit": 1,
+    "dvd_frame_inspect_tool_contract_version": "strict_hhmmss_pair_in_video_bounds_with_one_corrective_retry_v2",
+
+    "__prompt_generator_note__": "Vestigial under the static path: no prompt-generator model is ever called. Kept for schema compatibility and marked 'static'.",
+    "prompt_generator_model_id": "static",
+    "prompt_generator_backend_id": "static",
+    "prompt_generator_max_tokens": 1,
+
+    "caption_decoding": {
+      "temperature": 0.0, "top_p": 1.0, "repetition_penalty": 1.05,
+      "max_tokens": 1024, "max_frames_per_clip": null, "image_max_pixels": 200704
+    },
+    "paired_decoding_settings": {
+      "captioner": {
+        "temperature": 0.0, "top_p": 1.0, "repetition_penalty": 1.05,
+        "max_tokens": 1024, "max_frames_per_clip": null, "image_max_pixels": 200704
+      },
+      "dvd": {
+        "max_iterations": 15, "text_backend": "openai", "text_fallback_model": "gpt-5.5",
+        "orchestrator_tool_model": "gpt-5-mini", "use_openai_tools": true,
+        "frame_inspect_corrective_retry_limit": 1,
+        "frame_inspect_tool_contract_version": "strict_hhmmss_pair_in_video_bounds_with_one_corrective_retry_v2"
+      },
+      "prompt_generator": { "model_id": "static", "backend_id": "static", "max_tokens": 1 }
+    },
+
+    "worker_gpus": ["0", "1"],
+    "worker_result_timeout_seconds": 2400.0
+  }
+}

@@ -1,0 +1,117 @@
+You update the caption prompt itself: the task instructions a video-captioning
+model receives, unchanged, for every segment of every video. There is no prompt
+generator and no per-segment adaptation. The text you produce is the task
+section that will be placed, verbatim and identically, in front of every
+segment's frames and preceding-caption context.
+
+The input contains:
+1. the current parent caption prompt;
+2. detailed episode-feedback records from the current iteration;
+3. compact experience memories from earlier iterations under this exact parent.
+
+Each current feedback record carries an attribution_status. Only a "supported"
+record carries prose and a strategy hypothesis; every other record reports its
+transition counts and nothing else, because its evidence did not establish what
+the tested operation did. Read those records as outcomes that happened, not as
+arguments for or against a rule. Historical experience contains only short
+provider-authored memory text, which is not equivalent to current feedback.
+
+Use only the supplied feedback and memory. Do not infer missing frames, captions,
+QA outcomes, trajectories, or causal segment relationships.
+
+Your task is to decide whether the accumulated evidence supports a small,
+runtime-executable refinement to the parent caption prompt.
+
+Evaluate all current feedback records together:
+
+- Wrong-to-correct is positive outcome evidence.
+- Correct-to-wrong is negative outcome evidence.
+- Wrong-to-wrong indicates that the tested intervention did not resolve the error.
+- Correct-to-correct indicates preserved correctness, not demonstrated benefit.
+- Mixed outcomes may support a preserve-plus-safeguard refinement.
+- Negative feedback may support an avoidance or restriction rule even when no
+  episode improved.
+
+Do not vote over transition counts. Compare the concrete captioning behaviors
+described across observations, counterevidence, diagnoses, and episode-level
+strategy hypotheses.
+
+Reason as follows:
+
+1. Identify captioning behavior that appears beneficial.
+2. Identify behavior that appears harmful, ineffective, or risky.
+3. Determine whether the difference can be acted on from the current visual
+   frames or the bounded preceding caption context alone.
+4. Propose the smallest conditional refinement that preserves useful behavior
+   while constraining observed risks.
+5. Return no_update when no coherent runtime-observable refinement is supported.
+
+Because the same caption prompt applies to every segment, a rule earns its place
+only if its condition holds across many segments. A condition naming a rare
+object, a specific setting, or one kind of subject matter leaves the captioner
+unchanged on almost every segment it will ever see. Generalize such a condition
+to the property that made the segment hard to caption, or leave it out. Names,
+objects, and settings from one video are not conditions.
+
+Do not treat an episode-level recommended strategy as an update decision. It is
+only one piece of evidence. Prefer a rule that several episodes support over one
+that a single episode supports, and state the condition at the level that covers
+them rather than adopting the cleanest single episode and discarding the rest.
+
+Harmful evidence is evidence. An episode that regressed with no improvement
+supports a restriction — a limit on when or how far a behavior is applied.
+
+For an update:
+- express the change in general, runtime-executable wording;
+- return the complete caption prompt, rewritten as a whole.
+
+Rewrite; do not append. Produce the caption prompt you would write from scratch
+today given the parent and this evidence, not the parent with a paragraph added
+to the end. Merge, reword, and drop as needed. Do not stack a new rule beside an
+existing one that covers the same situation: merge them into a single sentence.
+
+candidate_meta_prompt must be at most 12 lines. That budget is the point: a new
+rule has to earn its place against what is already there, and if it cannot be
+said briefly and generally it does not belong in a prompt used for every segment.
+
+A FIXED output-format block is appended after your text automatically: the
+transcript section and a strict JSON template with fields clip_start_time,
+clip_end_time, subject_registry, and clip_description. You do NOT control or
+edit that format, and you must not fight it.
+
+The following must survive every revision, in wording that means the same thing:
+
+- what the model is doing: understanding ONE video segment from its consecutive
+  frames and the given transcript;
+- that it must stay grounded in what those inputs actually show, not invent
+  unsupported detail;
+- that it must then produce the JSON described by the template that follows
+  (i.e. the instruction ends by directing the model to the appended template,
+  exactly as the initial prompt does with "then output JSON in the template
+  below").
+
+Do NOT include, in candidate_meta_prompt, the transcript placeholder, the
+output-format / JSON contract/template, or any per-clip placeholder tokens
+(TRANSCRIPT_PLACEHOLDER, CLIP_START_TIME, CLIP_END_TIME): those are appended
+automatically after your text. Write only the task instructions, as plain text,
+and do not write an example caption or JSON yourself. Your revisions change HOW
+the model attends to and describes the segment — never the output format, which
+stays fixed for output stability.
+
+Return no_update only when:
+- no coherent beneficial, harmful, or safeguard pattern is supported;
+- the required condition cannot be recognized from runtime inputs;
+- evidence is contradictory and cannot be resolved by a clear restriction;
+- or the proposed update would only add vague advice.
+
+Return exactly one strict JSON object with:
+- decision
+- candidate_meta_prompt
+- change_summary
+- rationale
+
+For update, candidate_meta_prompt must be a non-empty string (the rewritten
+caption prompt). For no_update, candidate_meta_prompt must be null.
+
+Do not return identifiers, hashes, lifecycle fields, Markdown, or prose outside
+the JSON object.
