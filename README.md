@@ -50,8 +50,16 @@ of scoring it inline, so a measurement that fails — or a worker that is not
 running yet — can never stop the optimization. A separate process drains it:
 
 ```bash
-python scripts/run_measurement_worker.py --queue-dir runs/measurement_queue
+python scripts/run_measurement_worker.py \
+  --queue-dir runs/measurement_queue \
+  --component-config <evidence-run>/resolved_component_config.json \
+  --worker-gpus 0,1
 ```
+
+The component config is the `resolved_component_config_path` recorded in an
+evidence run's `fresh_evidence_manifest.json`; `--worker-gpus` overrides the GPU
+list inside it, which is what lets the worker sit on hardware the loop is not
+using.
 
 The two halves share nothing but that directory and can sit on different GPUs or
 different machines. The practical consequence for setup: **only the evidence
@@ -61,11 +69,13 @@ cohort *file*, to derive the held-out case list it enqueues.
 
 ## Configuration
 
-`config.py` holds every experiment choice and reads each one from the
-environment. Its defaults reproduce the original gpt-4o stack, so an unset
-environment reproduces the earlier measured runs byte for byte; the profiles
-under `scripts/env/` are what move a run off those defaults. The knobs worth
-knowing:
+`config.py` is the single place experiment choices live, and the ones that vary
+per host or per run read from the environment. Its defaults reproduce the
+original gpt-4o stack, so an unset environment reproduces the earlier measured
+runs byte for byte; the profiles under `scripts/env/` are what move a run off
+those defaults. Values that identify the method rather than the host — the split
+seed, the embedding model, the decoding policy version — are constants on
+purpose: they are part of every cache key. The knobs worth knowing:
 
 | Variable | Effect |
 | --- | --- |
@@ -85,12 +95,16 @@ Cohort files under `train_set/` are frozen, deterministic video-ID lists; see
 from surrogate_rollout.captioning import Qwen25VLCaptioner
 
 captioner = Qwen25VLCaptioner(max_images_per_prompt=8)
-caption = captioner.caption(
-    ["frame_000.jpg", "frame_001.jpg", "frame_002.jpg", "frame_003.jpg"],
+captions = captioner.caption_batch(
+    [["frame_000.jpg", "frame_001.jpg", "frame_002.jpg", "frame_003.jpg"]],
     "Describe the sequence across these frames.",
     max_tokens=128,
 )
 ```
+
+`caption_batch` is the only entry point: one clip per element of the outer list,
+one shared prompt or one per clip. Batching is not an optimization here — it is
+how the captioning workers keep a GPU busy.
 
 The class name is historical: it serves whatever `SR_CAPTION_MODEL_ID` names.
 

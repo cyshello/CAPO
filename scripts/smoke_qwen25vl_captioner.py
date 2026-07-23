@@ -89,11 +89,11 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         image_max_pixels=args.image_max_pixels,
     )
-    caption = captioner.caption(
-        images[: args.num_images],
+    caption = captioner.caption_batch(
+        [images[: args.num_images]],
         args.prompt,
         max_tokens=args.max_tokens,
-    )
+    )[0]
 
     print(f"images_used={len(images[: args.num_images])}")
     print("caption:")
