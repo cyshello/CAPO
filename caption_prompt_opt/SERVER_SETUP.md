@@ -25,10 +25,33 @@ bash caption_prompt_opt/scripts/go_caption_prompt.sh
   `import surrogate_rollout` both resolve. Override with `SR_PROJECT_ROOT` if
   your checkout is elsewhere.
 
-## 2. Conda env (captioner runtime)
-- Env name `local_llm_vllm` (override `SR_CONDA_ENV`): vLLM + transformers +
-  `qwen_vl_utils` + opencv, matching CUDA for the Pro 5000 GPUs.
-- vLLM version **must support the captioner architecture** (see caveats).
+## 2. Conda env (captioner runtime) — brand-new server
+
+The base bring-up is `docs/PORTABLE_SETUP.md` in the CAPO repo:
+`conda create -n local_llm_vllm python=3.11` + `pip install -r requirements.txt`
++ `.env` + sync cohort media (`scripts/sync_cohort_data.sh`).
+
+**One delta for this path:** `requirements.txt` pins `vllm==0.11.2`,
+`transformers==4.57.6`, `qwen-vl-utils==0.0.14` — those target **Qwen2.5-VL**.
+**Qwen3.5-9B / Qwen3-VL needs newer vLLM (nightly) + transformers.** So after the
+pinned install you must upgrade the captioner stack to a combo that recognizes
+the model's architecture.
+
+`caption_prompt_opt/scripts/setup_new_server.sh` automates all of it (conda env,
+pinned deps, captioner-stack override, `.env`, model download, import check):
+
+```bash
+cd <CAPO checkout named surrogate_rollout>
+export SR_CAPTION_MODEL_ID=Qwen/Qwen3.5-9B
+export OPENAI_API_KEY=sk-...          # only if no .env yet
+# pin the verified combo (recommended); defaults just `pip install -U latest`:
+export CAPTION_STACK_SPEC='vllm==<ver> transformers==<ver> qwen-vl-utils==<ver>'
+export VLLM_PIP_EXTRA='--pre --extra-index-url https://wheels.vllm.ai/nightly'
+bash caption_prompt_opt/scripts/setup_new_server.sh
+```
+
+It does **not** create GPUs or sync media (data comes from a host that has it);
+it prints the remaining data-sync + run steps. Match CUDA to the Pro 5000s.
 
 ## 3. Secrets — `surrogate_rollout/.env`
 - `OPENAI_API_KEY` (feedback / proposer / updater / DVD text backend — all
