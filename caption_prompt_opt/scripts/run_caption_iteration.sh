@@ -82,8 +82,12 @@ CACHE_RESET_IDENTITY="caption_prompt_static_clean_${RUN_TIMESTAMP}"
 # the evidence cross-check passes.
 MODEL_IDENTITY="captioner=${SR_CAPTION_MODEL_ID:-Qwen/Qwen2.5-VL-7B-Instruct};prompt_generator=static;dvd_tool=${SR_ORCHESTRATOR_TOOL_MODEL:-gpt-5-mini};dvd_fallback=gpt-5.5"
 
-# Held-out measurement runs inline or deferred, same as the incumbent.
-PROMOTION_POLICY="${FRESH_PROMPT_DELTA_PROMOTION_POLICY:-always_promote_measured_v1}"
+# Held-out measurement is DEFERRED, same as the reference training_host.sh:
+# every candidate is promoted (no confirmation gate) and the held-out score is
+# enqueued for a separate measurement worker, so this loop never re-captions the
+# held-out videos. (always_promote_measured_v1 would instead measure inline,
+# re-captioning the held-out set every iteration.)
+PROMOTION_POLICY="${FRESH_PROMPT_DELTA_PROMOTION_POLICY:-promote_and_enqueue_measurement_v1}"
 MEASUREMENT_QUEUE_ARGS=()
 if [[ "$PROMOTION_POLICY" == "promote_and_enqueue_measurement_v1" ]]; then
   MEASUREMENT_QUEUE_DIR="${FRESH_PROMPT_DELTA_MEASUREMENT_QUEUE_DIR:-$PROJECT_ROOT/runs/caption_prompt_measurement_queue}"

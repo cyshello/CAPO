@@ -13,8 +13,17 @@ bash caption_prompt_opt/scripts/setup_training_host.sh go
 This mirrors the reference experiment exactly — **20 evidence videos × 5
 iterations** — with the caption swaps: static generator (no prompt-generator
 call), caption-prompt updater, and promotion **pinned to
-`always_promote_measured_v1`** (held-out set reports, never gates). Isolated run
-roots + cache identities, so it can run beside a meta-prompt job.
+`promote_and_enqueue_measurement_v1`** (same as the reference). That means:
+
+- **no confirmation gate** — every candidate is promoted and becomes the next
+  parent;
+- **no held-out re-captioning in the loop** — the held-out (15-video) score is
+  *enqueued* to `runs/caption_prompt_measurement_queue`, not run here. A separate
+  `scripts/run_measurement_worker.py` (this box or another) captions and scores
+  the held-out set later, and the loop never consults it. Skip that worker and
+  the held-out set is never captioned at all.
+
+Isolated run roots + cache identities, so it can run beside a meta-prompt job.
 
 Script chain (all copies of the incumbent ones, caption-flavored):
 `setup_training_host.sh` → `run_caption_kiter.sh` (K-loop) →

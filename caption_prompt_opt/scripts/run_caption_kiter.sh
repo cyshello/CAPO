@@ -5,8 +5,10 @@
 #   * per-iteration driver -> caption_prompt_opt/scripts/run_caption_iteration.sh
 #   * parent chain starts at the caption prompt, advances by promoted id
 #   * run/experiment dirs prefixed caption_prompt_
-#   * promotion policy PINNED to always_promote_measured_v1 (held-out reports,
-#     never gates) -- required for this experiment.
+#   * promotion policy PINNED to promote_and_enqueue_measurement_v1 (same as the
+#     reference training_host.sh): every candidate is promoted (no confirmation
+#     gate), and the held-out measurement is ENQUEUED for a separate worker --
+#     the loop never re-captions the held-out videos on this host.
 
 set -euo pipefail
 
@@ -134,7 +136,7 @@ for ordinal in $(seq 1 "$ITERATION_COUNT"); do
   FRESH_PROMPT_DELTA_STATE_ROOT="$STATE_ROOT" \
   FRESH_PROMPT_DELTA_CACHE_ROOT="$CACHE_ROOT" \
   FRESH_PROMPT_DELTA_MEMORY_BANK_ROOT="$MEMORY_ROOT" \
-  FRESH_PROMPT_DELTA_PROMOTION_POLICY="always_promote_measured_v1" \
+  FRESH_PROMPT_DELTA_PROMOTION_POLICY="promote_and_enqueue_measurement_v1" \
     bash "$CPO_ROOT/scripts/run_caption_iteration.sh"
 
   evidence_manifest="$PROJECT_ROOT/runs/caption_prompt_iteration_${run_timestamp}_evidence/fresh_evidence_manifest.json"
