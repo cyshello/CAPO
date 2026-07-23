@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capo"
+version = "0.1.0"
+description = "Caption-prompt optimization for long-form video understanding: the meta-prompt training loop."
+requires-python = ">=3.11"
+
+# Every module imports the absolute name `surrogate_rollout`, and the scripts
+# reach it by putting the repository's parent directory on sys.path. Without an
+# installed distribution that only works when the checkout directory is itself
+# named `surrogate_rollout`, so `git clone <url>` into the default `CAPO`
+# directory breaks every entry point. Mapping the package name onto the
+# repository root makes `pip install -e .` supply the name instead, and the
+# checkout can then be called anything.
+[tool.setuptools]
+package-dir = { "surrogate_rollout" = "." }
+
+# Explicit, because a find-directive under this mapping would also sweep in the
+# vendored DVD stack. That stack is loaded by path (config.PROMPT_SENS_ROOT),
+# never imported as a subpackage, and it keeps its own top-level module names.
+packages = [
+    "surrogate_rollout",
+    "surrogate_rollout.cache",
+    "surrogate_rollout.captioning",
+    "surrogate_rollout.evaluation",
+    "surrogate_rollout.mixed_views",
+    "surrogate_rollout.optimization",
+    "surrogate_rollout.optimization.policies",
+    "surrogate_rollout.prompt_routing",
+    "surrogate_rollout.prompt_routing.policies",
+    "surrogate_rollout.references",
+    "surrogate_rollout.retrieval",
+    "surrogate_rollout.scripts",
+    "surrogate_rollout.selection",
+]
