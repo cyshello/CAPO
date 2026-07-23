@@ -1,5 +1,9 @@
 # Training host: the optimization loop only, on a machine that is not the one
-# the completed iterations ran on. Source it after the model stack:
+# the completed iterations ran on.
+#
+# Every value here is a default, not an override: anything already set in the
+# environment wins, so `SR_CAPTION_MODEL_ID=... bash setup_training_host.sh go`
+# needs no edit to this file. Source it after the model stack:
 #   set -a
 #   source scripts/env/gpt5mini_stack.sh
 #   source scripts/env/training_host.sh
@@ -13,25 +17,25 @@
 # confirmation cohort *file* still does.
 
 # Four GPUs, one captioning worker each.
-PROMPT_DELTA_WORKER_GPUS=0,1,2,3
+PROMPT_DELTA_WORKER_GPUS=${PROMPT_DELTA_WORKER_GPUS:-0,1,2,3}
 
 # A different captioner from the 3090 host's Qwen2.5-VL-7B. The caption cache is
 # keyed on this identity, so the captions produced here never collide with the
 # earlier model's -- and never reuse them either: this host starts cold and
 # re-captions every clip.
-SR_CAPTION_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct
+SR_CAPTION_MODEL_ID=${SR_CAPTION_MODEL_ID:-Qwen/Qwen3-VL-8B-Instruct}
 
 # The 5-iteration schedule the 3090 host is running: 4 evidence videos per
 # iteration out of the frozen 20-video cohort, held-out set of 15.
-PROMPT_DELTA_ITERATION_COUNT=5
-PROMPT_DELTA_VIDEOS_PER_ITERATION=4
-PROMPT_DELTA_EVIDENCE_COHORT_FILE=train_set/20samples.txt
-PROMPT_DELTA_CONFIRMATION_COHORT_FILE=train_set/confirmation.txt
-PROMPT_DELTA_EXPERIMENT_LABEL=20video_5iter_val15
+PROMPT_DELTA_ITERATION_COUNT=${PROMPT_DELTA_ITERATION_COUNT:-5}
+PROMPT_DELTA_VIDEOS_PER_ITERATION=${PROMPT_DELTA_VIDEOS_PER_ITERATION:-4}
+PROMPT_DELTA_EVIDENCE_COHORT_FILE=${PROMPT_DELTA_EVIDENCE_COHORT_FILE:-train_set/20samples.txt}
+PROMPT_DELTA_CONFIRMATION_COHORT_FILE=${PROMPT_DELTA_CONFIRMATION_COHORT_FILE:-train_set/confirmation.txt}
+PROMPT_DELTA_EXPERIMENT_LABEL=${PROMPT_DELTA_EXPERIMENT_LABEL:-20video_5iter_val15}
 
 # Deferred measurement: promote the candidate, write the scoring request to the
 # queue, keep going. A measurement failure can then never stop the loop.
-FRESH_PROMPT_DELTA_PROMOTION_POLICY=promote_and_enqueue_measurement_v1
+FRESH_PROMPT_DELTA_PROMOTION_POLICY=${FRESH_PROMPT_DELTA_PROMOTION_POLICY:-promote_and_enqueue_measurement_v1}
 
 # The conda environment the run scripts invoke.
-SR_CONDA_ENV=capo
+SR_CONDA_ENV=${SR_CONDA_ENV:-capo}

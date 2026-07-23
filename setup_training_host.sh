@@ -9,10 +9,17 @@
 # them, so only the evidence cohort's videos need to be present here.
 #
 # Usage (from inside this repository, on the training host):
-#   bash setup_training_host.sh all        # every stage, stopping at manual gates
+#   SR_CAPTION_MODEL_ID=<hf-model> bash setup_training_host.sh go
+#         set up everything and start the run; stops before spending anything
+#         if the videos or the API key are missing
+#   bash setup_training_host.sh all        # set up only, never launches
 #   bash setup_training_host.sh <stage>    # one stage
 #
-# Stages: check env install models data creds smoke-vllm smoke-tests launch
+# Stages: check env install models data creds smoke-vllm smoke-tests launch go
+#
+# Anything already exported wins over the profiles in scripts/env, so the
+# caption model, the GPU list, and the schedule are all overridable from the
+# command line without editing a file.
 #
 # Automatable stages run themselves. Stages that need something only a human can
 # supply (the video files, a funded API key) print exactly what is missing and
@@ -153,19 +160,68 @@ stage_launch(){
   set +a
   bash scripts/run_prompt_delta_two_iteration_10video_pool.sh
 
-  Resume: re-run the same command with PROMPT_DELTA_ITERATION_TIMESTAMP set to
-  the timestamp of the run directory under runs/. Completed iterations are
-  skipped; a half-written one resumes from its own artifacts.
+  Or let this script do it: bash setup_training_host.sh go
+
+  Resume: re-run with PROMPT_DELTA_ITERATION_TIMESTAMP set to the timestamp of
+  the run directory under runs/. Completed iterations are skipped; a half-written
+  one resumes from its own artifacts.
 
   Held-out scoring (separate process, may be another machine):
-  python scripts/run_measurement_worker.py --queue-dir runs/measurement_queue
+  python scripts/run_measurement_worker.py --queue-dir runs/measurement_queue \\
+    --component-config <evidence-run>/resolved_component_config.json
 EOF
+}
+
+# The whole thing: every setup stage, then the run. The gates are hard here --
+# a missing video or a missing key stops it before anything is spent, because
+# the alternative is discovering it an hour into a paid run.
+stage_go(){
+  stage_check    || die "environment not ready"
+  stage_env      || die "dependency install failed"
+  stage_install  || exit 1
+  stage_models   || exit 1
+  stage_data     || die "evidence videos missing (see above); nothing was started"
+  stage_creds    || die "no API key (see above); nothing was started"
+  stage_smoke_vllm
+  stage_smoke_tests
+
+  say "run: ${PROMPT_DELTA_ITERATION_COUNT:-5} iterations, captioner $CAPTION_MODEL, GPUs $GPUS"
+  cd "$REPO_DIR" || die "cannot enter $REPO_DIR"
+  # The profiles only fill in what the environment has not already set, so a
+  # variable exported before this script wins over both of them.
+  set -a
+  # shellcheck source=scripts/env/gpt5mini_stack.sh
+  source "$REPO_DIR/scripts/env/gpt5mini_stack.sh"
+  # shellcheck source=scripts/env/training_host.sh
+  source "$REPO_DIR/scripts/env/training_host.sh"
+  set +a
+
+  if [ -n "${CAPO_FOREGROUND:-}" ]; then
+    exec bash "$REPO_DIR/scripts/run_prompt_delta_two_iteration_10video_pool.sh"
+  fi
+  # Days of runtime; a dropped ssh session must not take the run with it.
+  mkdir -p "$REPO_DIR/runs"
+  local log="$REPO_DIR/runs/launch_$(date -u +%Y%m%d_%H%M%S).log"
+  nohup bash "$REPO_DIR/scripts/run_prompt_delta_two_iteration_10video_pool.sh" \
+    > "$log" 2>&1 &
+  local pid=$!
+  sleep 5
+  if kill -0 "$pid" 2>/dev/null; then
+    ok "running: pid $pid"
+    echo "  log:    tail -f $log"
+    echo "  stop:   kill $pid"
+    echo "  (CAPO_FOREGROUND=1 runs it in this shell instead)"
+  else
+    warn "the run exited within five seconds -- last lines:"
+    tail -20 "$log"
+    return 1
+  fi
 }
 
 case "${1:-all}" in
   check) stage_check;; env) stage_env;; install) stage_install;; models) stage_models;;
   data) stage_data;; creds) stage_creds;; smoke-vllm) stage_smoke_vllm;;
-  smoke-tests) stage_smoke_tests;; launch) stage_launch;;
+  smoke-tests) stage_smoke_tests;; launch) stage_launch;; go) stage_go;;
   all)
     stage_check && stage_env && stage_install && stage_models
     stage_data  || warn "provide the videos, then: bash setup_training_host.sh data"

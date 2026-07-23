@@ -8,22 +8,29 @@ caption. The model weights never move.
 
 ## Setting it up on a new host
 
+Pick the caption model, then run one command:
+
 ```bash
-git clone https://github.com/cyshello/CAPO.git
-cd CAPO
-bash setup_training_host.sh all
+git clone https://github.com/cyshello/CAPO.git && cd CAPO && \
+  SR_CAPTION_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct bash setup_training_host.sh go
 ```
 
-The setup script runs the automatable stages and stops at the two gates only a
-human can pass — the video files and a funded API key — telling you exactly what
-is missing. Individual stages re-run on their own:
-`check env install models data creds smoke-vllm smoke-tests launch`.
+`go` builds the conda environment, installs the package, downloads the models,
+verifies the evidence videos, checks that vLLM can load the caption model on this
+hardware, runs the unit tests, and starts the 5-iteration run in the background
+with a log path printed. Nothing is spent before the two gates only a human can
+pass: the video files and a funded API key. If either is missing it stops and
+prints exactly what to supply — including the `rsync` line for the videos.
+
+`bash setup_training_host.sh all` does the same setup but never launches, and
+each stage re-runs on its own:
+`check env install models data creds smoke-vllm smoke-tests launch go`.
 
 The checkout directory can be called anything. The package name
 `surrogate_rollout` comes from the editable install (`pip install -e .`), not
 from the directory.
 
-## Running the loop
+## Running the loop by hand
 
 ```bash
 set -a
@@ -36,10 +43,13 @@ bash scripts/run_prompt_delta_two_iteration_10video_pool.sh
 Two profiles, because the two choices are independent: the model stack is an
 experiment decision that should travel between hosts unchanged, while GPU
 indices, the caption model, and the iteration schedule belong to the machine.
+Both files assign defaults only — an exported variable wins over both, which is
+what makes the one-liner above work without editing anything.
 
-To resume, re-run the same command with `PROMPT_DELTA_ITERATION_TIMESTAMP` set
-to an existing run's timestamp. Completed iterations are skipped and a partial
-one resumes from its own artifacts.
+To resume, re-run with `PROMPT_DELTA_ITERATION_TIMESTAMP` set to an existing
+run's timestamp. Completed iterations are skipped and a partial one resumes from
+its own artifacts. `CAPO_FOREGROUND=1` keeps the run in the current shell
+instead of detaching it.
 
 ## What this host does not do
 
