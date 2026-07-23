@@ -101,7 +101,7 @@ def test_clip_search_schema_and_execution_identity_are_fixed_to_16():
     assert identity["qa_concurrency_policy_version"] == \
         "serialized_dvd_qa_execution_v1"
     assert identity["frame_inspect_tool_contract_version"] == \
-        "strict_hhmmss_pair_with_one_corrective_retry_v1"
+        "strict_hhmmss_pair_in_video_bounds_with_one_corrective_retry_v2"
     assert identity["frame_inspect_corrective_retry_limit"] == 1
 
 
@@ -218,6 +218,77 @@ def test_frame_inspect_invalid_numeric_args_get_one_corrective_retry():
     assert wrapped(database=object(), question="q?",
                    time_ranges_hhmmss=[["00:00:00", "00:00:10"]]) == "answer"
     assert calls == [[["00:00:00", "00:00:10"]]]
+
+
+class _Database:
+    """Minimal stand-in for the NanoVectorDB the tool receives."""
+
+    def __init__(self, video_length="00:33:16"):
+        self._video_length = video_length
+
+    def get_additional_data(self):
+        return {"video_length": self._video_length}
+
+
+def test_a_start_past_the_end_of_the_video_gets_a_corrective_retry():
+    """The tool itself raises on this, which would abort the whole QA."""
+    calls = []
+
+    def frame_inspect_tool(database, question, time_ranges_hhmmss):
+        calls.append(time_ranges_hhmmss)
+        return "answer"
+
+    rec = RunRecorder()
+    wrapped = _wrap_frame_inspect(frame_inspect_tool, rec)
+    error = wrapped(database=_Database(), question="q?",
+                    time_ranges_hhmmss=[["00:40:00", "00:41:00"]])
+
+    assert calls == []
+    assert "past the end of this 00:33:16 video" in error
+    assert "00:00:00 to 00:33:16" in error
+    assert rec.tool_events[0]["status"] == "argument_validation_error"
+    assert rec.tool_events[0]["execution_performed"] is False
+
+    # the corrected call goes through
+    assert wrapped(database=_Database(), question="q?",
+                   time_ranges_hhmmss=[["00:30:00", "00:31:00"]]) == "answer"
+    assert calls == [[["00:30:00", "00:31:00"]]]
+
+
+def test_a_range_ending_past_the_video_is_left_to_the_tool_to_clamp():
+    calls = []
+
+    def frame_inspect_tool(database, question, time_ranges_hhmmss):
+        calls.append(time_ranges_hhmmss)
+        return "answer"
+
+    rec = RunRecorder()
+    wrapped = _wrap_frame_inspect(frame_inspect_tool, rec)
+    assert wrapped(database=_Database(), question="q?",
+                   time_ranges_hhmmss=[["00:33:00", "00:40:00"]]) == "answer"
+    assert calls == [[["00:33:00", "00:40:00"]]]
+
+
+def test_a_reversed_range_is_rejected_before_execution():
+    rec = RunRecorder()
+    wrapped = _wrap_frame_inspect(lambda **_kwargs: "unreached", rec)
+    error = wrapped(database=_Database(), question="q?",
+                    time_ranges_hhmmss=[["00:02:00", "00:01:00"]])
+    assert "ends before it starts" in error
+
+
+def test_bounds_are_skipped_when_the_database_exposes_no_length():
+    calls = []
+
+    def frame_inspect_tool(database, question, time_ranges_hhmmss):
+        calls.append(time_ranges_hhmmss)
+        return "answer"
+
+    rec = RunRecorder()
+    wrapped = _wrap_frame_inspect(frame_inspect_tool, rec)
+    assert wrapped(database=object(), question="q?",
+                   time_ranges_hhmmss=[["00:40:00", "00:41:00"]]) == "answer"
+    assert calls == [[["00:40:00", "00:41:00"]]]
 
 
 def test_frame_inspect_second_invalid_args_fail_closed():

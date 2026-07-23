@@ -25,8 +25,8 @@ from surrogate_rollout.optimization.llm_episode_feedback import (
 from surrogate_rollout.optimization.feedback_memory import (
     append_parent_feedback_memory_bank,
     archive_parent_feedback_memory_bank,
+    carry_over_parent_feedback_memory_bank,
     build_episode_feedback_memory_record,
-    initialize_parent_feedback_memory_bank,
     load_parent_feedback_memory_bank,
 )
 from surrogate_rollout.optimization.schemas import (
@@ -49,6 +49,30 @@ CONFIRMATION_REQUEST_SCHEMA_VERSION = "meta_prompt_confirmation_request_v1"
 CONFIRMATION_RESULT_SCHEMA_VERSION = "meta_prompt_confirmation_result_v1"
 PROMOTION_DECISION_SCHEMA_VERSION = "meta_prompt_promotion_decision_v1"
 CURRENT_POINTER_SCHEMA_VERSION = "current_meta_prompt_pointer_v1"
+# How an update decision becomes the next parent.
+#   confirmed_paired_v1     the held-out set decides: parent and candidate are
+#                           scored on it and the candidate is promoted only if
+#                           it passes the criterion.
+#   always_promote_measured_v1
+#                           the held-out set decides nothing. Every candidate
+#                           becomes the next parent and the held-out set scores
+#                           the active prompt once per iteration, so its numbers
+#                           are an unbiased learning curve rather than a
+#                           selection signal.
+#   promote_and_enqueue_measurement_v1
+#                           the same, except the scoring runs elsewhere. The
+#                           iteration promotes and records a measurement
+#                           request; a separate worker -- other GPUs, other
+#                           machine -- drains the queue and writes the numbers
+#                           back. The optimization loop never waits for a
+#                           measurement it does not consult anyway, so a
+#                           measurement failure cannot stop the run.
+PROMOTION_POLICIES = ("confirmed_paired_v1", "always_promote_measured_v1",
+                      "promote_and_enqueue_measurement_v1")
+DEFERRED_MEASUREMENT_POLICY = "promote_and_enqueue_measurement_v1"
+DEFERRED_MEASUREMENT_REQUEST_SCHEMA_VERSION = \
+    "deferred_held_out_measurement_request_v1"
+DEFAULT_PROMOTION_POLICY = "confirmed_paired_v1"
 
 
 class PromptDeltaIterationError(RuntimeError):
@@ -173,6 +197,75 @@ class MetaPromptConfirmationEvaluator(Protocol):
 
 
 @dataclass(frozen=True)
+class MetaPromptMeasurementOutcome:
+    case_id: str
+    video_id: str
+    qa_id: str
+    correct: bool | None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("case_id", "video_id", "qa_id"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"measurement outcome {name} is required")
+        if self.correct is not None and not isinstance(self.correct, bool):
+            raise TypeError("correct must be bool or None")
+        if self.error is not None and not isinstance(self.error, str):
+            raise TypeError("error must be str or None")
+
+
+@dataclass(frozen=True)
+class MetaPromptMeasurementResult:
+    """One meta-prompt scored on the held-out cases, decision-free.
+
+    Nothing reads this to accept or reject a candidate: it exists so the
+    held-out set can report a learning curve without ever taking part in
+    selection.
+    """
+
+    measurement_id: str
+    meta_prompt_id: str
+    confirmation_set_id: str
+    model_identity: str
+    decoding_settings: Mapping[str, Any]
+    cache_reset_identity: str
+    evaluation_pipeline_identity: str
+    outcomes: tuple[MetaPromptMeasurementOutcome, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcomes, tuple) or not self.outcomes or any(
+                not isinstance(item, MetaPromptMeasurementOutcome)
+                for item in self.outcomes):
+            raise TypeError("measurement result outcomes are invalid")
+
+    @property
+    def evaluated_count(self) -> int:
+        return sum(1 for item in self.outcomes if item.correct is not None)
+
+    @property
+    def accuracy(self) -> float:
+        """Correct fraction over every case, unevaluated ones counted wrong."""
+        return sum(1 for item in self.outcomes if item.correct) / len(
+            self.outcomes)
+
+
+class MetaPromptMeasurementEvaluator(Protocol):
+    def measure(
+        self,
+        *,
+        meta_prompt: MetaPromptVersion,
+        cases: Sequence[MetaPromptConfirmationCase],
+        confirmation_set_id: str,
+        model_identity: str,
+        decoding_settings: Mapping[str, Any],
+        cache_reset_identity: str,
+        evaluation_pipeline_identity: str,
+        output_directory: str,
+    ) -> MetaPromptMeasurementResult:
+        ...
+
+
+@dataclass(frozen=True)
 class MetaPromptPromotionDecision:
     decision_id: str
     accepted: bool
@@ -230,6 +323,28 @@ def _write_pointer(path: str, value: Any) -> str:
     os.makedirs(os.path.dirname(absolute), exist_ok=True)
     _atomic_write_text(absolute, dumps_canonical(value) + "\n")
     return absolute
+
+
+def _pointer_lineage(state: str, meta_prompt_id: Any) -> tuple[str, ...]:
+    """The pointed-at meta-prompt followed by its recorded ancestors.
+
+    Each promoted version stores the parent it was derived from, so walking
+    that chain answers "was this meta-prompt ever active in this run?" without
+    consulting any iteration's artifacts.
+    """
+    if not isinstance(meta_prompt_id, str) or not meta_prompt_id:
+        return ()
+    chain: list[str] = []
+    seen: set[str] = set()
+    current: Any = meta_prompt_id
+    while isinstance(current, str) and current and current not in seen:
+        seen.add(current)
+        chain.append(current)
+        version_path = os.path.join(state, "versions", f"{current}.json")
+        if not os.path.isfile(version_path):
+            break
+        current = _read_object(version_path).get("parent_meta_prompt_id")
+    return tuple(chain)
 
 
 def _file_sha256(path: str) -> str:
@@ -468,10 +583,27 @@ class PromptDeltaIterationOrchestrator:
         feedback_generator: EpisodeFeedbackGenerator,
         updater: MetaPromptUpdater,
         confirmation_evaluator: MetaPromptConfirmationEvaluator,
+        measurement_evaluator: MetaPromptMeasurementEvaluator | None = None,
+        promotion_policy: str = DEFAULT_PROMOTION_POLICY,
+        measurement_queue_directory: str | None = None,
     ) -> None:
+        if promotion_policy not in PROMOTION_POLICIES:
+            raise ValueError(f"promotion_policy must be one of {PROMOTION_POLICIES}")
+        if promotion_policy == "always_promote_measured_v1" and \
+                measurement_evaluator is None:
+            raise ValueError(
+                "always_promote_measured_v1 requires a measurement_evaluator")
+        if promotion_policy == DEFERRED_MEASUREMENT_POLICY and \
+                not measurement_queue_directory:
+            raise ValueError(
+                f"{DEFERRED_MEASUREMENT_POLICY} requires a "
+                "measurement_queue_directory")
         self.feedback_generator = feedback_generator
         self.updater = updater
         self.confirmation_evaluator = confirmation_evaluator
+        self.measurement_evaluator = measurement_evaluator
+        self.measurement_queue_directory = measurement_queue_directory
+        self.promotion_policy = promotion_policy
 
     def run(
         self,
@@ -554,8 +686,13 @@ class PromptDeltaIterationOrchestrator:
                     "completed iteration source artifact hashes changed")
             pointer = _read_valid_pointer(
                 os.path.join(state, "current_meta_prompt.json"))
-            if pointer.get("active_meta_prompt_id") != \
-                    final.get("active_meta_prompt_id"):
+            # A multi-iteration experiment replays every completed iteration on
+            # resume, and the iterations after this one have legitimately moved
+            # the pointer forward. What must still hold is that this
+            # iteration's result is an ancestor of the pointer: a rewound,
+            # rebuilt, or foreign state directory does not satisfy that.
+            if final.get("active_meta_prompt_id") not in _pointer_lineage(
+                    state, pointer.get("active_meta_prompt_id")):
                 raise PromptDeltaIterationConflictError(
                     "completed iteration active pointer changed")
             return PromptDeltaIterationResult(
@@ -754,6 +891,19 @@ class PromptDeltaIterationOrchestrator:
             status="provisional")
         provisional_path = _write_once(
             os.path.join(output, "provisional_meta_prompt.json"), candidate)
+        if self.promotion_policy == "always_promote_measured_v1":
+            return self._promote_and_measure(
+                iteration_id=iteration_id, parent=parent, candidate=candidate,
+                cases=cases, model_identity=model_identity,
+                decoding_settings=decoding_settings,
+                cache_reset_identity=cache_reset_identity,
+                evaluation_pipeline_identity=evaluation_pipeline_identity,
+                output=output, state=state, pointer_path=pointer_path,
+                provisional_path=provisional_path,
+                identity_path=identity_path, updater_path=updater_path,
+                memory_bank=memory_bank, episodes=episodes,
+                source_before=source_before, final_path=final_path,
+                feedback_memory_bank_directory=feedback_memory_bank_directory)
         request = build_confirmation_request(
             parent=parent, candidate=candidate, cases=cases,
             model_identity=model_identity,
@@ -806,8 +956,10 @@ class PromptDeltaIterationOrchestrator:
             archived_memory_bank = archive_parent_feedback_memory_bank(
                 feedback_memory_bank_directory, parent.meta_prompt_id,
                 promoted_meta_prompt_id=candidate.meta_prompt_id)
-            new_parent_memory_bank = initialize_parent_feedback_memory_bank(
-                feedback_memory_bank_directory, candidate.meta_prompt_id)
+            new_parent_memory_bank = carry_over_parent_feedback_memory_bank(
+                feedback_memory_bank_directory,
+                source_parent_meta_prompt_id=parent.meta_prompt_id,
+                target_parent_meta_prompt_id=candidate.meta_prompt_id)
         else:
             if pointer.get("active_meta_prompt_id") != parent.meta_prompt_id:
                 raise PromptDeltaIterationConflictError(
@@ -849,6 +1001,197 @@ class PromptDeltaIterationOrchestrator:
         return PromptDeltaIterationResult(
             iteration_id, status, output, active_id,
             candidate.meta_prompt_id, final_manifest, False)
+
+    def _enqueue_measurement(
+        self, *, iteration_id, promoted, cases, confirmation_set_id,
+        model_identity, decoding_settings, cache_reset_identity,
+        evaluation_pipeline_identity, measurement_path,
+    ) -> str:
+        """Write one measurement request for an external worker to pick up.
+
+        Written once per iteration under a stable name, so a resumed iteration
+        finds its own request instead of queueing a second copy.
+        """
+        queue = os.path.abspath(self.measurement_queue_directory)
+        os.makedirs(os.path.join(queue, "pending"), exist_ok=True)
+        os.makedirs(os.path.join(queue, "done"), exist_ok=True)
+        os.makedirs(os.path.join(queue, "failed"), exist_ok=True)
+        request = {
+            "schema_version": DEFERRED_MEASUREMENT_REQUEST_SCHEMA_VERSION,
+            "iteration_id": iteration_id,
+            "meta_prompt_id": promoted.meta_prompt_id,
+            "meta_prompt": _plain(promoted),
+            "confirmation_set_id": confirmation_set_id,
+            "cases": [_plain(item) for item in cases],
+            "model_identity": model_identity,
+            "decoding_settings": _plain(decoding_settings),
+            "cache_reset_identity": cache_reset_identity,
+            "evaluation_pipeline_identity": evaluation_pipeline_identity,
+            "measurement_output_path": os.path.abspath(measurement_path),
+            "measurement_output_directory": os.path.dirname(
+                os.path.abspath(measurement_path)),
+        }
+        name = f"{iteration_id}__{promoted.meta_prompt_id}.json"
+        for state_name in ("done", "failed", "pending"):
+            existing = os.path.join(queue, state_name, name)
+            if os.path.isfile(existing):
+                return existing
+        return _write_once(os.path.join(queue, "pending", name), request)
+
+    def _promote_and_measure(
+        self, *, iteration_id, parent, candidate, cases, model_identity,
+        decoding_settings, cache_reset_identity, evaluation_pipeline_identity,
+        output, state, pointer_path, provisional_path, identity_path,
+        updater_path, memory_bank, episodes, source_before, final_path,
+        feedback_memory_bank_directory,
+    ) -> PromptDeltaIterationResult:
+        """Promote the candidate, then score it on the held-out cases.
+
+        The order matters: promotion does not consult the measurement, so the
+        held-out set cannot influence which meta-prompt the run carries forward.
+        """
+        pointer = _read_valid_pointer(pointer_path)
+        if pointer.get("active_meta_prompt_id") not in (
+                parent.meta_prompt_id, candidate.meta_prompt_id):
+            raise PromptDeltaIterationConflictError(
+                "current pointer is neither parent nor resumed candidate")
+        promoted = MetaPromptVersion(
+            meta_prompt_id=candidate.meta_prompt_id,
+            parent_meta_prompt_id=parent.meta_prompt_id,
+            text=candidate.text, created_at=candidate.created_at,
+            status="confirmed")
+        active_path = _write_once(
+            os.path.join(state, "versions", f"{promoted.meta_prompt_id}.json"),
+            promoted)
+        if pointer.get("active_meta_prompt_id") == parent.meta_prompt_id:
+            _write_pointer(pointer_path, {
+                "schema_version": CURRENT_POINTER_SCHEMA_VERSION,
+                "active_meta_prompt_id": promoted.meta_prompt_id,
+                "artifact_path": active_path,
+                "artifact_sha256": _file_sha256(active_path),
+                "parent_meta_prompt_id": parent.meta_prompt_id,
+                "promotion_policy": self.promotion_policy,
+            })
+        # Both calls are idempotent, so they also run on a resume that finds
+        # the pointer already moved -- otherwise a crash between the pointer
+        # write and the carry-over would silently drop the parent's memories.
+        archived_memory_bank = archive_parent_feedback_memory_bank(
+            feedback_memory_bank_directory, parent.meta_prompt_id,
+            promoted_meta_prompt_id=candidate.meta_prompt_id)
+        new_parent_memory_bank = carry_over_parent_feedback_memory_bank(
+            feedback_memory_bank_directory,
+            source_parent_meta_prompt_id=parent.meta_prompt_id,
+            target_parent_meta_prompt_id=candidate.meta_prompt_id)
+
+        confirmation_set_id = "confirmation_set_" + sha256_json(
+            [_plain(item) for item in cases])[:20]
+        measurement_path = os.path.join(
+            output, "measurement", "active_measurement.json")
+        if self.promotion_policy == DEFERRED_MEASUREMENT_POLICY and \
+                not os.path.isfile(measurement_path):
+            # Promote, record what still has to be scored, and return. The
+            # held-out numbers are a report, so a queue that is behind -- or a
+            # measurement worker that is down -- delays the learning curve
+            # instead of stopping the optimization.
+            request_path = self._enqueue_measurement(
+                iteration_id=iteration_id, promoted=promoted, cases=cases,
+                confirmation_set_id=confirmation_set_id,
+                model_identity=model_identity,
+                decoding_settings=decoding_settings,
+                cache_reset_identity=cache_reset_identity,
+                evaluation_pipeline_identity=evaluation_pipeline_identity,
+                measurement_path=measurement_path)
+            source_after = _source_hashes(episodes)
+            if source_after != source_before:
+                raise PromptDeltaIterationConflictError(
+                    "source artifacts changed")
+            final = {
+                "schema_version": ITERATION_SCHEMA_VERSION,
+                "iteration_id": iteration_id,
+                "status": "promoted",
+                "promotion_policy": self.promotion_policy,
+                "active_meta_prompt_id": promoted.meta_prompt_id,
+                "candidate_meta_prompt_id": candidate.meta_prompt_id,
+                "input_identity_path": identity_path,
+                "updater_result_path": updater_path,
+                "feedback_memory_bank": memory_bank,
+                "archived_parent_feedback_memory_bank": archived_memory_bank,
+                "new_parent_feedback_memory_bank": new_parent_memory_bank,
+                "provisional_meta_prompt_path": provisional_path,
+                "held_out_measurement_path": measurement_path,
+                "held_out_measurement_request_path": request_path,
+                "held_out_measurement_status": "queued",
+                "held_out_accuracy": None,
+                "held_out_evaluated_count": None,
+                "held_out_case_count": len(cases),
+                "current_pointer_path": pointer_path,
+                "source_hashes_before": source_before,
+                "source_hashes_after": source_after,
+            }
+            final_manifest = _write_once(final_path, final)
+            return PromptDeltaIterationResult(
+                iteration_id, "promoted", output, promoted.meta_prompt_id,
+                candidate.meta_prompt_id, final_manifest, False)
+        if os.path.isfile(measurement_path):
+            measurement = measurement_result_from_json(
+                _read_object(measurement_path))
+        else:
+            measurement = self.measurement_evaluator.measure(
+                meta_prompt=promoted, cases=cases,
+                confirmation_set_id=confirmation_set_id,
+                model_identity=model_identity,
+                decoding_settings=decoding_settings,
+                cache_reset_identity=cache_reset_identity,
+                evaluation_pipeline_identity=evaluation_pipeline_identity,
+                output_directory=os.path.dirname(measurement_path))
+            _write_once(measurement_path, measurement)
+        if measurement.meta_prompt_id != promoted.meta_prompt_id:
+            raise PromptDeltaIterationConflictError(
+                "measurement scored a different meta-prompt")
+
+        source_after = _source_hashes(episodes)
+        if source_after != source_before:
+            raise PromptDeltaIterationConflictError("source artifacts changed")
+        final = {
+            "schema_version": ITERATION_SCHEMA_VERSION,
+            "iteration_id": iteration_id,
+            "status": "promoted",
+            "promotion_policy": self.promotion_policy,
+            "active_meta_prompt_id": promoted.meta_prompt_id,
+            "candidate_meta_prompt_id": candidate.meta_prompt_id,
+            "input_identity_path": identity_path,
+            "updater_result_path": updater_path,
+            "feedback_memory_bank": memory_bank,
+            "archived_parent_feedback_memory_bank": archived_memory_bank,
+            "new_parent_feedback_memory_bank": new_parent_memory_bank,
+            "provisional_meta_prompt_path": provisional_path,
+            "held_out_measurement_path": measurement_path,
+            "held_out_accuracy": measurement.accuracy,
+            "held_out_evaluated_count": measurement.evaluated_count,
+            "held_out_case_count": len(cases),
+            "current_pointer_path": pointer_path,
+            "source_hashes_before": source_before,
+            "source_hashes_after": source_after,
+        }
+        final_manifest = _write_once(final_path, final)
+        return PromptDeltaIterationResult(
+            iteration_id, "promoted", output, promoted.meta_prompt_id,
+            candidate.meta_prompt_id, final_manifest, False)
+
+
+def measurement_result_from_json(
+    value: Mapping[str, Any],
+) -> MetaPromptMeasurementResult:
+    return MetaPromptMeasurementResult(
+        measurement_id=value["measurement_id"],
+        meta_prompt_id=value["meta_prompt_id"],
+        confirmation_set_id=value["confirmation_set_id"],
+        model_identity=value["model_identity"],
+        decoding_settings=value["decoding_settings"],
+        cache_reset_identity=value["cache_reset_identity"],
+        evaluation_pipeline_identity=value["evaluation_pipeline_identity"],
+        outcomes=tuple(MetaPromptMeasurementOutcome(**item)
+                       for item in value["outcomes"]))
 
 
 def paired_confirmation_result_from_json(

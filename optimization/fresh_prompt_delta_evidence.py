@@ -14,7 +14,11 @@ import re
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from surrogate_rollout import config
 from surrogate_rollout.captioning.candidate_captions import build_clip_index
+from surrogate_rollout.optimization.openai_chat_model_profile import (
+    adapt_chat_completions_body,
+)
 from surrogate_rollout.evaluation.dvd_qa import (
     dvd_qa_execution_identity,
     run_dvd_qa,
@@ -54,15 +58,23 @@ PROMPT_DELTA_PROPOSAL_REPRESENTATION_VERSION = (
 PROMPT_DELTA_PROPOSAL_EVIDENCE_SCOPE = (
     "assistant_timestamp_or_localized_frame_inspection_v1")
 PROMPT_DELTA_PROPOSAL_SPLIT_POLICY = (
-    "always_per_qa_isolated_v1")
+    "always_per_qa_isolated_exact_delta_count_v2")
 PROMPT_DELTA_SEGMENT_SELECTION_POLICY = (
-    "source_qa_localized_trajectory_segments_only_v1")
+    "source_qa_localized_trajectory_segments_v2_global_only_excluded")
 PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY = (
     "frame_inspection_global_boundary_tolerance_v1")
 PROMPT_DELTA_POLICY_OUTPUT_NAMESPACE = (
     "per_qa_isolated_localized_trajectory_segments_v2")
 PROMPT_DELTA_INTERVENTION_EXECUTION_NAMESPACE = (
     "dvd_strict_frame_inspect_corrective_retry_v1")
+# Which baseline QAs may receive a prompt-delta proposal. Intervening on a QA
+# the baseline already answers correctly has no upside and can only regress it,
+# so the default targets the wrong ones. Evaluation is unaffected: every
+# intervention episode still scores every QA of the video, correct ones
+# included, so regressions on correct siblings stay visible.
+PROMPT_DELTA_PROPOSAL_TARGET_POLICIES = (
+    "incorrect_baseline_qa_only_v1", "all_baseline_qa_v1")
+DEFAULT_PROMPT_DELTA_PROPOSAL_TARGET_POLICY = "incorrect_baseline_qa_only_v1"
 
 
 def correctness_transition(before: bool, after: bool) -> str:
@@ -230,7 +242,7 @@ class OpenAICompatiblePromptDeltaProposalBackend:
                 "proposer_diagnosis": {"type": "string"},
             },
         }
-        body = json.loads(dumps_canonical({
+        body = json.loads(dumps_canonical(adapt_chat_completions_body({
             "model": self.model_id, "messages": messages,
             "max_tokens": self.maximum_output_tokens,
             **self.generation_settings,
@@ -247,7 +259,7 @@ class OpenAICompatiblePromptDeltaProposalBackend:
                     },
                 },
             },
-        }))
+        }, reasoning_effort=config.PROPOSER_REASONING_EFFORT)))
         self.call_count += 1
         envelope = self.response_transport(body)
         try:
@@ -642,13 +654,19 @@ def _qa_segment_selection_records(
                 "segment_ids": ordered_call_segments,
             })
 
-        # A call is classified atomically. If malformed instrumentation places
-        # one segment in both categories, global exclusion wins fail-closed.
-        localized_inspected.difference_update(global_inspected)
+        # A call is classified atomically, and a whole-video call covers every
+        # segment. Subtracting the global set outright therefore deleted the
+        # localized evidence whenever the agent also browsed globally, leaving
+        # the QA with no intervention candidates at all. Only segments seen
+        # *exclusively* by a global call are excluded: a segment a localized
+        # call actually pointed at stays evidence.
+        global_only_inspected = global_inspected - localized_inspected
         candidate = assistant_cited | localized_inspected
         assistant_ordered = _ordered_subset(segment_order, assistant_cited)
         localized_ordered = _ordered_subset(segment_order, localized_inspected)
         global_ordered = _ordered_subset(segment_order, global_inspected)
+        global_only_ordered = _ordered_subset(
+            segment_order, global_only_inspected)
         candidate_ordered = _ordered_subset(segment_order, candidate)
         rows.append({
             "qa_id": qa_id,
@@ -656,6 +674,7 @@ def _qa_segment_selection_records(
             "assistant_timestamp_cited_segments": assistant_ordered,
             "localized_frame_inspected_segments": localized_ordered,
             "global_frame_inspected_segments": global_ordered,
+            "global_only_frame_inspected_segments": global_only_ordered,
             "intervention_candidate_segments": candidate_ordered,
             "frame_inspect_calls": call_rows,
             "selection_reason": (
@@ -865,6 +884,8 @@ class LLMPromptDeltaProposer:
         maximum_deltas_per_qa: int,
         selection_policy: str,
         global_inspection_boundary_tolerance_seconds: float,
+        proposal_target_policy: str = (
+            DEFAULT_PROMPT_DELTA_PROPOSAL_TARGET_POLICY),
     ) -> None:
         if not callable(getattr(backend, "preflight", None)) or not callable(
                 getattr(backend, "generate", None)):
@@ -876,11 +897,16 @@ class LLMPromptDeltaProposer:
         if global_inspection_boundary_tolerance_seconds < 0:
             raise ValueError(
                 "global inspection boundary tolerance must be non-negative")
+        if proposal_target_policy not in PROMPT_DELTA_PROPOSAL_TARGET_POLICIES:
+            raise ValueError(
+                "proposal_target_policy must be one of "
+                f"{PROMPT_DELTA_PROPOSAL_TARGET_POLICIES}")
         self.backend = backend
         self.maximum_deltas_per_qa = maximum_deltas_per_qa
         self.selection_policy = selection_policy
         self.global_inspection_boundary_tolerance_seconds = (
             global_inspection_boundary_tolerance_seconds)
+        self.proposal_target_policy = proposal_target_policy
 
     @staticmethod
     def _parse_response(
@@ -934,7 +960,15 @@ class LLMPromptDeltaProposer:
             global_inspection_boundary_tolerance_seconds=
                 self.global_inspection_boundary_tolerance_seconds)
         output = os.path.abspath(output_directory)
-        qa_ids = tuple(row["qa_id"] for row in payload["qa_records"])
+        baseline_correct_by_qa = {
+            row["qa_id"]: bool(row["baseline_correct"])
+            for row in payload["qa_records"]
+        }
+        targets_incorrect_only = (
+            self.proposal_target_policy == "incorrect_baseline_qa_only_v1")
+        qa_ids = tuple(
+            row["qa_id"] for row in payload["qa_records"]
+            if not (targets_incorrect_only and baseline_correct_by_qa[row["qa_id"]]))
         selection_records = list(_plain(_qa_segment_selection_records(
             baseline_video_manifest_path,
             global_inspection_boundary_tolerance_seconds=
@@ -961,9 +995,18 @@ class LLMPromptDeltaProposer:
                     self.global_inspection_boundary_tolerance_seconds)
             for row in selection_records
         }
+        for row in selection_records:
+            row["baseline_correct"] = baseline_correct_by_qa.get(row["qa_id"])
+            if targets_incorrect_only and row["baseline_correct"]:
+                row["skip"] = True
+                row["skip_reason"] = "baseline_already_correct"
         selection_summary = {
-            "schema_version": "prompt_delta_segment_selection_audit_v2",
+            "schema_version": "prompt_delta_segment_selection_audit_v3",
             "selection_policy": self.selection_policy,
+            "proposal_target_policy": self.proposal_target_policy,
+            "baseline_correct_qa_count": sum(
+                1 for value in baseline_correct_by_qa.values() if value),
+            "proposal_target_qa_count": len(qa_ids),
             "frame_inspection_classification_policy":
                 PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
             "global_inspection_boundary_tolerance_seconds":
@@ -1011,6 +1054,7 @@ class LLMPromptDeltaProposer:
                     self.backend.configuration_identity),
                 "maximum_deltas_per_qa": self.maximum_deltas_per_qa,
                 "selection_policy": self.selection_policy,
+                "proposal_target_policy": self.proposal_target_policy,
             }
             identity_hash = sha256_json(identity)
             _write_once(os.path.join(output, "request_manifest.json"), {
@@ -1072,7 +1116,11 @@ class LLMPromptDeltaProposer:
         split_mode = "isolated_per_qa"
         for qa_id in eligible_qa_ids:
             single, single_hash, preflight = single_by_qa[qa_id]
-            requests.append((single, single_hash, preflight, 1,
+            # Exactly `maximum_deltas_per_qa` proposals per targeted QA: the
+            # provider's strict response schema carries minItems == maxItems,
+            # so the count is enforced rather than requested.
+            requests.append((single, single_hash, preflight,
+                             self.maximum_deltas_per_qa,
                              self.maximum_deltas_per_qa))
 
         context_ineligible = [
@@ -1103,6 +1151,7 @@ class LLMPromptDeltaProposer:
             "provider_settings": provider_identity,
             "maximum_deltas_per_qa": self.maximum_deltas_per_qa,
             "selection_policy": self.selection_policy,
+            "proposal_target_policy": self.proposal_target_policy,
         }
         request_identity_hash = sha256_json(request_identity)
         request_rows = []
@@ -1293,6 +1342,7 @@ class PromptDeltaInterventionRunner:
         caption_cache_manifest_path: str,
         composition_separator: str,
         qa_fn: Callable[..., Any] = run_dvd_qa,
+        qa_retry_attempts: int = config.INTERVENTION_QA_RETRY_ATTEMPTS,
         clip_index_fn: Callable[..., list[tuple[str, dict]]] = build_clip_index,
         mixed_view_builder: MixedViewBuilder | None = None,
         dvd_max_iterations: int, gpu: str | None,
@@ -1307,11 +1357,42 @@ class PromptDeltaInterventionRunner:
         self.caption_cache_manifest_path = caption_cache_manifest_path
         self.composition_separator = composition_separator
         self.qa_fn = qa_fn
+        self.qa_retry_attempts = qa_retry_attempts
         self.clip_index_fn = clip_index_fn
         self.mixed = mixed_view_builder or MixedViewBuilder()
         self.dvd_max_iterations = dvd_max_iterations
         self.gpu = gpu
         self.contract = scaffold_contract
+
+    def _run_qa_with_retries(self, *, qa_id, sample, qa_dir, mixed):
+        """Run one downstream QA, re-running it when the answer is unusable.
+
+        The DVD agent occasionally ends a run without naming an option -- "the
+        video does not show ..." -- and that reply cannot be scored. Observed
+        once in roughly 270 runs. It used to end the process, and the watcher
+        recovered by restarting the driver and resuming, which costs minutes
+        and one restart from a bounded budget to redo a call that takes
+        seconds and usually succeeds on the next attempt.
+
+        Only the transient case is absorbed. A QA that stays unusable across
+        every attempt still fails loudly: recording it as an answer would put a
+        fabricated transition into the evidence the optimizer learns from.
+        """
+        attempts = max(1, int(self.qa_retry_attempts))
+        errors = None
+        for attempt in range(attempts):
+            run_dir = qa_dir if attempt == 0 else f"{qa_dir}__retry{attempt}"
+            result = self.qa_fn(
+                captions_path=mixed.captions_path, sample=sample,
+                run_dir=run_dir, question_id=qa_id,
+                database_path=mixed.database_path,
+                max_iterations=self.dvd_max_iterations, gpu=self.gpu)
+            if not result.errors and result.prediction is not None:
+                return result
+            errors = result.errors
+        raise FreshPromptDeltaError(
+            f"intervention QA execution failed after {attempts} attempts: "
+            f"{qa_id}: {errors}")
 
     def run(
         self, *, baseline_video_manifest_path: str,
@@ -1444,14 +1525,8 @@ class PromptDeltaInterventionRunner:
             qa_id = baseline_qa["question_id"]
             sample = dict(self.sample_loader(int(baseline_qa["provider_index"])))
             qa_dir = os.path.join(output, "qa", qa_id.replace("/", "-"))
-            result = self.qa_fn(
-                captions_path=mixed.captions_path, sample=sample,
-                run_dir=qa_dir, question_id=qa_id,
-                database_path=mixed.database_path,
-                max_iterations=self.dvd_max_iterations, gpu=self.gpu)
-            if result.errors or result.prediction is None:
-                raise FreshPromptDeltaError(
-                    f"intervention QA execution failed: {qa_id}: {result.errors}")
+            result = self._run_qa_with_retries(
+                qa_id=qa_id, sample=sample, qa_dir=qa_dir, mixed=mixed)
             candidate_correct = float(result.score) > 0.0
             trajectory_path = os.path.join(qa_dir, "trajectory.jsonl")
             outcomes.append(QAInterventionOutcome(

@@ -74,16 +74,20 @@ def test_meta_prompt_matches_the_baseline_repo_when_present():
                         ("REQUEST_SCHEMA_VERSION", smrb.REQUEST_SCHEMA_VERSION),
                         ("PARSER_VERSION", smrb.PARSER_VERSION)):
         assert f'{name} = "{value}"' in source, f"{name} drifted"
-    assert "GENERATOR_SAMPLE_FPS = 0.5" in source
+    # The frame policy is deliberately not in parity: this repository
+    # subsamples more sparsely than the baseline repo to cut generator image
+    # tokens. Only the meta-prompt and the request/parser contract are shared.
     assert "GENERATOR_IMAGE_SCALE = 0.5" in source
 
 
 # ------------------------------ frame policy ------------------------------- #
-def test_generator_sees_every_other_frame():
+def test_generator_sees_every_fourth_frame():
+    """0.25 fps against the captioner's 1.0 fps: a strict, aligned subset."""
     frames = [f"/f/frame_n{i:06d}.jpg" for i in range(10)]
     selected = smrb.select_generator_frames(frames, caption_fps=1.0)
-    assert selected == frames[::2]
-    assert len(selected) == 5
+    assert selected == frames[::4]
+    assert len(selected) == 3
+    assert set(selected) <= set(frames)
 
 
 def test_frame_subsample_never_interpolates():
@@ -109,7 +113,8 @@ def test_request_is_query_independent():
         video_id="v1", segment_id="30_40",
         frame_references=["/f/a.jpg"], serialized_history=_history_json())
     assert request["schema_version"] == smrb.REQUEST_SCHEMA_VERSION
-    assert request["generator_identity"]["sample_fps"] == 0.5
+    assert request["generator_identity"]["sample_fps"] == \
+        smrb.GENERATOR_SAMPLE_FPS == 0.25
     assert request["generator_identity"]["image_scale"] == 0.5
     serialized = smrb.dumps_canonical(request).casefold()
     for forbidden in ("question", "option", "answer", "ground_truth", "score",
@@ -269,7 +274,8 @@ def test_openai_is_the_default_free_form_provider(monkeypatch):
     assert identity["model"] == "gpt-4o-mini"
     assert identity["composition"] == "replace_body"
     assert identity["template_hash"] == smrb.META_PROMPT_SHA256
-    assert identity["generator_sample_fps"] == 0.5
+    assert identity["generator_sample_fps"] == \
+        smrb.GENERATOR_SAMPLE_FPS == 0.25
     assert identity["generator_image_scale"] == 0.5
 
 

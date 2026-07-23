@@ -56,7 +56,7 @@ def _load_prompt_text(filename: str) -> str:
 
 
 META_PROMPT_UPDATER_SYSTEM_INSTRUCTION = _load_prompt_text(
-    "meta_prompt_updater_system_v3.txt")
+    "meta_prompt_updater_system_v5.txt")
 
 _RESPONSE_FIELDS = {
     "decision", "candidate_meta_prompt", "change_summary", "rationale",
@@ -167,8 +167,15 @@ _QA_IDENTIFIER_RE = re.compile(
 )
 
 
-def _id_free_text(value: str) -> str:
-    """Remove provenance tokens from model prose used by the updater."""
+def _id_free_text(value: str | None) -> str | None:
+    """Remove provenance tokens from model prose used by the updater.
+
+    None survives as None: an abstaining feedback has no rule to clean, and
+    turning that into the literal string "None" would hand the updater a
+    sentence to act on.
+    """
+    if value is None:
+        return None
     text = _SEGMENT_IDENTIFIER_RE.sub("a selected interval", str(value))
     text = _QA_IDENTIFIER_RE.sub("a QA", text)
     return " ".join(text.split())
@@ -211,13 +218,19 @@ def _updater_feedback_projection(
         "mixed" if improved and regressed else
         "positive" if improved else
         "negative" if regressed else "neutral")
+    # Feedback that did not establish an attribution still reports what
+    # happened, but its prose must not reach the updater: an abstention was
+    # reasoned about anyway last time, and its wording shaped the rule it was
+    # not entitled to support.
+    supported = feedback.attribution_status == "supported"
     evidence_statements = []
-    for evidence in (*feedback.observations, *feedback.counterevidence):
-        if evidence.evidence_type == "qa_transition":
-            continue
-        statement = _id_free_text(evidence.statement)
-        if statement and statement not in evidence_statements:
-            evidence_statements.append(statement)
+    if supported:
+        for evidence in (*feedback.observations, *feedback.counterevidence):
+            if evidence.evidence_type == "qa_transition":
+                continue
+            statement = _id_free_text(evidence.statement)
+            if statement and statement not in evidence_statements:
+                evidence_statements.append(statement)
     changed = (
         grounded.get("changed_segment_ids")
         if isinstance(grounded, Mapping) else None)
@@ -230,8 +243,19 @@ def _updater_feedback_projection(
         "qa_transition_counts": counts,
         "episode_effect": effect,
         "caption_or_trajectory_evidence": evidence_statements,
-        "recommended_strategy_change": _id_free_text(
-            feedback.recommended_strategy_change),
+        # Only a supported attribution may reach the updater as a rule. The
+        # rest is still transmitted as an observation, so the updater sees the
+        # episode happened, without a lesson it is not entitled to draw.
+        "attribution_status": feedback.attribution_status,
+        "recommended_strategy_change": (
+            _id_free_text(feedback.recommended_strategy_change)
+            if supported else None),
+        "observable_trigger": (
+            _id_free_text(feedback.observable_trigger)
+            if supported else None),
+        "caption_operation": (
+            _id_free_text(feedback.caption_operation)
+            if supported else None),
     }
 
 
@@ -345,18 +369,6 @@ def build_meta_prompt_update_request(
     )
 
 
-_RUNTIME_UNAVAILABLE_PATTERNS = (
-    r"\bQA(?:s)?\b",
-    r"\bcorrectness(?: labels?)?\b",
-    r"\btrajector(?:y|ies)\b",
-    r"\bOCR(?: metadata)?\b",
-    r"\bexternal tools?\b",
-    r"\bground[- ]truth answers?\b",
-    r"\banswer choices?\b",
-    r"\bdataset[- ]specific answers?\b",
-)
-
-
 def _contains_exact_identifier(text: str, identifier: str) -> bool:
     """Match a known provenance ID as a complete identifier token.
 
@@ -413,16 +425,10 @@ def validate_meta_prompt_candidate_content(
         raise ValueError(
             "candidate meta-prompt contains provenance-only identifiers: "
             f"{present}")
-    unavailable = sorted({
-        match.group(0)
-        for pattern in _RUNTIME_UNAVAILABLE_PATTERNS
-        for match in re.finditer(
-            pattern, decision.candidate_meta_prompt, flags=re.IGNORECASE)
-    })
-    if unavailable:
-        raise ValueError(
-            "candidate meta-prompt requires runtime-unavailable or "
-            f"dataset-specific inputs: {unavailable}")
+    # Whether the candidate depends on runtime-unavailable inputs is stated in
+    # the updater prompt, not matched here. A word search cannot tell "use the
+    # QA answer" from "do not use the QA answer", so it rejected candidates
+    # that were obeying the instruction.
 
 
 def parse_meta_prompt_update_response(
@@ -448,11 +454,17 @@ def parse_meta_prompt_update_response(
                          for item in feedback_memories)
         if historical_memories is not None:
             known.update(item.feedback_id for item in historical_memories)
-        unknown = set(decision.supporting_feedback_ids) - known
-        if unknown:
-            raise ValueError(
-                "MetaPromptUpdateDecision references unknown feedback IDs: "
-                f"{sorted(unknown)}")
+        # The request is ID-free by construction: feedback, episode, QA and
+        # segment identifiers are stripped before the model ever sees it. The
+        # strict response schema still requires the key, so a model with no
+        # identifiers to cite fills it with positional inventions. Those cite
+        # nothing and are dropped; the harness attaches the real lineage. An ID
+        # that does match stays, which keeps the older ID-carrying requests
+        # exact.
+        supported = tuple(item for item in decision.supporting_feedback_ids
+                          if item in known)
+        if supported != decision.supporting_feedback_ids:
+            decision = replace(decision, supporting_feedback_ids=supported)
         validate_meta_prompt_candidate_content(
             decision, ordered, feedback_memories, historical_memories)
         restored = meta_prompt_update_decision_from_json(
@@ -552,10 +564,47 @@ class LLMMetaPromptUpdater:
                         ),
                     )
         raw = self.backend(request.system_instruction, request.user_request)
-        decision, candidate_id, status = parse_meta_prompt_update_response(
-            raw, request=request, feedbacks=ordered,
-            feedback_memories=feedback_memories,
-            historical_memories=historical_memories)
+        try:
+            decision, candidate_id, status = parse_meta_prompt_update_response(
+                raw, request=request, feedbacks=ordered,
+                feedback_memories=feedback_memories,
+                historical_memories=historical_memories)
+        except MetaPromptUpdaterParseError as exc:
+            # An unusable candidate is a reason to keep the parent, not to end
+            # the run: a multi-iteration experiment would lose every completed
+            # stage over one malformed response. One corrective retry states
+            # the violation, and a second failure becomes an explicit
+            # no_update carrying both raw responses.
+            retry_instruction = (
+                request.system_instruction +
+                "\n\nThe previous response was rejected: " + str(exc) +
+                "\nReturn a candidate that satisfies the stated contract, or "
+                "return no_update with candidate_meta_prompt set to null.")
+            retry_raw = self.backend(retry_instruction, request.user_request)
+            try:
+                decision, candidate_id, status = (
+                    parse_meta_prompt_update_response(
+                        retry_raw, request=request, feedbacks=ordered,
+                        feedback_memories=feedback_memories,
+                        historical_memories=historical_memories))
+                raw = retry_raw
+            except MetaPromptUpdaterParseError as retry_exc:
+                decision = MetaPromptUpdateDecision(
+                    decision="no_update",
+                    candidate_meta_prompt=None,
+                    change_summary=(
+                        "No update: the updater response was unusable."),
+                    rationale=(
+                        "The response was rejected twice by the updater "
+                        f"contract. First: {exc}. Retry: {retry_exc}."),
+                    supporting_feedback_ids=())
+                candidate_id, status = None, None
+                raw = dumps_canonical({
+                    "rejected_first_response": raw,
+                    "rejected_retry_response": retry_raw,
+                    "first_error": str(exc),
+                    "retry_error": str(retry_exc),
+                })
         return MetaPromptUpdateResult(
             request=request,
             decision=decision,

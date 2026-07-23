@@ -282,7 +282,8 @@ def _openai_text(messages: list, model: str, api_key: str,
 def make_router(inference_model: str, tool_calling_model: str,
                 tool_openai_api_key: str | None,
                 text_openai_api_key: str | None,
-                text_backend: str = "openai"):
+                text_backend: str = "openai",
+                tool_fallback_model: str | None = None):
     """Return a call_openai_model_with_tools-compatible router.
 
     Routing:
@@ -313,23 +314,39 @@ def make_router(inference_model: str, tool_calling_model: str,
                 # Genuine OpenAI tool-calling (per user: key only for this).
                 # gpt-4o-mini sometimes replies text-only (tool_calls=None);
                 # retry forcing tool_choice="required" to get an actual call.
-                last = None
-                for attempt in range(_OPENAI_TOOL_RETRIES + 1):
-                    tc = "required" if attempt > 0 else tool_choice
-                    resp = _ORIG_CALL(
-                        messages=messages, endpoints=None,
-                        model_name=tool_calling_model, api_key=tool_openai_api_key,
-                        tools=list(tools), max_tokens=max_tokens,
-                        temperature=temperature, tool_choice=tc,
-                    )
-                    if resp is None:
-                        break  # quota/error -> codex fallback
-                    resp.setdefault("role", "assistant")
-                    if resp.get("tool_calls"):
+                def _attempt(model):
+                    last = None
+                    for attempt in range(_OPENAI_TOOL_RETRIES + 1):
+                        tc = "required" if attempt > 0 else tool_choice
+                        resp = _ORIG_CALL(
+                            messages=messages, endpoints=None,
+                            model_name=model, api_key=tool_openai_api_key,
+                            tools=list(tools), max_tokens=max_tokens,
+                            temperature=temperature, tool_choice=tc,
+                        )
+                        if resp is None:
+                            return None, False  # transport/API refusal
+                        resp.setdefault("role", "assistant")
+                        if resp.get("tool_calls"):
+                            return resp, True
+                        last = resp  # text-only; retry with required
+                    return last, True
+
+                resp, reached = _attempt(tool_calling_model)
+                if reached:
+                    return resp
+                # The primary model refused the request itself -- a reasoning
+                # model can reject a transcript as prompt-policy violating
+                # where a non-reasoning one accepts it, and that is a property
+                # of the video, so it recurs on every retry. A second
+                # orchestrator answers it instead of dropping to the Codex
+                # shim, which shares no quota with the API key.
+                if tool_fallback_model and tool_fallback_model != tool_calling_model:
+                    print(f"[dvd] tool call on {tool_calling_model} failed; "
+                          f"retrying on {tool_fallback_model}", flush=True)
+                    resp, reached = _attempt(tool_fallback_model)
+                    if reached:
                         return resp
-                    last = resp  # text-only; retry with required
-                if last is not None:
-                    return last  # DVD loop tolerates the empty tool_calls
             return _codex_tool_call(messages, list(tools), inference_model)
         # Plain text reasoning (global_browse / merge).
         if text_backend == "openai":
@@ -352,7 +369,8 @@ def make_router(inference_model: str, tool_calling_model: str,
 def install_backend(inference_model: str = "gpt-5.5", tool_vlm_max_frames: int = 16,
                     tool_calling_model: str = "gpt-4o-mini", openai_api_key: str | None = None,
                     use_openai_tools: bool = True, text_backend: str = "openai",
-                    tensor_parallel_size: int = 1):
+                    tensor_parallel_size: int = 1,
+                    tool_fallback_model: str | None = None):
     """Monkeypatch DVD to use Qwen vision, BGE embeddings, and configured text.
 
     Tool-calling (orchestrator) uses the real OpenAI API when a key with quota
@@ -368,7 +386,8 @@ def install_backend(inference_model: str = "gpt-5.5", tool_vlm_max_frames: int =
 
     key = (openai_api_key or _load_openai_key()) if use_openai_tools else None
     text_key = openai_api_key or _load_openai_key()
-    router = make_router(inference_model, tool_calling_model, key, text_key, text_backend)
+    router = make_router(inference_model, tool_calling_model, key, text_key,
+                         text_backend, tool_fallback_model)
     # Rebind in every module that did `from dvd.utils import call_openai_...`.
     utils.call_openai_model_with_tools = router
     dvd_core.call_openai_model_with_tools = router

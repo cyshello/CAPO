@@ -15,7 +15,9 @@ if str(ROOT.parent) not in sys.path:
 
 from surrogate_rollout import config
 from surrogate_rollout.optimization.fresh_prompt_delta_evidence import (
+    DEFAULT_PROMPT_DELTA_PROPOSAL_TARGET_POLICY,
     PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
+    PROMPT_DELTA_PROPOSAL_TARGET_POLICIES,
     PROMPT_DELTA_PROPOSAL_EVIDENCE_SCOPE,
     PROMPT_DELTA_PROPOSAL_REPRESENTATION_VERSION,
     PROMPT_DELTA_PROPOSAL_SPLIT_POLICY,
@@ -106,6 +108,12 @@ def _args(argv=None):
     p.add_argument("--proposer-policy-version", required=True)
     p.add_argument("--maximum-deltas-per-qa", required=True, type=int)
     p.add_argument("--selection-policy", required=True)
+    p.add_argument(
+        "--proposal-target-policy",
+        choices=PROMPT_DELTA_PROPOSAL_TARGET_POLICIES,
+        default=DEFAULT_PROMPT_DELTA_PROPOSAL_TARGET_POLICY,
+        help=("Which baseline QAs may receive a delta proposal. Every QA of "
+              "the video is still evaluated in each intervention episode."))
     p.add_argument(
         "--global-inspection-boundary-tolerance-seconds",
         required=True, type=float)
@@ -275,6 +283,7 @@ def main(argv=None) -> int:
             "maximum_calls": proposer_call_budget,
             "maximum_deltas_per_qa": a.maximum_deltas_per_qa,
             "selection_policy": a.selection_policy,
+            "proposal_target_policy": a.proposal_target_policy,
             "frame_inspection_classification_policy":
                 PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
             "global_inspection_boundary_tolerance_seconds":

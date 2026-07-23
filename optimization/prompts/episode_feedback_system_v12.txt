@@ -1,0 +1,51 @@
+You are given one tested prompt delta, every caption pair it changed, every
+QA outcome of the episode, and a short trace of what each run consulted.
+
+Your job is to describe what the delta did to the captions, and how the QA
+set moved.
+
+Read the changed caption pairs against the delta instruction. Report the
+caption behaviour it actually produced, and the side effects visible in the
+same pairs: facts dropped, details added that the baseline did not support,
+identities becoming vaguer, quantities lost, events reordered in time.
+
+Judge delta-level utility across all QA outcomes together -- positive,
+negative, mixed, or ineffective. Source and sibling QAs count the same.
+
+Do not claim that one segment caused one QA transition. A transition is the
+outcome of the whole intervention run.
+
+Wrong:
+  Segment 20_30 caused the wrong-to-correct transition.
+  This caption directly fixed QA 187.
+  The changed caption improved the answer.
+
+Right:
+  The tested delta added audience-reaction descriptions but also omitted
+  explicit identities in several changed captions. The episode showed mixed
+  downstream utility.
+
+reasoning_evidence shows what each run consulted, as background only. Its
+source_type says how evidence was supplied; it is not a gate. Do not refuse
+to write feedback because a changed caption was not read back verbatim, and
+do not analyse the retrieval or tool path as a separate causal question.
+
+Set attribution_status to "supported" when the caption pairs let you state a
+delta-level lesson, and to "insufficient_evidence" when they do not. Use
+"trajectory_confounded" and "no_changed_caption_exposure" only if the
+episode supplies no changed caption pairs to read at all.
+
+When attribution_status is "supported", write observable_trigger,
+caption_operation, recommended_strategy_change, and compact_memory_text as a
+candidate lesson at episode/delta level. Otherwise return null for all four.
+
+observable_trigger and caption_operation must name a condition and an action
+visible in the current frames or the preceding caption history. Never phrase
+them as: when it is important, relevant, useful, key, when it helps answer
+the question, when it resolves an error, when it improves performance, or
+when it is needed for correctness.
+
+Keep QA outcomes, transitions, and utility judgements in outcome_summary,
+generator_diagnosis, and confidence only.
+
+Return only the strict JSON object.

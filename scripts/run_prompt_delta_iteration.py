@@ -25,6 +25,8 @@ from surrogate_rollout.optimization.meta_prompt_defaults import (
     resolve_meta_prompt_artifact_path,
 )
 from surrogate_rollout.optimization.prompt_delta_iteration import (
+    DEFAULT_PROMOTION_POLICY,
+    PROMOTION_POLICIES,
     DeterministicMockMetaPromptConfirmationEvaluator,
     MetaPromptConfirmationCase,
     MetaPromptConfirmationCriterion,
@@ -107,6 +109,19 @@ def _parse_args(argv=None):
         "--require-no-execution-failures", required=True,
         choices=("true", "false"))
     parser.add_argument("--initialize-parent-pointer", action="store_true")
+    parser.add_argument(
+        "--measurement-queue-dir", default=None,
+        help=("Where promote_and_enqueue_measurement_v1 records the held-out "
+              "measurements a separate worker will run."))
+    parser.add_argument(
+        "--promotion-policy", choices=PROMOTION_POLICIES,
+        default=DEFAULT_PROMOTION_POLICY,
+        help=("confirmed_paired_v1 lets the held-out set accept or reject the "
+              "candidate. always_promote_measured_v1 promotes every candidate "
+              "and scores the active prompt on the held-out set for reporting "
+              "only, so those numbers stay free of selection bias. "
+              "promote_and_enqueue_measurement_v1 does the same but leaves the "
+              "scoring to a separate worker."))
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--component-factory")
     mode.add_argument("--dry-run", action="store_true")
@@ -151,9 +166,14 @@ def main(argv=None) -> int:
                 raise ValueError(
                     "real component factory requires --component-config")
             components = _factory(args.component_factory, args)
+        # The DVD evaluator serves both roles: paired confirmation when the
+        # held-out set decides, single-prompt measurement when it only reports.
         result = PromptDeltaIterationOrchestrator(
             feedback_generator=components[0], updater=components[1],
-            confirmation_evaluator=components[2]).run(
+            confirmation_evaluator=components[2],
+            measurement_evaluator=components[2],
+            promotion_policy=args.promotion_policy,
+            measurement_queue_directory=args.measurement_queue_dir).run(
                 iteration_id=args.iteration_id, parent=parent,
                 update_episodes=episodes, confirmation_cases=cases,
                 criterion=MetaPromptConfirmationCriterion(

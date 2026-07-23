@@ -1,9 +1,10 @@
 """Static meta-prompt (replace-body) policy — parity copy of the baseline repo.
 
-The private baseline repo runs this exact condition standalone: a fixed meta
-prompt sees a 0.5 fps, half-resolution subset of a segment's frames plus the
-frozen preceding caption history, and writes that segment's captioning task
-section. The generated text REPLACES the base template's task text; only the
+The private baseline repo runs this condition standalone: a fixed meta prompt
+sees a subsampled, half-resolution subset of a segment's frames plus the frozen
+preceding caption history, and writes that segment's captioning task section.
+This repository runs a sparser subsample than the baseline repo does (see
+GENERATOR_SAMPLE_FPS), so the frame policy is deliberately not in parity. The generated text REPLACES the base template's task text; only the
 transcript block and the verbatim JSON output contract survive.
 
 This module is the same policy expressed for this repository so both sides
@@ -42,9 +43,10 @@ DEFAULT_MAX_HISTORY_CAPTIONS = 30
 DEFAULT_GENERATOR_MAX_TOKENS = 512
 
 # Frame policy: the generator sees FEWER and SMALLER frames than the captioner —
-# every other frame (0.5 fps against the captioner's 1.0 fps) at half
-# resolution.
-GENERATOR_SAMPLE_FPS = 0.5
+# every fourth frame (0.25 fps against the captioner's 1.0 fps) at half
+# resolution. Images dominate the generator's token cost, so the subsample is
+# the cheapest lever that keeps it looking at the segment.
+GENERATOR_SAMPLE_FPS = 0.25
 GENERATOR_IMAGE_SCALE = 0.5
 GENERATOR_JPEG_QUALITY = 90
 
@@ -165,8 +167,8 @@ def downscale_frames(
 
 def prepare_generator_frames(files: Sequence[str], *,
                              caption_fps: float) -> list[str]:
-    """The frames one generator call receives: 0.5 fps subset, half resolution.
-    Downscaled copies live beside the decoded frames they came from."""
+    """The frames one generator call receives: a GENERATOR_SAMPLE_FPS subset at
+    half resolution. Downscaled copies live beside the frames they came from."""
     selected = select_generator_frames(files, caption_fps=caption_fps)
     if not selected:
         return []
@@ -191,7 +193,7 @@ def build_generator_request(
     """Query-independent request: frames + frozen history, nothing else.
 
     Takes no question/options/answer argument by construction.
-    `frame_references` are the downscaled 0.5 fps generator frames.
+    `frame_references` are the downscaled generator frames.
     """
     frames = tuple(str(item) for item in frame_references)
     if not frames:

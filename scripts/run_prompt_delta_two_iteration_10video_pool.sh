@@ -11,7 +11,8 @@ Usage: bash scripts/run_prompt_delta_two_iteration_10video_pool.sh
 
 Environment:
   PROMPT_DELTA_ITERATION_TIMESTAMP      UTC YYYYMMDD_HHMMSS; reuse to resume.
-  PROMPT_DELTA_WORKER_GPUS              Exactly five unique GPU IDs (default 0,1,2,3,4).
+  PROMPT_DELTA_WORKER_GPUS              Unique GPU IDs, one or more (default 0,1,2,3,4).
+  PROMPT_DELTA_REQUIRED_GPU_COUNT       Optional exact GPU count to enforce.
   PROMPT_DELTA_ITERATION_COUNT          Positive iteration count (default 2).
   PROMPT_DELTA_VIDEOS_PER_ITERATION     Evidence videos per iteration (default 5).
   PROMPT_DELTA_EVIDENCE_COHORT_FILE     Ordered video-ID file (default train_set/10samples.txt).
@@ -32,14 +33,28 @@ cd "$PROJECT_ROOT"
 GPUS="${PROMPT_DELTA_WORKER_GPUS:-${PROMPT_DELTA_TWO_ITERATION_GPUS:-0,1,2,3,4}}"
 ITERATION_COUNT="${PROMPT_DELTA_ITERATION_COUNT:-2}"
 VIDEOS_PER_ITERATION="${PROMPT_DELTA_VIDEOS_PER_ITERATION:-5}"
+# The worker count is a capacity choice, not a correctness constraint: the
+# evidence runner only requires a non-empty unique GPU list. Pin it with
+# PROMPT_DELTA_REQUIRED_GPU_COUNT when a run must reserve an exact number.
+REQUIRED_GPU_COUNT="${PROMPT_DELTA_REQUIRED_GPU_COUNT:-}"
 IFS=',' read -r -a GPU_IDS <<< "$GPUS"
-if [[ "${#GPU_IDS[@]}" -ne 5 ]]; then
-  echo "PROMPT_DELTA_TWO_ITERATION_GPUS must contain exactly five GPU IDs" >&2
+if [[ "${#GPU_IDS[@]}" -lt 1 ]]; then
+  echo "PROMPT_DELTA_WORKER_GPUS must contain at least one GPU ID" >&2
   exit 2
 fi
-if [[ "$(printf '%s\n' "${GPU_IDS[@]}" | sort -u | wc -l)" -ne 5 ]]; then
-  echo "PROMPT_DELTA_TWO_ITERATION_GPUS must be unique" >&2
+if [[ "$(printf '%s\n' "${GPU_IDS[@]}" | sort -u | wc -l)" -ne "${#GPU_IDS[@]}" ]]; then
+  echo "PROMPT_DELTA_WORKER_GPUS must be unique" >&2
   exit 2
+fi
+if [[ -n "$REQUIRED_GPU_COUNT" ]]; then
+  if [[ ! "$REQUIRED_GPU_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PROMPT_DELTA_REQUIRED_GPU_COUNT must be a positive integer" >&2
+    exit 2
+  fi
+  if [[ "${#GPU_IDS[@]}" -ne "$REQUIRED_GPU_COUNT" ]]; then
+    echo "PROMPT_DELTA_WORKER_GPUS must contain exactly $REQUIRED_GPU_COUNT GPU IDs" >&2
+    exit 2
+  fi
 fi
 if [[ ! "$VIDEOS_PER_ITERATION" =~ ^[1-9][0-9]*$ ]]; then
   echo "PROMPT_DELTA_VIDEOS_PER_ITERATION must be a positive integer" >&2
@@ -95,6 +110,7 @@ for ordinal in $(seq 1 "$ITERATION_COUNT"); do
     previous_csv="$(IFS=,; echo "${previous[*]}")"
   fi
 
+  FRESH_PROMPT_DELTA_MEASURE_PARENT="$([[ "$ordinal" -eq 1 ]] && echo true || echo false)" \
   FRESH_PROMPT_DELTA_TIMESTAMP="$run_timestamp" \
   FRESH_PROMPT_DELTA_WORKER_GPUS="$GPUS" \
   FRESH_PROMPT_DELTA_SELECTED_VIDEO_IDS="$selected_csv" \
@@ -112,8 +128,17 @@ for ordinal in $(seq 1 "$ITERATION_COUNT"); do
   if [[ "$status" != "no_eligible_proposal_evidence" ]]; then
     result="$PROJECT_ROOT/runs/fresh_prompt_delta_iteration_${run_timestamp}_output/iteration_result.json"
     jq -e '.status == "no_update" or .status == "promoted" or .status == "rolled_back"' "$result" >/dev/null
-    pointer="$STATE_ROOT/current_meta_prompt.json"
-    CURRENT_PARENT="$(jq -r '.artifact_path' "$pointer")"
+    # Not the live pointer: an iteration moves it at promotion time, before
+    # its own measurement finishes. Replaying completed iterations after a
+    # crash would then read the pointer this iteration itself advanced and
+    # hand the next iteration a parent its prepared inputs never agreed to.
+    # What carries forward is what THIS iteration ended with.
+    active_id="$(jq -r '.active_meta_prompt_id' "$result")"
+    if [[ -z "$active_id" || "$active_id" == "null" ]]; then
+      echo "iteration result has no active meta-prompt id: $result" >&2
+      exit 1
+    fi
+    CURRENT_PARENT="$STATE_ROOT/versions/${active_id}.json"
     test -f "$CURRENT_PARENT"
   fi
   COMPLETED_ITERATIONS+=("$run_timestamp")
@@ -145,6 +170,22 @@ else
   mv "$manifest_tmp" "$EXPERIMENT_ROOT/experiment_manifest.json"
 fi
 accuracy_tmp="$EXPERIMENT_ROOT/heldout_accuracy.json.tmp.$$"
+{
+# iteration 0: the starting meta-prompt, measured before any update
+first_parent_measurement="$PROJECT_ROOT/runs/fresh_prompt_delta_iteration_${COMPLETED_ITERATIONS[0]}_output/parent_measurement/measurement_summary.json"
+if [[ -f "$first_parent_measurement" ]]; then
+  jq '{
+    iteration_id:"iteration_0_initial_meta_prompt",
+    status:"initial",
+    heldout_evaluation:"completed_active_measurement",
+    evaluated_qa_count:.evaluated_qa_count,
+    case_count:.case_count,
+    parent_accuracy:null,
+    candidate_accuracy:null,
+    active_accuracy:.accuracy,
+    measurement_manifest_path:.measurement_manifest_path
+  }' "$first_parent_measurement"
+fi
 printf '%s\n' "${COMPLETED_ITERATIONS[@]}" | while read -r run_timestamp; do
   output="$PROJECT_ROOT/runs/fresh_prompt_delta_iteration_${run_timestamp}_output"
   result="$output/iteration_result.json"
@@ -155,9 +196,24 @@ printf '%s\n' "${COMPLETED_ITERATIONS[@]}" | while read -r run_timestamp; do
   fi
   status="$(jq -r '.status' "$result")"
   confirmation="$output/confirmation/dvd_confirmation_manifest.json"
+  measurement="$output/measurement/dvd_measurement_manifest.json"
   if [[ "$status" == "no_update" ]]; then
     jq -n --arg iteration_id "fresh_prompt_delta_${run_timestamp}" \
       '{iteration_id:$iteration_id,status:"no_update",heldout_evaluation:"not_run",parent_accuracy:null,candidate_accuracy:null,active_accuracy:null}'
+  elif [[ -f "$measurement" ]]; then
+    # always_promote_measured_v1: the held-out set reports, it does not decide.
+    jq --arg status "$status" --arg path "$measurement" \
+      --arg iteration_id "$(jq -r '.iteration_id' "$result")" '{
+      iteration_id:$iteration_id,
+      status:$status,
+      heldout_evaluation:"completed_active_measurement",
+      evaluated_qa_count:.aggregate.evaluated_qa_count,
+      case_count:.aggregate.case_count,
+      parent_accuracy:null,
+      candidate_accuracy:null,
+      active_accuracy:.aggregate.accuracy,
+      measurement_manifest_path:$path
+    }' "$measurement"
   else
     test -f "$confirmation"
     jq --arg status "$status" --arg path "$confirmation" \
@@ -173,7 +229,8 @@ printf '%s\n' "${COMPLETED_ITERATIONS[@]}" | while read -r run_timestamp; do
       confirmation_manifest_path:$path
     }' "$confirmation"
   fi
-done | jq -s '{schema_version:"prompt_delta_iteration_heldout_accuracy_v1",iterations:.}' > "$accuracy_tmp"
+done
+} | jq -s '{schema_version:"prompt_delta_iteration_heldout_accuracy_v2",iterations:.}' > "$accuracy_tmp"
 if [[ -f "$EXPERIMENT_ROOT/heldout_accuracy.json" ]]; then
   cmp -s "$accuracy_tmp" "$EXPERIMENT_ROOT/heldout_accuracy.json" || {
     echo "held-out accuracy report conflicts with resumed artifacts" >&2

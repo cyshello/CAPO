@@ -69,9 +69,66 @@ PROMPT_GENERATOR_MODEL_ID = os.environ.get(
     "SR_PROMPT_GENERATOR_MODEL_ID", "gpt-4o-mini")
 PROMPT_GENERATOR_BACKEND_ID = "openai_chat_completions_vision_replace_body_v1"
 PROMPT_GENERATOR_MAX_TOKENS = 512
-ORCHESTRATOR_TOOL_MODEL = "gpt-4o-mini"
+# The DVD agent: function-calling orchestrator and the plain-text reasoning it
+# does between tool calls. frame_inspect's vision stays on the local Qwen
+# captioner, so this is the only OpenAI model in the DVD loop.
+ORCHESTRATOR_TOOL_MODEL = os.environ.get(
+    "SR_ORCHESTRATOR_TOOL_MODEL", "gpt-4o")
+# A second orchestrator for requests the first one refuses. The reasoning
+# models apply a stricter prompt-policy filter than gpt-4o, and a transcript
+# that trips it trips it on every retry, so without this the run stops on that
+# video. The Codex shim cannot serve as the fallback: it is a ChatGPT-account
+# path with its own quota, which can be -- and currently is -- exhausted.
+ORCHESTRATOR_TOOL_FALLBACK_MODEL = os.environ.get(
+    "SR_ORCHESTRATOR_TOOL_FALLBACK_MODEL", "gpt-4o")
 TEXT_FALLBACK_MODEL = "gpt-5.5"  # codex CLI
 FEEDBACK_MODEL = os.environ.get("SR_FEEDBACK_MODEL", "gpt-4o")
+
+
+def _reasoning_effort(variable_name: str) -> str | None:
+    """One reasoning-effort knob, unset by default.
+
+    Only the GPT-5 family reads it; on gpt-4o the request body is unchanged, so
+    leaving these unset keeps every request byte-identical to earlier runs.
+    """
+    value = os.environ.get(variable_name, "").strip()
+    return value or None
+
+
+# The DVD agent sometimes ends a run without naming an answer option, which
+# cannot be scored. Re-running the QA costs seconds; letting it end the process
+# costs a driver restart. Attempts include the first try.
+INTERVENTION_QA_RETRY_ATTEMPTS = int(
+    os.environ.get("SR_INTERVENTION_QA_RETRY_ATTEMPTS", "3"))
+
+# Structural compaction of the tool evidence in the feedback payload.
+COMPACT_TOOL_EVIDENCE = os.environ.get(
+    "SR_COMPACT_TOOL_EVIDENCE", "0") not in ("0", "false", "False", "")
+
+# The minimal feedback payload: delta, caption pairs, QA outcomes, one line per
+# tool event. Off keeps the lean/compact payload.
+EPISODE_FEEDBACK_VIEW = os.environ.get(
+    "SR_EPISODE_FEEDBACK_VIEW", "0") not in ("0", "false", "False", "")
+
+# minimal | low | medium | high. Reasoning tokens are billed as output and are
+# spent from the same allowance as the visible answer, so raising the effort
+# without raising the output budget truncates the reply.
+GENERATOR_REASONING_EFFORT = _reasoning_effort("SR_GENERATOR_REASONING_EFFORT")
+DVD_REASONING_EFFORT = _reasoning_effort("SR_DVD_REASONING_EFFORT")
+# The optimization-side models are cheap (about fifteen calls per iteration), so
+# effort here is a latency choice, not a cost one. They are set separately
+# because the work differs: reading caption pairs is comparison, while turning a
+# set of episodes into one general rule is where the reasoning earns its time.
+OPTIMIZER_REASONING_EFFORT = _reasoning_effort("SR_OPTIMIZER_REASONING_EFFORT")
+PROPOSER_REASONING_EFFORT = (
+    _reasoning_effort("SR_PROPOSER_REASONING_EFFORT")
+    or OPTIMIZER_REASONING_EFFORT)
+FEEDBACK_REASONING_EFFORT = (
+    _reasoning_effort("SR_FEEDBACK_REASONING_EFFORT")
+    or OPTIMIZER_REASONING_EFFORT)
+UPDATER_REASONING_EFFORT = (
+    _reasoning_effort("SR_UPDATER_REASONING_EFFORT")
+    or OPTIMIZER_REASONING_EFFORT)
 
 # DVD text-reasoning / tool-calling backend. "openai" routes through the
 # OpenAI API; "codex" uses the codex CLI. Default is the API path so runs do
@@ -195,7 +252,7 @@ PROPERTY_RETRIEVAL_TOP_K = 5
 DVD_CLIP_SEARCH_TOP_K = 16
 DVD_CLIP_SEARCH_POLICY_VERSION = "fixed_clip_search_top_k_v1"
 DVD_FRAME_INSPECT_TOOL_CONTRACT_VERSION = (
-    "strict_hhmmss_pair_with_one_corrective_retry_v1")
+    "strict_hhmmss_pair_in_video_bounds_with_one_corrective_retry_v2")
 DVD_FRAME_INSPECT_CORRECTIVE_RETRY_LIMIT = 1
 
 # CLIP retrieval defaults (PHASE2_3 §9-10)

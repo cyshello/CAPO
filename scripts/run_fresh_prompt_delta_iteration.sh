@@ -38,6 +38,60 @@ if [[ -n "$BASELINE_RESUME_DIR" ]]; then
   BASELINE_RESUME_ARGS+=(--baseline-resume-dir "$BASELINE_RESUME_DIR")
 fi
 PARENT_PREPARE_ARGS=()
+# Restart safety: worker_result_timeout_seconds is embedded in write-once
+# artifacts (fresh_evidence_manifest.json, input_identity.json).  Changing the
+# value under an iteration that already wrote one of them turns every resume
+# into an immutable-artifact conflict, so an in-flight iteration keeps the value
+# it was started with and only fresh iterations pick up the new default.
+WORKER_RESULT_TIMEOUT_SECONDS="${FRESH_PROMPT_DELTA_WORKER_RESULT_TIMEOUT_SECONDS:-2400}"
+
+# Model selection. Defaults reproduce the gpt-4o stack every completed
+# iteration was measured with; the GPT-5 family needs a larger output budget
+# because reasoning tokens are billed and capped as output.
+OPTIMIZER_MODEL_ID="${FRESH_PROMPT_DELTA_OPTIMIZER_MODEL_ID:-gpt-4o}"
+GENERATOR_MODEL_ID="${FRESH_PROMPT_DELTA_GENERATOR_MODEL_ID:-gpt-4o-mini}"
+OPTIMIZER_MAX_OUTPUT_TOKENS="${FRESH_PROMPT_DELTA_OPTIMIZER_MAX_OUTPUT_TOKENS:-4096}"
+GENERATOR_MAX_OUTPUT_TOKENS="${FRESH_PROMPT_DELTA_GENERATOR_MAX_OUTPUT_TOKENS:-512}"
+for _budget in "$OPTIMIZER_MAX_OUTPUT_TOKENS" "$GENERATOR_MAX_OUTPUT_TOKENS"; do
+  if [[ ! "$_budget" =~ ^[1-9][0-9]*$ ]]; then
+    echo "output token budgets must be positive integers" >&2
+    exit 2
+  fi
+done
+MODEL_IDENTITY="captioner=Qwen/Qwen2.5-VL-7B-Instruct;prompt_generator=${GENERATOR_MODEL_ID};dvd_tool=${SR_ORCHESTRATOR_TOOL_MODEL:-gpt-4o};dvd_fallback=gpt-5.5"
+
+# Held-out measurement can run inline or on its own GPUs. Deferring it keeps a
+# measurement failure -- or a measurement worker that is not running yet -- from
+# stopping the optimization loop, which never reads the numbers anyway.
+PROMOTION_POLICY="${FRESH_PROMPT_DELTA_PROMOTION_POLICY:-always_promote_measured_v1}"
+MEASUREMENT_QUEUE_ARGS=()
+if [[ "$PROMOTION_POLICY" == "promote_and_enqueue_measurement_v1" ]]; then
+  MEASUREMENT_QUEUE_DIR="${FRESH_PROMPT_DELTA_MEASUREMENT_QUEUE_DIR:-$PROJECT_ROOT/runs/measurement_queue}"
+  mkdir -p "$MEASUREMENT_QUEUE_DIR"
+  MEASUREMENT_QUEUE_ARGS+=(--measurement-queue-dir "$MEASUREMENT_QUEUE_DIR")
+fi
+_frozen_worker_timeout() {
+  local file="$1" value
+  [[ -f "$file" ]] || return 1
+  value="$(jq -r 'first(.. | objects | select(has("worker_result_timeout_seconds")) | .worker_result_timeout_seconds) // empty' "$file" 2>/dev/null)"
+  [[ -n "$value" && "$value" != "null" ]] || return 1
+  printf '%s' "$value"
+}
+for _frozen_source in \
+    "$OUTPUT_ROOT/input_identity.json" \
+    "$EVIDENCE_ROOT/fresh_evidence_manifest.json" \
+    "$INPUT_ROOT/component_config.json"; do
+  if _frozen_value="$(_frozen_worker_timeout "$_frozen_source")"; then
+    WORKER_RESULT_TIMEOUT_SECONDS="$_frozen_value"
+    echo "reusing frozen worker_result_timeout_seconds=$WORKER_RESULT_TIMEOUT_SECONDS from $_frozen_source" >&2
+    break
+  fi
+done
+if [[ ! "$WORKER_RESULT_TIMEOUT_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "FRESH_PROMPT_DELTA_WORKER_RESULT_TIMEOUT_SECONDS must be a positive number" >&2
+  exit 2
+fi
+
 if [[ -n "${FRESH_PROMPT_DELTA_PARENT_META_PROMPT:-}" ]]; then
   PARENT_PREPARE_ARGS+=(--parent-meta-prompt "$PARENT")
 fi
@@ -96,7 +150,15 @@ if [[ -n "${FRESH_PROMPT_DELTA_EVIDENCE_COHORT_FILE:-}" ||
 fi
 
 if [[ ! -f "$INPUT_ROOT/manifest.json" ]]; then
-  test ! -e "$INPUT_ROOT"
+  # A prepare that died midway leaves an input root without a manifest.  Failing
+  # on it is deterministic, so the watcher would burn its whole restart budget
+  # at the same point.  Move the partial root aside instead; nothing is deleted.
+  if [[ -e "$INPUT_ROOT" ]]; then
+    QUARANTINE="${INPUT_ROOT}.incomplete.$(date -u +%Y%m%d_%H%M%S)"
+    test ! -e "$QUARANTINE"
+    mv "$INPUT_ROOT" "$QUARANTINE"
+    echo "quarantined incomplete prepared inputs: $QUARANTINE" >&2
+  fi
   conda run --no-capture-output -n "$SR_CONDA_ENV" \
     python "$PROJECT_ROOT/scripts/prepare_fresh_prompt_delta_iteration.py" \
     "${PARENT_PREPARE_ARGS[@]}" \
@@ -109,40 +171,60 @@ if [[ ! -f "$INPUT_ROOT/manifest.json" ]]; then
     --api-endpoint https://api.openai.com/v1/chat/completions \
     --api-key-environment-variable OPENAI_API_KEY \
     --timeout-seconds 600 \
-    --proposer-model-id gpt-4o \
+    --proposer-model-id "$OPTIMIZER_MODEL_ID" \
     --proposer-context-limit 128000 \
-    --proposer-maximum-output-tokens 4096 \
+    --proposer-maximum-output-tokens "$OPTIMIZER_MAX_OUTPUT_TOKENS" \
     --proposer-temperature 0.0 \
-    --proposer-policy-version fresh_prompt_delta_proposer_gpt4o_per_qa_isolated_v5 \
+    --proposer-policy-version fresh_prompt_delta_proposer_gpt4o_per_qa_isolated_v6 \
     --maximum-deltas-per-qa 2 \
-    --selection-policy source_qa_localized_trajectory_segments_only_v1 \
+    --proposal-target-policy "${FRESH_PROMPT_DELTA_PROPOSAL_TARGET_POLICY:-incorrect_baseline_qa_only_v1}" \
+    --selection-policy source_qa_localized_trajectory_segments_v2_global_only_excluded \
     --global-inspection-boundary-tolerance-seconds 10 \
-    --feedback-model-id gpt-4o \
+    --feedback-model-id "$OPTIMIZER_MODEL_ID" \
     --feedback-context-limit 128000 \
-    --feedback-maximum-output-tokens 4096 \
+    --feedback-maximum-output-tokens "$OPTIMIZER_MAX_OUTPUT_TOKENS" \
     --feedback-temperature 0.0 \
-    --feedback-policy-version episode_feedback_request_v6_candidate_mixed_view_sibling_outcomes_gpt4o \
-    --updater-model-id gpt-4o \
+    --feedback-policy-version episode_feedback_request_v12_directional_gpt4o \
+    --updater-model-id "$OPTIMIZER_MODEL_ID" \
     --updater-context-limit 128000 \
-    --updater-maximum-output-tokens 4096 \
+    --updater-maximum-output-tokens "$OPTIMIZER_MAX_OUTPUT_TOKENS" \
     --updater-temperature 0.0 \
-    --updater-policy-version meta_prompt_updater_v2_grounded_gpt4o_checkpoint_g \
+    --updater-policy-version meta_prompt_updater_v5_merge_gpt4o \
     --worker-gpus "$WORKER_GPUS" \
-    --worker-result-timeout-seconds 900 \
-    --prompt-generator-model-id gpt-4o-mini \
+    --worker-result-timeout-seconds "$WORKER_RESULT_TIMEOUT_SECONDS" \
+    --prompt-generator-model-id "$GENERATOR_MODEL_ID" \
     --prompt-generator-backend-id openai_chat_completions_vision_replace_body_v1 \
-    --prompt-generator-max-tokens 512 \
+    --prompt-generator-max-tokens "$GENERATOR_MAX_OUTPUT_TOKENS" \
     --history-block-seconds 300 \
     --max-history-captions 30 \
     --dvd-max-iterations 15 \
     --cache-root "$CACHE_ROOT" \
     --cache-manifest-path "$CACHE_ROOT/caption_cache_manifest.jsonl" \
-    --paired-model-identity 'captioner=Qwen/Qwen2.5-VL-7B-Instruct;prompt_generator=gpt-4o-mini;dvd_tool=gpt-4o-mini;dvd_fallback=gpt-5.5' \
+    --paired-model-identity "$MODEL_IDENTITY" \
     --cache-reset-identity "fresh_prompt_delta_clean_${RUN_TIMESTAMP}" \
     --evaluation-pipeline-identity dvd_history_aware_free_form_paired_v1
 fi
 
 jq -e '.status == "prepared" and .model_or_api_calls == 0 and .legacy_property_codebook_or_router_used == false and .source_hashes_before == .source_hashes_after' "$INPUT_ROOT/manifest.json" >/dev/null
+
+if [[ "${FRESH_PROMPT_DELTA_MEASURE_PARENT:-false}" == "true" && "$PROMOTION_POLICY" == "promote_and_enqueue_measurement_v1" ]]; then
+  # The iteration-0 point is scored by the measurement worker, not here, and
+  # it is queued before the evidence phase so the worker has something to do
+  # in the window before the first candidate exists.
+  PARENT_MEASUREMENT_ROOT="${OUTPUT_ROOT}/parent_measurement"
+  conda run --no-capture-output -n "$SR_CONDA_ENV" \
+    python "$PROJECT_ROOT/scripts/enqueue_measurement.py" \
+    --queue-dir "$MEASUREMENT_QUEUE_DIR" \
+    --meta-prompt "$PARENT" \
+    --confirmation-cases "$INPUT_ROOT/confirmation_cases.json" \
+    --output-dir "$PARENT_MEASUREMENT_ROOT" \
+      --iteration-id "iteration_0_initial_meta_prompt_${RUN_TIMESTAMP}" \
+    --model-identity "$MODEL_IDENTITY" \
+    --decoding-settings "$INPUT_ROOT/paired_decoding_settings.json" \
+      --cache-reset-identity "fresh_prompt_delta_clean_${RUN_TIMESTAMP}" \
+    --evaluation-pipeline-identity dvd_history_aware_free_form_paired_v1
+fi
+
 
 conda run --no-capture-output -n "$SR_CONDA_ENV" \
   python "$PROJECT_ROOT/scripts/run_fresh_prompt_delta_evidence.py" \
@@ -153,9 +235,9 @@ conda run --no-capture-output -n "$SR_CONDA_ENV" \
   "${BASELINE_RESUME_ARGS[@]}" \
   --source-revision "$SOURCE_REVISION" \
   --worker-gpus "$WORKER_GPUS" \
-  --worker-result-timeout-seconds 900 \
-  --proposer-policy-version-override fresh_prompt_delta_proposer_gpt4o_per_qa_isolated_v5 \
-  --selection-policy-override source_qa_localized_trajectory_segments_only_v1 \
+  --worker-result-timeout-seconds "$WORKER_RESULT_TIMEOUT_SECONDS" \
+  --proposer-policy-version-override fresh_prompt_delta_proposer_gpt4o_per_qa_isolated_v6 \
+  --selection-policy-override source_qa_localized_trajectory_segments_v2_global_only_excluded \
   --global-inspection-boundary-tolerance-seconds-override 10 \
   --proposer-maximum-calls-override "$((SELECTED_VIDEO_COUNT * 3))" \
   --maximum-deltas-per-qa-override 2
@@ -185,6 +267,28 @@ if [[ -n "${FRESH_PROMPT_DELTA_HISTORICAL_MEMORY_CHARACTER_BUDGET:-}" ]]; then
     "$FRESH_PROMPT_DELTA_HISTORICAL_MEMORY_CHARACTER_BUDGET")
 fi
 
+# Iteration-0 point of the learning curve: score the starting meta-prompt on
+# the held-out cases before any update touches it. Decision-free, so it never
+# feeds back into the optimization. Under the deferred policy this already
+# went to the measurement queue before the evidence phase started.
+if [[ "${FRESH_PROMPT_DELTA_MEASURE_PARENT:-false}" == "true" && \
+      "$PROMOTION_POLICY" != "promote_and_enqueue_measurement_v1" ]]; then
+  PARENT_MEASUREMENT_ROOT="${OUTPUT_ROOT}/parent_measurement"
+  if [[ ! -f "$PARENT_MEASUREMENT_ROOT/measurement_summary.json" ]]; then
+    conda run --no-capture-output -n "$SR_CONDA_ENV" \
+      python "$PROJECT_ROOT/scripts/measure_meta_prompt.py" \
+      --meta-prompt "$PARENT" \
+      --confirmation-cases "$INPUT_ROOT/confirmation_cases.json" \
+      --output-dir "$PARENT_MEASUREMENT_ROOT" \
+      --component-factory surrogate_rollout.optimization.checkpoint_g_factory:build_checkpoint_g_components \
+      --component-config "$RESOLVED_COMPONENT_CONFIG" \
+      --decoding-settings "$INPUT_ROOT/paired_decoding_settings.json" \
+      --model-identity "$MODEL_IDENTITY" \
+      --cache-reset-identity "fresh_prompt_delta_clean_${RUN_TIMESTAMP}" \
+      --evaluation-pipeline-identity dvd_history_aware_free_form_paired_v1
+  fi
+fi
+
 conda run --no-capture-output -n "$SR_CONDA_ENV" \
   python "$PROJECT_ROOT/scripts/run_prompt_delta_iteration.py" \
   --iteration-id "fresh_prompt_delta_${RUN_TIMESTAMP}" \
@@ -196,12 +300,14 @@ conda run --no-capture-output -n "$SR_CONDA_ENV" \
   --feedback-memory-bank-dir "$FEEDBACK_MEMORY_BANK_ROOT" \
   "${HISTORICAL_MEMORY_ARGS[@]}" \
   --candidate-created-at "$CANDIDATE_CREATED_AT" \
-  --model-identity 'captioner=Qwen/Qwen2.5-VL-7B-Instruct;prompt_generator=gpt-4o-mini;dvd_tool=gpt-4o-mini;dvd_fallback=gpt-5.5' \
+  --model-identity "$MODEL_IDENTITY" \
   --decoding-settings "$INPUT_ROOT/paired_decoding_settings.json" \
   --cache-reset-identity "fresh_prompt_delta_clean_${RUN_TIMESTAMP}" \
   --evaluation-pipeline-identity dvd_history_aware_free_form_paired_v1 \
   --worker-gpus "$WORKER_GPUS" \
-  --worker-result-timeout-seconds 900 \
+  --worker-result-timeout-seconds "$WORKER_RESULT_TIMEOUT_SECONDS" \
+  --promotion-policy "$PROMOTION_POLICY" \
+  "${MEASUREMENT_QUEUE_ARGS[@]}" \
   --minimum-confirmation-samples "$(jq 'length' "$INPUT_ROOT/confirmation_cases.json")" \
   --minimum-accuracy-delta 0.0 \
   --maximum-correct-to-wrong 0 \

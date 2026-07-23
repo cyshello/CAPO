@@ -133,7 +133,32 @@ class FrameInspectArgumentValidationError(ValueError):
     pass
 
 
-def _frame_inspect_argument_error(value: Any) -> str | None:
+def _hhmmss_seconds(endpoint: str) -> float:
+    hours, minutes, seconds = endpoint.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _seconds_hhmmss(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def _video_length_seconds(database: Any) -> float | None:
+    """The indexed video's length, when the database exposes one."""
+    try:
+        value = database.get_additional_data()["video_length"]
+    except Exception:  # noqa: BLE001 - a database without it just skips the check
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and _HHMMSS_ARGUMENT.fullmatch(value):
+        return _hhmmss_seconds(value)
+    return None
+
+
+def _frame_inspect_argument_error(
+    value: Any, video_length_seconds: float | None = None,
+) -> str | None:
     if not isinstance(value, list) or not value:
         return "time_ranges_hhmmss must be a non-empty array"
     for index, pair in enumerate(value):
@@ -150,6 +175,17 @@ def _frame_inspect_argument_error(value: Any) -> str | None:
                 return (
                     f"time_ranges_hhmmss[{index}][{endpoint_index}] has an "
                     "invalid minute or second")
+        if _hhmmss_seconds(pair[1]) < _hhmmss_seconds(pair[0]):
+            return (
+                f"time_ranges_hhmmss[{index}] ends before it starts")
+        # A start past the end of the video raises inside the tool, which would
+        # abort the whole QA. Treat it as an argument error so the agent gets
+        # the same corrective retry a malformed timestamp gets.
+        if video_length_seconds is not None and \
+                _hhmmss_seconds(pair[0]) > video_length_seconds:
+            return (
+                f"time_ranges_hhmmss[{index}][0] starts at {pair[0]}, past the "
+                f"end of this {_seconds_hhmmss(video_length_seconds)} video")
     return None
 
 
@@ -158,7 +194,8 @@ def _wrap_frame_inspect(tool, recorder: RunRecorder):
     def wrapped(database, question, time_ranges_hhmmss):
         t0 = time.time()
         error = None
-        validation_error = _frame_inspect_argument_error(time_ranges_hhmmss)
+        validation_error = _frame_inspect_argument_error(
+            time_ranges_hhmmss, _video_length_seconds(database))
         if validation_error is not None:
             recorder.frame_inspect_argument_failures += 1
             retry_index = recorder.frame_inspect_argument_failures
@@ -182,11 +219,15 @@ def _wrap_frame_inspect(tool, recorder: RunRecorder):
                 raise FrameInspectArgumentValidationError(
                     "frame_inspect_tool argument validation failed after the "
                     f"single corrective retry: {validation_error}")
+            length = _video_length_seconds(database)
+            bound = ("" if length is None else
+                     " This video runs from 00:00:00 to "
+                     f"{_seconds_hhmmss(length)}.")
             return (
                 "Error: invalid frame_inspect_tool arguments. "
-                f"{validation_error}. Correct the arguments and call "
-                "frame_inspect_tool again using only HH:MM:SS strings. "
-                "Exactly one corrective retry is allowed.")
+                f"{validation_error}.{bound} Correct the arguments and call "
+                "frame_inspect_tool again using only HH:MM:SS strings inside "
+                "the video. Exactly one corrective retry is allowed.")
         try:
             result = tool(database=database, question=question,
                           time_ranges_hhmmss=time_ranges_hhmmss)

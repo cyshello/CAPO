@@ -206,26 +206,30 @@ def test_provider_request_is_strict_and_omits_candidate_identity(tmp_path):
     assert "status" not in schema["properties"]
 
 
-def test_unknown_supporting_feedback_fails_once_and_preserves_raw(tmp_path):
+def test_invented_supporting_feedback_ids_do_not_fail_the_update(tmp_path):
     _, feedbacks, parent_path, feedback_paths = write_sources(tmp_path)
-    invalid = response([feedbacks[0].feedback_id, "feedback-missing"])
-    transport = Transport(dumps_canonical(invalid))
+    raw = response([feedbacks[0].feedback_id, "feedback-missing"])
+    transport = Transport(dumps_canonical(raw))
     backend = backend_for(transport)
-    output = tmp_path / "failed_parse"
-    with pytest.raises(MetaPromptUpdateExecutionError, match="unknown"):
-        execute_meta_prompt_update_once(
-            parent_artifact_path=parent_path,
-            feedback_artifact_paths=feedback_paths,
-            output_directory=output,
-            backend=backend,
-            updater_policy_version=POLICY,
-            candidate_created_at=CREATED_AT,
-        )
+    output = tmp_path / "dropped_ids"
+    execute_meta_prompt_update_once(
+        parent_artifact_path=parent_path,
+        feedback_artifact_paths=feedback_paths,
+        output_directory=output,
+        backend=backend,
+        updater_policy_version=POLICY,
+        candidate_created_at=CREATED_AT,
+    )
     assert backend.call_count == len(transport.calls) == 1
-    assert (output / "raw_response.txt").read_text() == dumps_canonical(invalid)
-    assert (output / "raw_error.txt").is_file()
+    # the raw response is preserved exactly; only the parsed decision drops the
+    # identifier that cites nothing
+    assert (output / "raw_response.txt").read_text() == dumps_canonical(raw)
     assert json.loads((output / "run_manifest.json").read_text())["status"] == \
-        "failed"
+        "succeeded"
+    parsed = json.loads(
+        (output / "parsed_meta_prompt_update_result.json").read_text())
+    assert parsed["decision"]["supporting_feedback_ids"] == [
+        feedbacks[0].feedback_id]
 
 
 def test_provider_failure_is_not_retried_and_raw_error_is_written(tmp_path):
@@ -268,7 +272,7 @@ def test_existing_output_directory_is_write_once_and_skips_call(tmp_path):
     assert marker.read_text() == "keep"
 
 
-def test_known_ids_use_boundaries_and_unavailable_inputs_are_rejected():
+def test_known_ids_are_rejected_only_on_exact_token_boundaries():
     parent = parent_fixture()
     feedbacks = feedback_fixtures()
     request = build_meta_prompt_update_request(
@@ -292,8 +296,18 @@ def test_known_ids_use_boundaries_and_unavailable_inputs_are_rejected():
         parse_meta_prompt_update_response(
             dumps_canonical(value), request=request, feedbacks=feedbacks)
 
+
+def test_runtime_availability_wording_is_left_to_the_prompt():
+    """A word search cannot tell a prohibition from a requirement."""
+    parent = parent_fixture()
+    feedbacks = feedback_fixtures()
+    request = build_meta_prompt_update_request(
+        parent, feedbacks, updater_policy_version=POLICY)
+    value = response([item.feedback_id for item in feedbacks])
     value["candidate_meta_prompt"] = \
-        "Consult correctness labels before generating an instruction."
-    with pytest.raises(MetaPromptUpdaterParseError, match="runtime-unavailable"):
-        parse_meta_prompt_update_response(
-            dumps_canonical(value), request=request, feedbacks=feedbacks)
+        "Do not consult correctness labels or QA answers when writing the " \
+        "instruction."
+    decision, _, _ = parse_meta_prompt_update_response(
+        dumps_canonical(value), request=request, feedbacks=feedbacks)
+    assert decision.candidate_meta_prompt == value["candidate_meta_prompt"]
+

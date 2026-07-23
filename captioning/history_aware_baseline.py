@@ -519,6 +519,13 @@ def _parallel_history_worker(
                             "block_index": block_index,
                             "segment_count": len(block_clips),
                             "block_root": os.path.abspath(block_root)})
+                        # One request carries several blocks, so the parent
+                        # cannot tell a long request from a stalled one without
+                        # a beat between them.
+                        result_queue.put({
+                            "request_id": request_id, "gpu": gpu,
+                            "event": "progress", "stage": "block_start",
+                            "block_index": block_index})
                         artifact = builder.build(
                             sample=common["sample"], clip_index=list(block_clips),
                             bank_version=common["bank_version"],
@@ -976,6 +983,9 @@ class HistoryAwareBaselineCaptionViewBuilder:
         self._pool_result_queue: Any | None = None
         self._pool_result_thread: threading.Thread | None = None
         self._pool_pending: dict[str, queue.Queue] = {}
+        # request_id -> monotonic time of the last sign of life. The worker
+        # timeout is an idle limit, not a cap on total request duration.
+        self._pool_progress: dict[str, float] = {}
         self._pool_startup_errors: list[dict[str, Any]] = []
         self._pool_processes: dict[str, Any] = {}
         self._pool_command_queues: dict[str, Any] = {}
@@ -1483,11 +1493,23 @@ class HistoryAwareBaselineCaptionViewBuilder:
                     + dumps_canonical(self._pool_startup_errors[0]))
             request_id = self._next_pool_request_id(prefix)
             self._pool_pending[request_id] = queue.Queue(maxsize=1)
+            self._pool_progress[request_id] = time.monotonic()
             return request_id
 
     def _discard_pool_request(self, request_id: str) -> None:
         with self._pool_lock:
             self._pool_pending.pop(request_id, None)
+            self._pool_progress.pop(request_id, None)
+
+    def _note_pool_progress(self, request_id: str) -> None:
+        with self._pool_lock:
+            if request_id in self._pool_pending:
+                self._pool_progress[request_id] = time.monotonic()
+
+    def _pool_idle_seconds(self, request_id: str) -> float:
+        with self._pool_lock:
+            since = self._pool_progress.get(request_id)
+        return 0.0 if since is None else time.monotonic() - since
 
     def _pool_process_diagnostics(self) -> dict[str, Mapping[str, Any]]:
         return {str(gpu): {
@@ -1505,14 +1527,17 @@ class HistoryAwareBaselineCaptionViewBuilder:
             raise RuntimeError(f"unknown persistent-pool request: {request_id}")
         limit = (self.worker_result_timeout_seconds
                  if timeout_seconds is None else float(timeout_seconds))
-        deadline = time.monotonic() + limit
         try:
             while True:
-                remaining = deadline - time.monotonic()
+                # A request carrying several blocks legitimately runs longer
+                # than the limit; only silence is a failure.
+                idle = self._pool_idle_seconds(request_id)
+                remaining = limit - idle
                 if remaining <= 0:
                     raise RuntimeError(
                         "persistent caption worker timed out with no truncation "
                         f"or retry: request={request_id}, limit_seconds={limit}, "
+                        f"idle_seconds={idle:.1f}, "
                         "processes=" + dumps_canonical(
                             self._pool_process_diagnostics()))
                 try:
@@ -1544,6 +1569,10 @@ class HistoryAwareBaselineCaptionViewBuilder:
             request_id = str(item.get("request_id"))
             if request_id == "__parent_stop__":
                 return
+            if item.get("event") == "progress":
+                # Liveness only: it must not satisfy the waiter.
+                self._note_pool_progress(request_id)
+                continue
             with self._pool_lock:
                 if request_id == "startup":
                     self._pool_startup_errors.append(item)

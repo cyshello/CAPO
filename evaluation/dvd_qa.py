@@ -172,6 +172,7 @@ def ensure_backend(
             use_openai_tools=use_openai_tools,
             text_backend=text_backend,
             tensor_parallel_size=1,
+            tool_fallback_model=config.ORCHESTRATOR_TOOL_FALLBACK_MODEL,
         )
         _BACKEND_INSTALLED = True
     if preload_captioner:

@@ -13,13 +13,20 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from surrogate_rollout import config
+from surrogate_rollout.optimization.openai_chat_model_profile import (
+    adapt_chat_completions_body,
+)
 from surrogate_rollout.optimization.llm_episode_feedback import (
     EpisodeFeedbackArtifactResolver,
     EpisodeFeedbackBackendConfigurationError,
     LeanEpisodeFeedbackRequest,
     build_lean_episode_feedback_request,
 )
-from surrogate_rollout.optimization.schemas import InterventionEpisode
+from surrogate_rollout.optimization.schemas import (
+    EPISODE_FEEDBACK_ATTRIBUTION_STATUSES,
+    InterventionEpisode,
+)
 from surrogate_rollout.prompt_routing.schemas import dumps_canonical
 from surrogate_rollout.schemas import sha256_json
 
@@ -144,13 +151,38 @@ def episode_feedback_response_json_schema() -> dict[str, Any]:
         "observations": {"type": "array", "items": evidence},
         "counterevidence": {"type": "array", "items": evidence},
         "generator_diagnosis": {"type": "string"},
-        "recommended_strategy_change": {"type": "string"},
+        "attribution_status": {
+            "type": "string",
+            "enum": list(EPISODE_FEEDBACK_ATTRIBUTION_STATUSES),
+            "description": (
+                "Whether the supplied evidence supports an operation-level "
+                "lesson, and if not, what blocks it."),
+        },
+        "observable_trigger": {
+            "type": ["string", "null"],
+            "description": (
+                "A condition visible in the current frames or the preceding "
+                "caption history; null unless attribution_status is "
+                "'supported'."),
+        },
+        "caption_operation": {
+            "type": ["string", "null"],
+            "description": (
+                "The captioning operation the trigger calls for; null unless "
+                "attribution_status is 'supported'."),
+        },
+        "recommended_strategy_change": {
+            "type": ["string", "null"],
+            "description": (
+                "The transferable rule; null unless attribution_status is "
+                "'supported'."),
+        },
         "confidence": dict(confidence),
         "compact_memory_text": {
             "type": ["string", "null"],
             "description": (
                 "A short provider-authored experience for historical memory; "
-                "null only when no non-empty memory can be supplied."),
+                "null unless attribution_status is 'supported'."),
         },
     }
     return {
@@ -243,7 +275,7 @@ class OpenAICompatibleEpisodeFeedbackProviderAdapter:
             {"role": "system", "content": system_instruction},
             {"role": "user", "content": user_payload},
         )
-        body = {
+        body = adapt_chat_completions_body({
             "model": self.model_id,
             "messages": [dict(item) for item in messages],
             "max_tokens": self.maximum_output_tokens,
@@ -256,7 +288,7 @@ class OpenAICompatibleEpisodeFeedbackProviderAdapter:
                     "schema": self.response_schema,
                 },
             },
-        }
+        }, reasoning_effort=config.FEEDBACK_REASONING_EFFORT)
         canonical_body = json.loads(dumps_canonical(body))
         exact = self.exact_token_counter(messages)
         if not isinstance(exact, ExactProviderInputTokenCount):

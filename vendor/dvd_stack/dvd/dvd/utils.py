@@ -108,11 +108,15 @@ def call_openai_model_with_tools(
 
     model = model_name
       
-    payload = {  
+    payload = {
         "model": model,
-        "messages": copy.deepcopy(messages),  
-        # "reasoning_effort": reasoning_effort,
-    }  
+        "messages": copy.deepcopy(messages),
+    }
+    # Only the GPT-5 family accepts this; unset by default so gpt-4o requests
+    # stay exactly as they were. Set SR_DVD_REASONING_EFFORT to enable.
+    _reasoning_effort = os.environ.get("SR_DVD_REASONING_EFFORT", "").strip()
+    if _reasoning_effort and model.startswith(("gpt-5", "o1", "o3", "o4")):
+        payload["reasoning_effort"] = _reasoning_effort
     if return_json:
         payload["response_format"] = {"type": "json_object"}
   

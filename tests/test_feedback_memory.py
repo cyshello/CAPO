@@ -20,8 +20,10 @@ from surrogate_rollout.optimization.feedback_memory import (
     validate_compact_feedback_memory_record,
     append_parent_feedback_memory_bank,
     build_episode_feedback_memory_record,
+    carry_over_parent_feedback_memory_bank,
     load_parent_feedback_memory_bank,
     select_historical_feedback_memories,
+    CompactFeedbackMemoryError,
 )
 from surrogate_rollout.optimization.meta_prompt_updater import (
     DeterministicMockMetaPromptUpdater,
@@ -53,20 +55,27 @@ def _record(*, attribution="unresolved", effect="wrong_to_correct",
     )
 
 
-def test_word_sentence_markdown_and_causal_limits():
+def test_memory_text_style_is_left_to_the_prompt():
+    """Only emptiness is a schema error; wording is the prompt's job.
+
+    Word counts, sentence counts and banned causal verbs used to be enforced
+    here. They read tokens rather than meaning, so they rejected memories that
+    followed the instruction, and the feedback stage has no retry to absorb a
+    rejection.
+    """
     validate_compact_feedback_memory_record(_record())
-    with pytest.raises(ValueError, match="30 words"):
+    for text in (" ".join(["word"] * 31), "First sentence. Second sentence.",
+                 "- list item", "The description caused the answer change."):
+        memory = CompactFeedbackMemory(
+            runtime_condition="A chart is visible.",
+            description_change=text, effect="wrong_to_correct",
+            attribution="unresolved")
+        assert memory.description_change == text
+    with pytest.raises(ValueError, match="non-empty"):
         CompactFeedbackMemory(
-            runtime_condition=" ".join(["word"] * 31),
+            runtime_condition="",
             description_change="Describe visible evidence.",
             effect="wrong_to_correct", attribution="unresolved")
-    for text in ("First sentence. Second sentence.", "- list item",
-                 "The description caused the answer change."):
-        with pytest.raises(ValueError):
-            CompactFeedbackMemory(
-                runtime_condition="A chart is visible.",
-                description_change=text, effect="wrong_to_correct",
-                attribution="unresolved")
 
 
 def test_grounding_wins_and_noop_invalid_are_deterministic():
@@ -235,6 +244,65 @@ def test_provider_authored_episode_memory_is_one_per_episode_and_deduplicated(
         str(tmp_path / "bank"), "parent-1") == (record,)
     assert load_parent_feedback_memory_bank(
         str(tmp_path / "bank"), "another-parent") == ()
+
+
+def test_memories_accumulate_across_successive_promotions(tmp_path):
+    """The bank is parent-scoped, so promotion must not empty it.
+
+    Under always-promote every iteration opens a new scope. Without carry-over
+    the updater's history would be empty on every single iteration.
+    """
+    bank = str(tmp_path / "bank")
+    episode = episode_fixture()
+    feedback = DeterministicMockEpisodeFeedbackGenerator().generate(episode)
+
+    def _append(parent, iteration, candidate_suffix):
+        record = build_episode_feedback_memory_record(
+            feedback=feedback, episode=episode, iteration_id=iteration,
+            parent_meta_prompt_id=parent)
+        record = dataclasses.replace(
+            record, candidate_id=f"delta-{candidate_suffix}")
+        record = dataclasses.replace(
+            record, memory_id=f"episode_memory_{parent}_{candidate_suffix}")
+        return append_parent_feedback_memory_bank(bank, parent, (record,))
+
+    _append("parent-1", "iteration-1", "a")
+    carried = carry_over_parent_feedback_memory_bank(
+        bank, source_parent_meta_prompt_id="parent-1",
+        target_parent_meta_prompt_id="parent-2")
+    assert carried["record_count"] == 1
+    assert carried["source_parent_meta_prompt_id"] == "parent-1"
+
+    _append("parent-2", "iteration-2", "b")
+    second = carry_over_parent_feedback_memory_bank(
+        bank, source_parent_meta_prompt_id="parent-2",
+        target_parent_meta_prompt_id="parent-3")
+    assert second["record_count"] == 2
+
+    rows = load_parent_feedback_memory_bank(bank, "parent-3")
+    assert [item.iteration_id for item in rows] == ["iteration-1", "iteration-2"]
+    assert all(item.parent_meta_prompt_id == "parent-3" for item in rows)
+    # Two rebases must still name the iteration-1 scope the memory came from.
+    assert rows[0].metadata["origin_parent_meta_prompt_id"] == "parent-1"
+    assert rows[0].metadata["origin_memory_id"] == "episode_memory_parent-1_a"
+
+    # A resumed run may repeat the carry-over and must land on the same bank.
+    repeat = carry_over_parent_feedback_memory_bank(
+        bank, source_parent_meta_prompt_id="parent-2",
+        target_parent_meta_prompt_id="parent-3")
+    assert repeat["added_memory_ids"] == []
+    assert repeat["bank_sha256"] == second["bank_sha256"]
+
+    selected, _manifest = select_historical_feedback_memories(
+        rows, current_iteration_id="iteration-3")
+    assert len(selected) == 2
+
+
+def test_carry_over_refuses_a_self_referential_parent(tmp_path):
+    with pytest.raises(CompactFeedbackMemoryError):
+        carry_over_parent_feedback_memory_bank(
+            str(tmp_path / "bank"), source_parent_meta_prompt_id="parent-1",
+            target_parent_meta_prompt_id="parent-1")
 
 
 def test_historical_selection_excludes_current_and_uses_recent_stable_prefix():

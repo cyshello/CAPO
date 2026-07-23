@@ -127,16 +127,16 @@ def _require_optional_str(value: str | None, name: str) -> None:
 
 
 def _require_compact_memory_text(value: str, name: str) -> None:
+    """Only that the memory exists.
+
+    Length, sentence count and causal wording are shaped by the episode-feedback
+    prompt, not enforced here. Style rules on generated prose fail
+    probabilistically — they read words, not meaning, so a memory that obeys the
+    intent ("no QA improved") is rejected for containing a banned token, and a
+    single rejection used to end a multi-iteration run at the one stage that has
+    no retry.
+    """
     _require_nonempty_str(value, name)
-    if len(re.findall(r"\b[\w'-]+\b", value, flags=re.UNICODE)) > 30:
-        raise ValueError(f"{name} exceeds 30 words")
-    if "\n" in value or re.search(r"(?:```|^\s*[-*#>]\s)", value):
-        raise ValueError(f"{name} must be one plain-text sentence")
-    if len(re.findall(r"[.!?](?=\s|$)", value)) > 1:
-        raise ValueError(f"{name} must contain at most one sentence")
-    if re.search(r"\b(?:caused|led\s+to|corrected|resulted\s+in)\b",
-                 value, flags=re.IGNORECASE):
-        raise ValueError(f"{name} contains prohibited causal wording")
 
 
 @dataclass(frozen=True)
@@ -316,6 +316,22 @@ class EpisodeFeedbackEvidence:
         _freeze_opaque_json(self, "confidence")
 
 
+EPISODE_FEEDBACK_ATTRIBUTION_STATUSES = (
+    "supported",
+    "trajectory_confounded",
+    "no_changed_caption_exposure",
+    "insufficient_evidence",
+)
+
+# The fields a transferable lesson is made of. They stand or fall together:
+# either the attribution is supported and all four are present, or the
+# generator abstained and all four are null.
+EPISODE_FEEDBACK_STRATEGY_FIELDS = (
+    "observable_trigger", "caption_operation",
+    "recommended_strategy_change", "compact_memory_text",
+)
+
+
 @dataclass(frozen=True)
 class EpisodeFeedback:
     feedback_id: str
@@ -324,19 +340,31 @@ class EpisodeFeedback:
     observations: tuple[EpisodeFeedbackEvidence, ...]
     counterevidence: tuple[EpisodeFeedbackEvidence, ...]
     generator_diagnosis: str
-    recommended_strategy_change: str
+    # Null whenever the generator abstains: an unsupported attribution must not
+    # be dressed up as a transferable rule.
+    recommended_strategy_change: str | None
     confidence: Any
     compact_memory_text: str | None = None
+    attribution_status: str = "supported"
+    observable_trigger: str | None = None
+    caption_operation: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.feedback_id, "EpisodeFeedback.feedback_id")
         _require_nonempty_str(self.episode_id, "EpisodeFeedback.episode_id")
-        for name in (
-            "outcome_summary", "generator_diagnosis",
-            "recommended_strategy_change",
-        ):
+        for name in ("outcome_summary", "generator_diagnosis"):
             if not isinstance(getattr(self, name), str):
                 raise TypeError(f"EpisodeFeedback.{name} must be a string")
+        if self.attribution_status not in EPISODE_FEEDBACK_ATTRIBUTION_STATUSES:
+            raise ValueError(
+                "EpisodeFeedback.attribution_status must be one of "
+                f"{EPISODE_FEEDBACK_ATTRIBUTION_STATUSES}")
+        for name in ("recommended_strategy_change", "observable_trigger",
+                     "caption_operation"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(
+                    f"EpisodeFeedback.{name} must be a string or None")
         for name in ("observations", "counterevidence"):
             value = getattr(self, name)
             if not isinstance(value, tuple) or any(
@@ -551,7 +579,10 @@ def episode_feedback_from_json(data: Mapping[str, Any]) -> EpisodeFeedback:
         generator_diagnosis=data["generator_diagnosis"],
         recommended_strategy_change=data["recommended_strategy_change"],
         confidence=data["confidence"],
-        compact_memory_text=data.get("compact_memory_text"))
+        compact_memory_text=data.get("compact_memory_text"),
+        attribution_status=data.get("attribution_status", "supported"),
+        observable_trigger=data.get("observable_trigger"),
+        caption_operation=data.get("caption_operation"))
 
 
 def episode_feedback_memory_record_from_json(

@@ -220,16 +220,79 @@ def test_mock_updater_deterministically_supports_no_update_and_update():
     assert updated.candidate_status == "provisional"
 
 
-def test_unknown_supporting_feedback_id_is_rejected():
+class _ScriptedBackend:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.systems = []
+
+    def __call__(self, system, user):
+        self.systems.append(system)
+        return self.replies[min(len(self.systems) - 1, len(self.replies) - 1)]
+
+
+_MALFORMED_RESPONSE = '{"decision": "update"}'  # missing required fields
+_CLEAN_CANDIDATE = "Track each speaker consistently across the segment."
+
+
+def test_a_rejected_candidate_gets_one_corrective_retry():
+    """A malformed response must not end a multi-iteration run."""
+    backend = _ScriptedBackend([
+        _MALFORMED_RESPONSE,
+        dumps_canonical(response([], candidate=_CLEAN_CANDIDATE)),
+    ])
+    result = LLMMetaPromptUpdater(
+        backend=backend, updater_policy_version=POLICY).update(
+            parent_fixture(), feedback_fixtures())
+
+    assert len(backend.systems) == 2
+    assert "was rejected" in backend.systems[1]
+    assert result.decision.decision == "update"
+    assert result.decision.candidate_meta_prompt == _CLEAN_CANDIDATE
+
+
+def test_a_twice_rejected_candidate_becomes_no_update():
+    backend = _ScriptedBackend([_MALFORMED_RESPONSE])
+    result = LLMMetaPromptUpdater(
+        backend=backend, updater_policy_version=POLICY).update(
+            parent_fixture(), feedback_fixtures())
+
+    assert len(backend.systems) == 2
+    assert result.decision.decision == "no_update"
+    assert result.decision.candidate_meta_prompt is None
+    assert result.candidate_meta_prompt_id is None
+    # both rejected responses stay auditable
+    assert "rejected_first_response" in result.raw_response
+    assert "rejected_retry_response" in result.raw_response
+
+
+def test_invented_supporting_feedback_ids_are_dropped():
+    """The request exposes no identifiers, so any the model returns cite nothing.
+
+    The strict response schema still requires the field, so a model with
+    nothing to cite fills it with positional inventions; keeping them would
+    fail the whole update over a field the harness does not need.
+    """
     parent = parent_fixture()
     feedbacks = feedback_fixtures()
     request = build_meta_prompt_update_request(
         parent, feedbacks, updater_policy_version=POLICY)
-    value = response(["unknown-feedback"])
-    with pytest.raises(
-            MetaPromptUpdaterParseError, match="unknown feedback"):
-        parse_meta_prompt_update_response(
-            dumps_canonical(value), request=request, feedbacks=feedbacks)
+    decision, _, _ = parse_meta_prompt_update_response(
+        dumps_canonical(response(["0", "1", "unknown-feedback"])),
+        request=request, feedbacks=feedbacks)
+    assert decision.supporting_feedback_ids == ()
+    assert decision.decision == "update"
+
+
+def test_real_supporting_feedback_ids_survive():
+    parent = parent_fixture()
+    feedbacks = feedback_fixtures()
+    request = build_meta_prompt_update_request(
+        parent, feedbacks, updater_policy_version=POLICY)
+    real = feedbacks[0].feedback_id
+    decision, _, _ = parse_meta_prompt_update_response(
+        dumps_canonical(response([real, "0"])),
+        request=request, feedbacks=feedbacks)
+    assert decision.supporting_feedback_ids == (real,)
 
 
 @pytest.mark.parametrize("raw", (

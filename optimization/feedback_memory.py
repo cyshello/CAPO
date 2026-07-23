@@ -43,6 +43,8 @@ COMPACT_FEEDBACK_MEMORY_POLICY_VERSION = \
     "deterministic_grounded_compact_feedback_memory_v1"
 EPISODE_MEMORY_BANK_SCHEMA_VERSION = "episode_feedback_memory_bank_v2"
 EPISODE_MEMORY_RECORD_POLICY_VERSION = "provider_authored_episode_memory_v1"
+EPISODE_MEMORY_CARRY_OVER_POLICY_VERSION = \
+    "rebase_parent_scoped_episode_memory_on_promotion_v1"
 
 _WORD_RE = re.compile(r"\b[\w'-]+\b", flags=re.UNICODE)
 _CAUSAL_RE = re.compile(
@@ -284,9 +286,10 @@ def _runtime_condition(
     identifier_replacements: Mapping[str, str],
 ) -> str:
     candidate = None
-    if not _contains_exact_identifier(
-            feedback.recommended_strategy_change, identifier_replacements):
-        candidate = _safe_sentence(feedback.recommended_strategy_change)
+    rule = feedback.recommended_strategy_change
+    if rule is not None and not _contains_exact_identifier(
+            rule, identifier_replacements):
+        candidate = _safe_sentence(rule)
     if candidate and re.match(
             r"^(?:if|when|while|during|where)\b", candidate,
             flags=re.IGNORECASE):
@@ -393,9 +396,10 @@ def build_compact_feedback_memories(
                     *feedback.observations, *feedback.counterevidence)):
                 conflicts.append(
                     "feedback cites segment change while captions match")
-            feedback_prose = " ".join((
-                feedback.outcome_summary, feedback.generator_diagnosis,
-                feedback.recommended_strategy_change))
+            feedback_prose = " ".join(
+                item for item in (
+                    feedback.outcome_summary, feedback.generator_diagnosis,
+                    feedback.recommended_strategy_change) if item)
             if attribution != "direct" and _CAUSAL_RE.search(feedback_prose):
                 conflicts.append(
                     "feedback uses causal wording without direct trajectory grounding")
@@ -737,6 +741,76 @@ def initialize_parent_feedback_memory_bank(
         return json.loads(Path(pointer_path).read_text(encoding="utf-8"))
     return append_parent_feedback_memory_bank(
         bank_directory, parent_meta_prompt_id, ())
+
+
+def rebase_episode_feedback_memory_record(
+    record: EpisodeFeedbackMemoryRecord,
+    *,
+    parent_meta_prompt_id: str,
+) -> EpisodeFeedbackMemoryRecord:
+    """Re-scope one memory to a new parent without touching its memory text.
+
+    The bank is parent-scoped, so a promoted meta-prompt starts a new scope.
+    Carrying a memory across that boundary re-derives the scoped ``memory_id``
+    and keeps the first origin it was rebased from, so a memory that survives
+    several promotions still points back at the iteration that produced it.
+    """
+    if not isinstance(record, EpisodeFeedbackMemoryRecord):
+        raise TypeError("record must be an EpisodeFeedbackMemoryRecord")
+    if not isinstance(parent_meta_prompt_id, str) or not parent_meta_prompt_id:
+        raise CompactFeedbackMemoryError("parent_meta_prompt_id is required")
+    if record.parent_meta_prompt_id == parent_meta_prompt_id:
+        return record
+    identity = {
+        "parent_meta_prompt_id": parent_meta_prompt_id,
+        "episode_id": record.episode_id,
+        "candidate_id": record.candidate_id,
+    }
+    metadata = dict(record.metadata)
+    metadata.setdefault(
+        "origin_parent_meta_prompt_id", record.parent_meta_prompt_id)
+    metadata.setdefault("origin_memory_id", record.memory_id)
+    metadata["carry_over_policy_version"] = \
+        EPISODE_MEMORY_CARRY_OVER_POLICY_VERSION
+    return EpisodeFeedbackMemoryRecord(
+        memory_id="episode_memory_" + sha256_json(identity)[:20],
+        parent_meta_prompt_id=parent_meta_prompt_id,
+        iteration_id=record.iteration_id,
+        episode_id=record.episode_id,
+        candidate_id=record.candidate_id,
+        feedback_id=record.feedback_id,
+        memory_text=record.memory_text,
+        metadata=metadata,
+    )
+
+
+def carry_over_parent_feedback_memory_bank(
+    bank_directory: str,
+    *,
+    source_parent_meta_prompt_id: str,
+    target_parent_meta_prompt_id: str,
+) -> Mapping[str, Any]:
+    """Seed the promoted meta-prompt's bank with the parent's memories.
+
+    Without this the bank empties on every promotion, so the updater would
+    only ever see the current iteration's feedback. Rebasing is deterministic
+    and de-duplicates on ``(episode_id, candidate_id)``, so a resumed run may
+    call it again and reach the same snapshot.
+    """
+    if source_parent_meta_prompt_id == target_parent_meta_prompt_id:
+        raise CompactFeedbackMemoryError(
+            "carry-over source and target parents are identical")
+    carried = tuple(
+        rebase_episode_feedback_memory_record(
+            record, parent_meta_prompt_id=target_parent_meta_prompt_id)
+        for record in load_parent_feedback_memory_bank(
+            bank_directory, source_parent_meta_prompt_id))
+    pointer = append_parent_feedback_memory_bank(
+        bank_directory, target_parent_meta_prompt_id, carried)
+    return {**pointer,
+            "carry_over_policy_version": EPISODE_MEMORY_CARRY_OVER_POLICY_VERSION,
+            "source_parent_meta_prompt_id": source_parent_meta_prompt_id,
+            "carried_memory_ids": [item.memory_id for item in carried]}
 
 
 def archive_parent_feedback_memory_bank(

@@ -37,6 +37,9 @@ def valid_response(
         }],
         "counterevidence": [],
         "generator_diagnosis": "A local caption change may have helped.",
+        "attribution_status": "supported",
+        "observable_trigger": "when a hand-held object stays in frame",
+        "caption_operation": "name the object and what it is doing",
         "recommended_strategy_change": "Retain the locally supported detail.",
         "confidence": "Local evidence only.",
         "compact_memory_text": "Visible detail was added.\nThe stored result improved.",
@@ -72,7 +75,12 @@ def request(tmp_path):
 def test_prompt_is_one_repository_owned_lean_file():
     root = Path(__file__).parents[1] / "optimization" / "prompts"
     assert EPISODE_FEEDBACK_SYSTEM_INSTRUCTION == (
-        root / "episode_feedback_system_v7.txt").read_text().strip()
+        root / "episode_feedback_system_v12.txt").read_text().strip()
+    assert not (root / "episode_feedback_system_v11.txt").exists()
+    assert not (root / "episode_feedback_system_v10.txt").exists()
+    assert not (root / "episode_feedback_system_v9.txt").exists()
+    assert not (root / "episode_feedback_system_v8.txt").exists()
+    assert not (root / "episode_feedback_system_v7.txt").exists()
     assert not (root / "episode_feedback_system_v6_lean.txt").exists()
     assert not (root / "episode_feedback_system_v5.txt").exists()
     assert not (root / "episode_feedback_model_compact_addendum_v1.txt").exists()

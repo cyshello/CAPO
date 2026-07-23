@@ -119,9 +119,13 @@ def test_strict_output_schema_excludes_feedback_id():
     assert "feedback_id" not in schema["required"]
     assert set(schema["properties"]) == {
         "episode_id", "outcome_summary", "observations", "counterevidence",
-        "generator_diagnosis", "recommended_strategy_change", "confidence",
+        "generator_diagnosis", "attribution_status", "observable_trigger",
+        "caption_operation", "recommended_strategy_change", "confidence",
         "compact_memory_text",
     }
+    for nullable in ("observable_trigger", "caption_operation",
+                     "recommended_strategy_change", "compact_memory_text"):
+        assert schema["properties"][nullable]["type"] == ["string", "null"]
     assert schema["properties"]["compact_memory_text"]["type"] == [
         "string", "null"]
 

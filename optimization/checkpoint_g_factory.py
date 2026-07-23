@@ -19,6 +19,9 @@ from surrogate_rollout.captioning.history_aware_baseline import (
     HistoryAwareBaselineCaptionViewBuilder,
 )
 from surrogate_rollout.evaluation.dvd_qa import ensure_backend
+from surrogate_rollout.optimization.meta_prompt_update_execution import (
+    UPDATER_MAXIMUM_PROVIDER_CALLS,
+)
 from surrogate_rollout.optimization.confirmation_evaluator import (
     HistoryAwareDVDConfirmationEvaluator,
 )
@@ -117,17 +120,17 @@ class _OpenAITransport:
         return result
 
 
-class _SingleCallOpenAITransport(_OpenAITransport):
-    """Preserve the updater's one-call execution contract."""
+class _BoundedUpdaterOpenAITransport(_OpenAITransport):
+    """The updater's provider budget: one call plus one corrective retry."""
 
     def __init__(self, **kwargs: Any):
         super().__init__(**kwargs)
-        self._called = False
+        self.call_count = 0
 
     def request(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
-        if self._called:
+        if self.call_count >= UPDATER_MAXIMUM_PROVIDER_CALLS:
             raise RuntimeError("provider transport call budget exhausted")
-        self._called = True
+        self.call_count += 1
         return super().request(body)
 
 
@@ -227,7 +230,7 @@ def build_checkpoint_g_components(args):
     updater_model = _real_identity(
         _required(updater_cfg, "model_id"), "updater.model_id")
     updater_counter, updater_tokenizer_identity = _exact_counter(updater_model)
-    updater_transport = _SingleCallOpenAITransport(
+    updater_transport = _BoundedUpdaterOpenAITransport(
         endpoint=endpoint, api_key=api_key, timeout_seconds=timeout)
     updater_backend = OpenAICompatibleMetaPromptUpdaterBackend(
         provider="openai_api", model_id=updater_model,

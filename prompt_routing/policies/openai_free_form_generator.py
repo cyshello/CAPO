@@ -13,7 +13,9 @@ one caption per block. A hosted model keeps the two roles separate.
 Paid: normally one vision request per segment (up to three identical transport
 attempts under the configured retry policy). Frames follow the shared frame
 policy — a 0.5 fps subset at half resolution — so a generator request carries
-five small images instead of ten full-size ones at the current 1 FPS decode.
+a few small images instead of ten full-size ones at the current 1 FPS decode.
+Those images dominate the request's token cost, so the subsample is the lever
+that controls it.
 """
 from __future__ import annotations
 
@@ -23,6 +25,11 @@ import os
 import time
 from typing import Any, Mapping, Sequence
 
+from surrogate_rollout import config
+from surrogate_rollout.optimization.openai_chat_model_profile import (
+    adapt_chat_completions_body,
+    is_reasoning_chat_model,
+)
 from surrogate_rollout.prompt_routing import static_meta_replace_body as smrb
 from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
     FREE_FORM_ROUTING_MODE,
@@ -38,6 +45,9 @@ DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_RETRIES = 2
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TIMEOUT_SECONDS = 300
+# Observed: gpt-5-mini at reasoning_effort="medium" returns an empty completion
+# at 512 output tokens and a full instruction at 4096.
+REASONING_OUTPUT_TOKEN_FLOOR = 2048
 PROVIDER = "openai"
 
 
@@ -118,18 +128,32 @@ class OpenAIFreeFormInstructionGenerator:
         if not self.api_key:
             raise FreeFormGenerationError(
                 "the OpenAI free-form generator requires OPENAI_API_KEY")
+        # Checked here rather than in __init__: callers build a generator with
+        # default settings and replace it with the configured one a line later,
+        # so construction is not where the budget is known. A reasoning model
+        # spends this budget on hidden reasoning before it writes anything, and
+        # an empty completion is a hard failure once per segment.
+        effort = config.GENERATOR_REASONING_EFFORT
+        if effort is not None and is_reasoning_chat_model(self.model_id) and \
+                self.max_tokens < REASONING_OUTPUT_TOKEN_FLOOR:
+            raise FreeFormGenerationError(
+                f"{self.model_id} with reasoning_effort={effort!r} needs at "
+                f"least {REASONING_OUTPUT_TOKEN_FLOOR} output tokens; "
+                f"{self.max_tokens} leaves nothing for the instruction after "
+                "the reasoning")
 
         content: list[dict[str, Any]] = [
             {"type": "image_url", "image_url": {"url": _data_url(path)}}
             for path in frames
         ]
         content.append({"type": "text", "text": prompt})
-        payload = {
+
+        payload = adapt_chat_completions_body({
             "model": self.model_id,
             "messages": [{"role": "user", "content": content}],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-        }
+        }, reasoning_effort=config.GENERATOR_REASONING_EFFORT)
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
 

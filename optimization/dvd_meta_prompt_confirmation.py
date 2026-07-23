@@ -22,8 +22,11 @@ from surrogate_rollout.optimization.confirmation_evaluator import (
     _write_immutable,
 )
 from surrogate_rollout.optimization.prompt_delta_iteration import (
+    MetaPromptConfirmationCase,
     MetaPromptConfirmationOutcome,
     MetaPromptConfirmationRequest,
+    MetaPromptMeasurementOutcome,
+    MetaPromptMeasurementResult,
     PairedMetaPromptConfirmationResult,
 )
 from surrogate_rollout.optimization.schemas import MetaPromptVersion
@@ -37,6 +40,11 @@ from surrogate_rollout.prompt_routing.schemas import (
     dumps_canonical,
 )
 from surrogate_rollout.schemas import sha256_json
+
+
+def _plain(value: Any) -> Any:
+    """JSON-vocabulary copy of a dataclass or mapping."""
+    return json.loads(dumps_canonical(value))
 
 
 @dataclass(frozen=True)
@@ -237,6 +245,129 @@ class DVDMetaPromptConfirmationEvaluator:
                 rows.append(persisted)
         return tuple(rows)
 
+    def measure(
+        self, *, meta_prompt: MetaPromptVersion,
+        cases: Sequence[MetaPromptConfirmationCase],
+        confirmation_set_id: str, model_identity: str,
+        decoding_settings: Mapping[str, Any], cache_reset_identity: str,
+        evaluation_pipeline_identity: str, output_directory: str,
+    ) -> MetaPromptMeasurementResult:
+        """Score one meta-prompt on the held-out cases. No comparison, no decision.
+
+        Half the work of `evaluate`: one caption state and one QA pass instead
+        of a parent/candidate pair.
+        """
+        case_rows = tuple(cases)
+        if not case_rows:
+            raise ConfirmationEvaluationError("measurement requires cases")
+        expected = {item.video_id for item in case_rows}
+        available = {video.video_id for video in self.confirmation_videos}
+        if expected - available:
+            raise ConfirmationEvaluationConflictError(
+                "measurement cases reference videos outside the confirmation "
+                f"cohort: {sorted(expected - available)}")
+        output = os.path.abspath(output_directory)
+        manifest_path = os.path.join(output, "dvd_measurement_manifest.json")
+        request_hash = sha256_json(json.loads(dumps_canonical({
+            "meta_prompt": meta_prompt, "cases": case_rows,
+            "confirmation_set_id": confirmation_set_id,
+            "model_identity": model_identity,
+            "decoding_settings": decoding_settings,
+            "cache_reset_identity": cache_reset_identity,
+            "evaluation_pipeline_identity": evaluation_pipeline_identity,
+            "configuration": self.configuration_identity,
+        })))
+        if os.path.isfile(manifest_path):
+            manifest = _read_json(manifest_path)
+            if manifest.get("status") != "completed" or \
+                    manifest.get("request_hash") != request_hash:
+                raise ConfirmationEvaluationConflictError(
+                    "completed DVD measurement belongs to different inputs")
+            return MetaPromptMeasurementResult(
+                measurement_id=manifest["measurement_id"],
+                meta_prompt_id=meta_prompt.meta_prompt_id,
+                confirmation_set_id=confirmation_set_id,
+                model_identity=model_identity,
+                decoding_settings=decoding_settings,
+                cache_reset_identity=cache_reset_identity,
+                evaluation_pipeline_identity=evaluation_pipeline_identity,
+                outcomes=tuple(MetaPromptMeasurementOutcome(**item)
+                               for item in manifest["outcomes"]))
+
+        self.call_count += 1
+        evaluator_dir = os.path.join(output, "dvd_runtime")
+        bundle_path, bundle = self.evaluator._materialize_bundle(
+            confirmation_videos=self.confirmation_videos,
+            scaffold=self.scaffold, contract=self.contract,
+            output_dir=evaluator_dir)
+        state = self.evaluator._caption_state(
+            state_name="active", bundle=bundle,
+            bank_version=self.bank_version, router_version=self.router_version,
+            scaffold=self.scaffold, contract=self.contract,
+            output_dir=evaluator_dir,
+            free_form_generator=self._generator(meta_prompt))
+        rows = {row["question_id"]: row for row in self._run_qas(
+            state_name="active", bundle=bundle, state=state,
+            output_directory=evaluator_dir)}
+
+        outcomes = []
+        rich = []
+        for case in case_rows:
+            row = rows[case.qa_id]
+            error = _error_text(row["errors"])
+            outcomes.append(MetaPromptMeasurementOutcome(
+                case_id=case.case_id, video_id=case.video_id,
+                qa_id=case.qa_id, correct=row["is_correct"], error=error))
+            rich.append({
+                "case_id": case.case_id, "video_id": case.video_id,
+                "qa_id": case.qa_id, "prediction": row["prediction"],
+                "is_correct": row["is_correct"], "execution_error": error,
+                "prompt_artifact_ref": row["routing_manifest_path"],
+                "caption_artifact_ref": row["captions_path"],
+                "cache_identity_hashes": row["cache_identity_hashes"],
+                "runtime_statistics": {
+                    "caption_calls": row["caption_calls"],
+                    "caption_cache_hits": row["caption_cache_hits"],
+                    "qa_latency_seconds": row["latency_seconds"],
+                    "qa_run_directory": row["qa_run_directory"],
+                },
+            })
+        evaluated = [item for item in outcomes if item.correct is not None]
+        measurement_id = "measurement_" + sha256_json({
+            "request_hash": request_hash,
+            "outcomes": [_plain(item) for item in outcomes],
+        })[:20]
+        _write_immutable(manifest_path, {
+            "schema_version": "dvd_meta_prompt_measurement_manifest_v1",
+            "status": "completed",
+            "measurement_id": measurement_id,
+            "request_hash": request_hash,
+            "meta_prompt_id": meta_prompt.meta_prompt_id,
+            "confirmation_set_id": confirmation_set_id,
+            "decision_free": True,
+            "configuration": _plain(self.configuration_identity),
+            "bundle_path": bundle_path,
+            "outcomes": [_plain(item) for item in outcomes],
+            "case_results": rich,
+            "aggregate": {
+                "case_count": len(case_rows),
+                "evaluated_qa_count": len(evaluated),
+                "accuracy": (sum(1 for item in outcomes if item.correct)
+                             / len(case_rows)),
+                "execution_failures": [item.qa_id for item in outcomes
+                                       if item.error],
+            },
+        })
+        return MetaPromptMeasurementResult(
+            measurement_id=measurement_id,
+            meta_prompt_id=meta_prompt.meta_prompt_id,
+            confirmation_set_id=confirmation_set_id,
+            model_identity=model_identity,
+            decoding_settings=decoding_settings,
+            cache_reset_identity=cache_reset_identity,
+            evaluation_pipeline_identity=evaluation_pipeline_identity,
+            outcomes=tuple(outcomes))
+
     def evaluate(
         self, *, request: MetaPromptConfirmationRequest,
         parent: MetaPromptVersion, candidate: MetaPromptVersion,
@@ -427,11 +558,17 @@ class LazyDVDMetaPromptConfirmationEvaluator:
     def configuration_identity(self) -> Mapping[str, Any]:
         return self._configuration_identity
 
-    def evaluate(self, **kwargs):
+    def _resolved(self) -> "DVDMetaPromptConfirmationEvaluator":
         if self._delegate is None:
             delegate = self._factory()
             if not isinstance(delegate, DVDMetaPromptConfirmationEvaluator):
                 raise TypeError(
                     "lazy factory must return DVDMetaPromptConfirmationEvaluator")
             self._delegate = delegate
-        return self._delegate.evaluate(**kwargs)
+        return self._delegate
+
+    def evaluate(self, **kwargs):
+        return self._resolved().evaluate(**kwargs)
+
+    def measure(self, **kwargs):
+        return self._resolved().measure(**kwargs)

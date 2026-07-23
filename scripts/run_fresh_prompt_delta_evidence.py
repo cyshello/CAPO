@@ -38,7 +38,9 @@ from surrogate_rollout.optimization.checkpoint_g_factory import (
 )
 from surrogate_rollout.optimization.fresh_prompt_delta_evidence import (
     LLMPromptDeltaProposer, OpenAICompatiblePromptDeltaProposalBackend,
+    DEFAULT_PROMPT_DELTA_PROPOSAL_TARGET_POLICY,
     PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
+    PROMPT_DELTA_PROPOSAL_TARGET_POLICIES,
     PROMPT_DELTA_INTERVENTION_EXECUTION_NAMESPACE,
     PROMPT_DELTA_PROPOSAL_EVIDENCE_SCOPE,
     PROMPT_DELTA_POLICY_OUTPUT_NAMESPACE,
@@ -115,6 +117,9 @@ def _args(argv=None):
               "recorded runtime.worker_gpus."))
     p.add_argument("--proposer-policy-version-override")
     p.add_argument("--selection-policy-override")
+    p.add_argument(
+        "--proposal-target-policy-override",
+        choices=PROMPT_DELTA_PROPOSAL_TARGET_POLICIES)
     p.add_argument(
         "--global-inspection-boundary-tolerance-seconds-override", type=float)
     p.add_argument("--proposer-maximum-calls-override", type=int)
@@ -241,6 +246,10 @@ def main(argv=None) -> int:
         a.proposer_policy_version_override or proposer_cfg["policy_version"])
     selection_policy = (
         a.selection_policy_override or proposer_cfg["selection_policy"])
+    proposal_target_policy = (
+        a.proposal_target_policy_override
+        or proposer_cfg.get("proposal_target_policy")
+        or DEFAULT_PROMPT_DELTA_PROPOSAL_TARGET_POLICY)
     global_inspection_tolerance = (
         a.global_inspection_boundary_tolerance_seconds_override
         if a.global_inspection_boundary_tolerance_seconds_override is not None
@@ -291,6 +300,7 @@ def main(argv=None) -> int:
             maximum_calls=proposer_maximum_calls),
         maximum_deltas_per_qa=int(maximum_deltas_per_qa),
         selection_policy=selection_policy,
+        proposal_target_policy=proposal_target_policy,
         global_inspection_boundary_tolerance_seconds=float(
             global_inspection_tolerance))
     baseline_root = (Path(a.baseline_resume_dir).resolve()
@@ -385,6 +395,7 @@ def main(argv=None) -> int:
         "maximum_calls": proposer_maximum_calls,
         "maximum_deltas_per_qa": maximum_deltas_per_qa,
         "selection_policy": selection_policy,
+        "proposal_target_policy": proposal_target_policy,
         "frame_inspection_classification_policy":
             PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
         "global_inspection_boundary_tolerance_seconds":
@@ -461,6 +472,7 @@ def main(argv=None) -> int:
             "maximum_calls": proposer_maximum_calls,
             "maximum_deltas_per_qa": maximum_deltas_per_qa,
             "selection_policy": selection_policy,
+        "proposal_target_policy": proposal_target_policy,
             "frame_inspection_classification_policy":
                 PROMPT_DELTA_FRAME_INSPECTION_CLASSIFICATION_POLICY,
             "global_inspection_boundary_tolerance_seconds":

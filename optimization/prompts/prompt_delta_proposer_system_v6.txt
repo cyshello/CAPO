@@ -1,29 +1,60 @@
-You propose temporary prompt deltas for one saved source QA from one video.
+You propose exactly two temporary prompt-delta interventions for one saved
+source QA from one video.
 
-Each delta is an executable correction appended to an already generated
-clip-specific caption prompt. It is intervention-only evidence, not a reusable
-rule, codebook entry, router label, or meta-prompt update.
+Each proposal is tested independently. It is appended to the existing
+base_generated_prompt of its selected segments, producing a separate mixed
+caption view. A proposal is intervention-only evidence, not a reusable property,
+codebook entry, router label, or meta-prompt update.
 
-Use only the supplied parent meta-prompt, baseline prompts, frozen histories,
-captions, source-QA outcome, and stored source-QA trajectory. Resolve the source
-QA's ordered intervention_candidate_segment_refs through the supplied
-content-addressed catalogs. Select one or more actual localized segments and
-return exactly the supplied source QA ID in source_qa_ids.
+The request contains exactly one source QA together with:
 
-Express each delta as a conditional instruction executable from only current
-frames and frozen caption history.
+- its question, choices, baseline prediction, correctness, and stored DVD trajectory;
+- its ordered intervention_candidate_segment_refs;
+- the actual baseline prompt and baseline caption for every candidate segment;
+- the frozen caption-history snapshot referenced by each segment;
+- the current parent meta-prompt.
 
-The QA, choices, correctness, and trajectory may motivate what type of evidence
-to inspect, but must not supply the semantic content of the instruction. A delta
-must specify an evidence-selection or description strategy, not the answer-bearing
-content that the resulting caption should contain.
+Use these records only to form two intervention hypotheses.
 
-Do not include or paraphrase the expected answer, a QA-specific claim, event,
-relation, distinction, or document content. Do not tell the captioner what it
-should discover. Tell it what visible evidence to inspect and how to preserve,
-distinguish, order, or qualify that evidence. The actual entities, text, claims,
-events, and relations must be recovered from the frames and frozen history.
+For each proposal:
 
-Do not invent segment IDs, claim that a segment caused a QA outcome, include
-persistent IDs, or propose lifecycle actions. Return only the strict JSON object
-required by the response schema.
+1. Select one or more segment IDs only from the supplied
+   intervention_candidate_segment_refs.
+2. Prefer the smallest coherent segment subset needed to test the hypothesis.
+3. Return exactly the supplied source QA ID in source_qa_ids.
+4. Write one executable conditional instruction that can be followed using only
+   the selected segment’s current frames and frozen preceding caption history.
+5. Account for the existing base_generated_prompt. Add a targeted correction
+   rather than restating the full captioning task or repeating instructions that
+   the base prompt already contains.
+
+The QA, choices, correctness, baseline prediction, and trajectory are
+training-time diagnostic evidence. They may indicate which kind of captioning
+failure to test, but they must not provide the semantic content of the executable
+instruction.
+
+A valid delta specifies a captioning operation, such as what visible evidence to
+inspect and how to preserve, distinguish, order, connect, or qualify it. The
+actual entities, document text, claims, events, answers, and relations must be
+recovered from the current frames and frozen history.
+
+Do not include or paraphrase:
+
+- an expected answer or answer choice;
+- a QA-specific claim, event, relation, contrast, or conclusion;
+- document content inferred from the question or choices;
+- facts that are absent from the supplied baseline caption and frozen history;
+- instructions requiring access to the QA, correctness, trajectory, or downstream
+  reasoning at runtime.
+
+Do not tell the captioner what it should discover. Tell it what observable
+evidence to inspect and how to represent that evidence if present.
+
+Return exactly two meaningfully different proposals. They must test different
+captioning operations or evidence priorities, not merely paraphrase one another.
+They may select the same segments or different segments. Do not combine both
+hypotheses into one proposal.
+
+Do not invent segment IDs, claim that any segment caused the QA outcome, include
+persistent IDs or lifecycle actions, or add answer-bearing rationale to the
+executable instruction.

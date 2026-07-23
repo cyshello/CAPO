@@ -16,10 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from surrogate_rollout import config
 from surrogate_rollout.optimization.episode_feedback import (
     classify_qa_transition,
 )
 from surrogate_rollout.optimization.schemas import (
+    EPISODE_FEEDBACK_ATTRIBUTION_STATUSES,
+    EPISODE_FEEDBACK_STRATEGY_FIELDS,
     EpisodeFeedback,
     InterventionEpisode,
     episode_feedback_from_json,
@@ -28,10 +31,18 @@ from surrogate_rollout.prompt_routing.schemas import dumps_canonical
 from surrogate_rollout.schemas import sha256_json, sha256_text
 
 
+from surrogate_rollout.optimization.compact_tool_evidence import (
+    build_compact_qa_evidence,
+)
+from surrogate_rollout.optimization.feedback_view import (
+    EPISODE_FEEDBACK_VIEW_VERSION,
+    build_feedback_view,
+)
+
 LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION = \
     "episode_feedback_request_v6_candidate_mixed_view_sibling_outcomes"
 EPISODE_FEEDBACK_RESPONSE_SCHEMA_VERSION = \
-    "episode_feedback_response_v5_mixed_view_memory"
+    "episode_feedback_response_v6_attribution_aware"
 
 QA_TRANSITION_SUMMARY_ORDER = (
     "correct_to_correct", "wrong_to_wrong", "wrong_to_correct",
@@ -54,7 +65,7 @@ def _load_prompt_text(filename: str) -> str:
 
 
 EPISODE_FEEDBACK_SYSTEM_INSTRUCTION = _load_prompt_text(
-    "episode_feedback_system_v7.txt")
+    "episode_feedback_system_v12.txt")
 
 
 class EpisodeFeedbackRequestError(ValueError):
@@ -902,8 +913,15 @@ def build_lean_episode_feedback_request(
     *,
     artifact_resolver: EpisodeFeedbackArtifactResolver,
     token_counter: Callable[[tuple[Mapping[str, str], ...]], int] | None = None,
+    compact_tool_evidence: bool = False,
+    feedback_view: bool = False,
 ) -> LeanEpisodeFeedbackRequest:
-    """Build the only active feedback request without lossy truncation."""
+    """Build the only active feedback request without lossy truncation.
+
+    `compact_tool_evidence` replaces the verbatim tool results with their
+    structurally compacted form and adds the baseline/intervention trajectory
+    difference. It is off by default, so existing requests are byte-identical.
+    """
     resolved_qas = artifact_resolver.resolve_qas(episode)
     if len(resolved_qas) != len(episode.qa_outcomes):
         raise EpisodeFeedbackRequestError(
@@ -920,6 +938,11 @@ def build_lean_episode_feedback_request(
 
     qas = []
     tool_call_count = 0
+    # One registry blob comes back for every QA of the same video; shared across
+    # the episode it is carried once and pointed at afterwards.
+    shared_evidence_units: dict[str, dict[str, Any]] = {}
+    compact_by_qa: dict[str, Any] = {}
+    trajectories_by_qa: dict[str, Any] = {}
     for outcome, qa in zip(episode.qa_outcomes, resolved_qas):
         if qa.get("qa_id") != outcome.qa_id or \
                 qa.get("is_source_qa") is not outcome.is_source_qa:
@@ -950,26 +973,56 @@ def build_lean_episode_feedback_request(
                 "gold_answer", "baseline_answer", "baseline_correct",
                 "intervention_answer", "intervention_correct", "transition")
         }
+        projected_trajectories: dict[str, Any] = {}
         for side, reference in (
                 ("baseline", outcome.baseline_trajectory_ref),
                 ("intervention", outcome.intervention_trajectory_ref)):
             compact = _project_tool_trajectory(qa[f"{side}_trajectory"], reference)
+            projected_trajectories[side] = compact
             calls = _lean_tool_calls(
                 compact, changed_segment_ids=changed_ids)
             projected[f"{side}_tool_calls"] = calls
             tool_call_count += len(calls)
+        if compact_tool_evidence or feedback_view:
+            # Opt-in: the same events, deduplicated and structurally cut, plus
+            # the retrieval/inspection difference between the two runs. The
+            # episode and the raw trajectories on disk are untouched.
+            evidence = build_compact_qa_evidence(
+                projected_trajectories["baseline"],
+                projected_trajectories["intervention"],
+                changed_segment_ids=changed_ids,
+                seen_units=shared_evidence_units,
+                qa_id=outcome.qa_id)
+            projected["baseline_tool_calls"] = evidence["baseline_tool_calls"]
+            projected["intervention_tool_calls"] = \
+                evidence["intervention_tool_calls"]
+            projected["trajectory_delta"] = evidence["trajectory_delta"]
+            projected["compact_tool_evidence_version"] = \
+                evidence["compact_tool_evidence_version"]
+            compact_by_qa[outcome.qa_id] = evidence
+            trajectories_by_qa[outcome.qa_id] = dict(projected_trajectories)
         qas.append(projected)
 
-    payload = json.loads(dumps_canonical({
-        "schema_version": LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION,
-        "episode": {
-            "episode_id": episode.episode_id,
-            "prompt_delta": _plain_json(episode.prompt_delta),
-            "qa_transition_summary": build_qa_transition_summary(episode),
-            "changed_captions": changed_captions,
-            "qas": qas,
-        },
-    }))
+    if feedback_view:
+        # The generator sees only the delta, the caption pairs, the QA
+        # outcomes, and one line per tool event. Everything the provenance
+        # audit needs stays in the compact evidence artifact.
+        payload = json.loads(dumps_canonical({
+            "schema_version": EPISODE_FEEDBACK_VIEW_VERSION,
+            **build_feedback_view(
+                episode, qas, compact_by_qa, trajectories_by_qa),
+        }))
+    else:
+        payload = json.loads(dumps_canonical({
+            "schema_version": LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION,
+            "episode": {
+                "episode_id": episode.episode_id,
+                "prompt_delta": _plain_json(episode.prompt_delta),
+                "qa_transition_summary": build_qa_transition_summary(episode),
+                "changed_captions": changed_captions,
+                "qas": qas,
+            },
+        }))
     user_request = dumps_canonical(payload)
     messages = (
         {"role": "system", "content": EPISODE_FEEDBACK_SYSTEM_INSTRUCTION},
@@ -1001,7 +1054,48 @@ _DETAILED_RESPONSE_FIELDS = {
     "episode_id", "outcome_summary", "observations", "counterevidence",
     "generator_diagnosis", "recommended_strategy_change", "confidence",
 }
+_ATTRIBUTION_RESPONSE_FIELDS = {
+    "attribution_status", "observable_trigger", "caption_operation",
+}
 _RESPONSE_FIELDS = _DETAILED_RESPONSE_FIELDS | {"compact_memory_text"}
+_ATTRIBUTION_AWARE_RESPONSE_FIELDS = (
+    _RESPONSE_FIELDS | _ATTRIBUTION_RESPONSE_FIELDS)
+_ACCEPTED_RESPONSE_FIELD_SETS = (
+    _DETAILED_RESPONSE_FIELDS,
+    _RESPONSE_FIELDS,
+    _DETAILED_RESPONSE_FIELDS | _ATTRIBUTION_RESPONSE_FIELDS,
+    _ATTRIBUTION_AWARE_RESPONSE_FIELDS,
+)
+
+
+def validate_attribution_contract(value: Mapping[str, Any]) -> None:
+    """The four strategy fields stand or fall with the attribution status.
+
+    A supported attribution must carry a complete lesson; any other status must
+    carry none of it. Nothing is repaired or defaulted here -- a response that
+    claims support while abstaining, or abstains while still proposing a rule,
+    is rejected outright.
+    """
+    status = value.get("attribution_status", "supported")
+    if status not in EPISODE_FEEDBACK_ATTRIBUTION_STATUSES:
+        raise ValueError(
+            "attribution_status must be one of "
+            f"{EPISODE_FEEDBACK_ATTRIBUTION_STATUSES}: {status!r}")
+    present = {name: value.get(name)
+               for name in EPISODE_FEEDBACK_STRATEGY_FIELDS}
+    if status == "supported":
+        missing = [name for name, item in present.items()
+                   if not isinstance(item, str) or not item.strip()]
+        if missing:
+            raise ValueError(
+                "attribution_status 'supported' requires non-empty "
+                f"{sorted(missing)}")
+        return
+    populated = [name for name, item in present.items() if item is not None]
+    if populated:
+        raise ValueError(
+            f"attribution_status {status!r} requires null "
+            f"{sorted(populated)}")
 _EVIDENCE_FIELDS = {
     "statement", "supporting_segment_ids", "supporting_qa_ids",
     "evidence_type", "confidence",
@@ -1020,17 +1114,25 @@ def parse_episode_feedback_response(
         if not isinstance(raw_response, str):
             raise TypeError("response must be a string")
         value = json.loads(raw_response)
-        if not isinstance(value, dict) or set(value) not in (
-                _DETAILED_RESPONSE_FIELDS, _RESPONSE_FIELDS):
+        if not isinstance(value, dict) or set(value) not in \
+                _ACCEPTED_RESPONSE_FIELD_SETS:
             raise ValueError(
-                "response must contain the detailed feedback fields and only "
-                "the optional compact_memory_text field")
+                "response must contain the detailed feedback fields, the "
+                "attribution fields, and only the optional compact_memory_text")
         compact_memory = value.get("compact_memory_text")
         if compact_memory is not None and not isinstance(compact_memory, str):
             raise TypeError("compact_memory_text must be a string or null")
         value["compact_memory_text"] = (
             compact_memory.strip() or None
             if isinstance(compact_memory, str) else None)
+        for name in ("observable_trigger", "caption_operation",
+                     "recommended_strategy_change"):
+            item = value.get(name)
+            if item is not None and not isinstance(item, str):
+                raise TypeError(f"{name} must be a string or null")
+            if isinstance(item, str):
+                value[name] = item.strip() or None
+        validate_attribution_contract(value)
         if value.get("episode_id") != episode.episode_id:
             raise ValueError("response episode_id does not match input episode")
         for collection_name in ("observations", "counterevidence"):
@@ -1126,6 +1228,8 @@ class LLMEpisodeFeedbackGenerator:
         response_provider: EpisodeFeedbackResponseProvider,
         artifact_resolver: EpisodeFeedbackArtifactResolver,
         policy_version: str,
+        compact_tool_evidence: bool = config.COMPACT_TOOL_EVIDENCE,
+        feedback_view: bool = config.EPISODE_FEEDBACK_VIEW,
     ) -> None:
         if not callable(response_provider):
             raise EpisodeFeedbackBackendConfigurationError(
@@ -1139,6 +1243,8 @@ class LLMEpisodeFeedbackGenerator:
         self.response_provider = response_provider
         self.artifact_resolver = artifact_resolver
         self.policy_version = policy_version
+        self.compact_tool_evidence = bool(compact_tool_evidence)
+        self.feedback_view = bool(feedback_view)
 
     def generate(self, episode: InterventionEpisode) -> EpisodeFeedback:
         return self.generate_with_trace(episode).feedback
@@ -1168,16 +1274,23 @@ class LLMEpisodeFeedbackGenerator:
                 "backend preflight must be callable")
         request = build_lean_episode_feedback_request(
             episode, artifact_resolver=self.artifact_resolver,
-            token_counter=token_counter)
+            token_counter=token_counter,
+            compact_tool_evidence=self.compact_tool_evidence,
+            feedback_view=self.feedback_view)
         if preflight is None:
             limit = metadata["context_limit_tokens"]
             observed = request.size_statistics.token_count
             if limit is not None and observed is not None and observed > limit:
-                sections = request.user_payload["episode"]
+                sections = request.user_payload.get(
+                    "episode", request.user_payload)
                 largest = tuple(sorted((
                     ("changed_captions", len(dumps_canonical(
-                        sections["changed_captions"]))),
-                    ("qas", len(dumps_canonical(sections["qas"]))),
+                        sections.get("changed_captions", [])))),
+                    ("qas", len(dumps_canonical(
+                        sections.get("qas",
+                                     sections.get("qa_outcomes", []))))),
+                    ("reasoning_evidence", len(dumps_canonical(
+                        sections.get("reasoning_evidence", [])))),
                     ("system_instruction", len(request.system_instruction)),
                 ), key=lambda item: (-item[1], item[0])))
                 raise EpisodeFeedbackContextOverflowError(
@@ -1248,10 +1361,15 @@ def _persist_feedback_request(
             dumps_canonical(provider_body))
     stable_backend_metadata = _plain_json(backend_metadata)
     stable_backend_metadata.pop("call_count", None)
+    payload = request.model_payload
+    # The minimal view is flat; the lean payload nests under "episode".
+    request_schema_version = payload.get(
+        "schema_version", LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION)
+    episode_section = payload.get("episode", payload)
     manifest = {
         "schema_version": "episode_feedback_request_artifact_v1",
-        "request_schema_version": LEAN_EPISODE_FEEDBACK_REQUEST_SCHEMA_VERSION,
-        "episode_id": request.model_payload["episode"]["episode_id"],
+        "request_schema_version": request_schema_version,
+        "episode_id": episode_section["episode_id"],
         "policy_version": policy_version,
         "model_payload_hash": request.model_payload_hash,
         "system_prompt_hash": sha256_text(request.system_instruction),

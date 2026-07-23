@@ -17,6 +17,8 @@ from surrogate_rollout.optimization.prompt_delta_iteration import (
     MetaPromptConfirmationCase,
     MetaPromptConfirmationCriterion,
     MetaPromptConfirmationOutcome,
+    MetaPromptMeasurementOutcome,
+    MetaPromptMeasurementResult,
     PromptDeltaIterationOrchestrator,
     build_feedback_grounding,
 )
@@ -130,6 +132,119 @@ def run(tmp_path, *, candidate=CANDIDATE, accepted=True, noop_flip=False,
     return result, updater, feedback, evaluator
 
 
+class RecordingMeasurementEvaluator:
+    """Scores whatever meta-prompt it is handed; never compares or decides."""
+
+    def __init__(self, correct=(True, False)):
+        self.correct = correct
+        self.calls = 0
+        self.measured_ids = []
+
+    def measure(self, *, meta_prompt, cases, confirmation_set_id,
+                model_identity, decoding_settings, cache_reset_identity,
+                evaluation_pipeline_identity, output_directory):
+        self.calls += 1
+        self.measured_ids.append(meta_prompt.meta_prompt_id)
+        outcomes = tuple(
+            MetaPromptMeasurementOutcome(
+                case_id=case.case_id, video_id=case.video_id,
+                qa_id=case.qa_id, correct=self.correct[index])
+            for index, case in enumerate(cases))
+        return MetaPromptMeasurementResult(
+            measurement_id=f"measurement-{self.calls}",
+            meta_prompt_id=meta_prompt.meta_prompt_id,
+            confirmation_set_id=confirmation_set_id,
+            model_identity=model_identity,
+            decoding_settings=decoding_settings,
+            cache_reset_identity=cache_reset_identity,
+            evaluation_pipeline_identity=evaluation_pipeline_identity,
+            outcomes=outcomes)
+
+
+def run_measured(tmp_path, *, candidate=CANDIDATE, measurement=None,
+                 output_name="run"):
+    evaluator = DeterministicMockMetaPromptConfirmationEvaluator(
+        outcomes(accepted=False))
+    measurement = measurement or RecordingMeasurementEvaluator()
+    orchestrator = PromptDeltaIterationOrchestrator(
+        feedback_generator=CountingFeedback(),
+        updater=CountingUpdater(candidate),
+        confirmation_evaluator=evaluator,
+        measurement_evaluator=measurement,
+        promotion_policy="always_promote_measured_v1")
+    result = orchestrator.run(
+        iteration_id="iteration-1", parent=parent(),
+        update_episodes=(episode_fixture(),), confirmation_cases=cases(),
+        criterion=criterion(), model_identity="fixture-caption-qa-model",
+        decoding_settings={"temperature": 0.0},
+        cache_reset_identity="fresh-paired-cache-v1",
+        evaluation_pipeline_identity="fixture-paired-evaluator-v1",
+        candidate_created_at="2026-07-20T01:00:00Z",
+        output_directory=str(tmp_path / output_name),
+        state_directory=str(tmp_path / "state"),
+        feedback_memory_bank_directory=str(tmp_path / "memory_bank"),
+        initialize_parent_pointer=True)
+    return result, evaluator, measurement
+
+
+def test_measured_policy_promotes_without_consulting_the_held_out_set(tmp_path):
+    """The paired confirmation evaluator is never called; the candidate wins."""
+    result, evaluator, measurement = run_measured(tmp_path)
+
+    assert result.status == "promoted"
+    assert result.active_meta_prompt_id == result.candidate_meta_prompt_id
+    assert evaluator.call_count == 0
+    assert measurement.calls == 1
+    # the measurement scores the prompt the run carries forward, not the parent
+    assert measurement.measured_ids == [result.candidate_meta_prompt_id]
+
+    pointer = json.loads((tmp_path / "state/current_meta_prompt.json").read_text())
+    assert pointer["active_meta_prompt_id"] == result.candidate_meta_prompt_id
+    assert pointer["parent_meta_prompt_id"] == "meta-parent"
+    assert pointer["promotion_policy"] == "always_promote_measured_v1"
+
+
+def test_measured_policy_records_accuracy_without_a_promotion_decision(tmp_path):
+    result, _, _ = run_measured(tmp_path)
+    final = json.loads(Path(result.final_manifest_path).read_text())
+
+    assert final["promotion_policy"] == "always_promote_measured_v1"
+    assert final["held_out_accuracy"] == 0.5  # one of two cases correct
+    assert final["held_out_case_count"] == 2
+    assert final["held_out_evaluated_count"] == 2
+    assert "promotion_decision_path" not in final
+    assert "confirmation_result_path" not in final
+    assert not (tmp_path / "run/confirmation").exists()
+    assert (tmp_path / "run/measurement/active_measurement.json").exists()
+
+
+def test_measured_policy_still_stops_on_no_update(tmp_path):
+    result, evaluator, measurement = run_measured(tmp_path, candidate=None)
+    assert result.status == "no_update"
+    assert measurement.calls == 0
+    assert evaluator.call_count == 0
+
+
+def test_measured_policy_requires_a_measurement_evaluator():
+    with pytest.raises(ValueError, match="measurement_evaluator"):
+        PromptDeltaIterationOrchestrator(
+            feedback_generator=CountingFeedback(),
+            updater=CountingUpdater(CANDIDATE),
+            confirmation_evaluator=DeterministicMockMetaPromptConfirmationEvaluator(
+                outcomes()),
+            promotion_policy="always_promote_measured_v1")
+
+
+def test_unknown_promotion_policy_is_rejected():
+    with pytest.raises(ValueError, match="promotion_policy"):
+        PromptDeltaIterationOrchestrator(
+            feedback_generator=CountingFeedback(),
+            updater=CountingUpdater(CANDIDATE),
+            confirmation_evaluator=DeterministicMockMetaPromptConfirmationEvaluator(
+                outcomes()),
+            promotion_policy="whatever")
+
+
 def test_no_update_stops_without_confirmation_and_preserves_parent_pointer(tmp_path):
     result, updater, feedback, evaluator = run(tmp_path, candidate=None)
     assert result.status == "no_update"
@@ -167,10 +282,23 @@ def test_update_writes_provisional_then_confirmation_pass_promotes(tmp_path):
     assert confirmed["parent_meta_prompt_id"] == "meta-parent"
     final = json.loads((tmp_path / "run/iteration_result.json").read_text())
     assert final["archived_parent_feedback_memory_bank"] is not None
-    assert load_parent_feedback_memory_bank(
+    parent_bank = load_parent_feedback_memory_bank(
         str(tmp_path / "memory_bank"), "meta-parent")
-    assert load_parent_feedback_memory_bank(
-        str(tmp_path / "memory_bank"), provisional["meta_prompt_id"]) == ()
+    assert parent_bank
+    # Promotion opens a new parent scope; the memories must cross it, or the
+    # next iteration's updater would see no history at all.
+    carried = load_parent_feedback_memory_bank(
+        str(tmp_path / "memory_bank"), provisional["meta_prompt_id"])
+    assert [item.memory_text for item in carried] == \
+        [item.memory_text for item in parent_bank]
+    assert [item.iteration_id for item in carried] == \
+        [item.iteration_id for item in parent_bank]
+    assert all(item.parent_meta_prompt_id == provisional["meta_prompt_id"]
+               for item in carried)
+    assert [item.metadata["origin_memory_id"] for item in carried] == \
+        [item.memory_id for item in parent_bank]
+    assert final["new_parent_feedback_memory_bank"][
+        "source_parent_meta_prompt_id"] == "meta-parent"
 
 
 def test_confirmation_failure_rolls_back_without_pointer_change(tmp_path):
@@ -337,6 +465,10 @@ def test_cli_dry_run_executes_complete_mock_path(tmp_path):
     assert pointer["active_meta_prompt_id"] == \
         result["active_meta_prompt_id"]
     identity = json.loads((tmp_path / "output/input_identity.json").read_text())
-    # the repository-owned parent (optimization/prompts/init_meta_prompt.json)
+    # the repository-owned parent (optimization/prompts/init_meta_prompt.json),
+    # whose text — and therefore id — changes between experiments
+    from surrogate_rollout.optimization.meta_prompt_defaults import (
+        load_initial_meta_prompt,
+    )
     assert identity["parent"]["meta_prompt_id"] == \
-        "meta_prompt_4e7ca02d27e84339e6e5"
+        load_initial_meta_prompt().meta_prompt_id

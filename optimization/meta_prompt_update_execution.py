@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
+from surrogate_rollout import config
+from surrogate_rollout.optimization.openai_chat_model_profile import (
+    adapt_chat_completions_body,
+)
 from surrogate_rollout.optimization.meta_prompt_updater import (
     LLMMetaPromptUpdater,
     MetaPromptUpdateResult,
@@ -43,6 +47,10 @@ _FEEDBACK_FIELDS = {
     "feedback_id", "episode_id", "outcome_summary", "observations",
     "counterevidence", "generator_diagnosis", "recommended_strategy_change",
     "confidence",
+}
+# Written by every feedback the attribution-aware response schema produces.
+_ATTRIBUTION_FIELDS = {
+    "attribution_status", "observable_trigger", "caption_operation",
 }
 _EVIDENCE_FIELDS = {
     "statement", "supporting_segment_ids", "supporting_qa_ids",
@@ -85,6 +93,11 @@ def _configured_positive_int(value: Any, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+# The provider budget for one update: the initial call and one corrective
+# retry after a contract violation. Anything beyond that is a loop, not a fix.
+UPDATER_MAXIMUM_PROVIDER_CALLS = 2
 
 
 class OpenAICompatibleMetaPromptUpdaterBackend:
@@ -168,7 +181,7 @@ class OpenAICompatibleMetaPromptUpdaterBackend:
             {"role": "system", "content": system_instruction},
             {"role": "user", "content": user_request},
         )
-        body = json.loads(dumps_canonical({
+        body = json.loads(dumps_canonical(adapt_chat_completions_body({
             "model": self.model_id,
             "messages": messages,
             "max_tokens": self.maximum_output_tokens,
@@ -181,7 +194,7 @@ class OpenAICompatibleMetaPromptUpdaterBackend:
                     "schema": self.response_schema,
                 },
             },
-        }))
+        }, reasoning_effort=config.UPDATER_REASONING_EFFORT)))
         serialized = dumps_canonical(body)
         return PreparedMetaPromptUpdateProviderRequest(
             provider=self.provider,
@@ -195,8 +208,12 @@ class OpenAICompatibleMetaPromptUpdaterBackend:
         )
 
     def __call__(self, system_instruction: str, user_request: str) -> str:
-        if self.call_count:
-            raise RuntimeError("updater backend is limited to exactly one call")
+        # One call, plus the single corrective retry the updater is allowed
+        # when a response violates its contract.
+        if self.call_count >= UPDATER_MAXIMUM_PROVIDER_CALLS:
+            raise RuntimeError(
+                "updater backend is limited to "
+                f"{UPDATER_MAXIMUM_PROVIDER_CALLS} calls")
         user_request, fitted = self.fit_user_request(
             system_instruction, user_request)
         prepared = self.prepare_messages(system_instruction, user_request)
@@ -320,7 +337,10 @@ def _load_parent(path: Path) -> MetaPromptVersion:
 def _load_feedback(path: Path) -> EpisodeFeedback:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, Mapping) or set(value) not in (
-            _FEEDBACK_FIELDS, _FEEDBACK_FIELDS | {"compact_memory_text"}):
+            _FEEDBACK_FIELDS,
+            _FEEDBACK_FIELDS | {"compact_memory_text"},
+            _FEEDBACK_FIELDS | _ATTRIBUTION_FIELDS,
+            _FEEDBACK_FIELDS | _ATTRIBUTION_FIELDS | {"compact_memory_text"}):
         raise ValueError(
             "episode feedback artifact must contain the detailed fields and "
             "only the optional compact_memory_text field")
@@ -404,9 +424,11 @@ def execute_meta_prompt_update_once(
         updater = LLMMetaPromptUpdater(
             backend=backend, updater_policy_version=updater_policy_version)
         result = updater.update(parent, feedbacks)
-        if backend.call_count != 1:
+        if not 1 <= backend.call_count <= UPDATER_MAXIMUM_PROVIDER_CALLS:
             raise RuntimeError(
-                f"expected exactly one provider call, observed {backend.call_count}")
+                "expected at most "
+                f"{UPDATER_MAXIMUM_PROVIDER_CALLS} provider calls, observed "
+                f"{backend.call_count}")
         if result.request.request_id != request.request_id:
             raise RuntimeError("executed updater request identity changed")
         _write_once(output / "raw_response.txt", result.raw_response or "")

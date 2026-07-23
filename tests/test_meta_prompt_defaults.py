@@ -17,19 +17,31 @@ def test_initial_meta_prompt_is_repository_owned_and_schema_valid():
     assert INITIAL_META_PROMPT_PATH.parent.name == "prompts"
     assert INITIAL_META_PROMPT_PATH.parent.parent.name == "optimization"
     version = load_initial_meta_prompt()
-    # The repository-owned parent is the static replace-body meta prompt, the
-    # same text the private baseline repo runs (pinned by sha on both sides).
-    assert version.meta_prompt_id == "meta_prompt_4e7ca02d27e84339e6e5"
+    # The repository-owned parent is the starting point of the optimization, so
+    # its text changes between experiments. What must hold is that its id is
+    # derived from its own text: promoted versions and the per-parent feedback
+    # memory bank are keyed by that id, and a stale id would collide with the
+    # artifacts of the text it used to carry.
+    assert version.meta_prompt_id == \
+        "meta_prompt_" + sha256_text(version.text)[:20]
     assert version.parent_meta_prompt_id is None
     assert version.status == "parent"
-    assert sha256_text(version.text) == smrb.META_PROMPT_SHA256
+    assert version.text.strip()
     assert resolve_meta_prompt_artifact_path(None) == \
         INITIAL_META_PROMPT_PATH.resolve()
 
 
-def test_runtime_default_template_uses_canonical_initial_prompt_text():
+def test_generator_fallback_template_is_the_baseline_repo_parity_text():
+    """The two texts are allowed to diverge, and each has one job.
+
+    `smrb.META_PROMPT_TEXT` stays pinned to the private baseline repo so the
+    parity condition remains reproducible; it is only the fallback used when no
+    parent is supplied. Every optimization run passes its parent explicitly, so
+    the repository-owned artifact is what actually drives those runs.
+    """
+    assert sha256_text(smrb.META_PROMPT_TEXT) == smrb.META_PROMPT_SHA256
     value = json.loads(INITIAL_META_PROMPT_PATH.read_text(encoding="utf-8"))
-    assert smrb.META_PROMPT_TEXT == value["text"]
+    assert value["text"].strip()
 
 
 def test_updater_training_cli_parent_is_optional_and_defaults_later():

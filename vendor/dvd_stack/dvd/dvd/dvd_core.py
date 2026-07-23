@@ -132,6 +132,21 @@ class DVDCoreAgent:
         except StopException as exc:  # graceful stop
             print(f"Finish task with message: '{exc!s}'")
             raise
+        except Exception as exc:  # noqa: BLE001 - local modification
+            # Vendored change: a failing tool call is reported back to the
+            # agent instead of unwinding out of `run`. Upstream let any
+            # non-Stop exception escape, which turned one bad tool argument
+            # into a dead question, a dead intervention, and a dead
+            # multi-iteration experiment. The loop is bounded by
+            # max_iterations, so a tool that keeps failing ends in the forced
+            # finish rather than in a crash.
+            print(f"Tool `{name}` failed: {type(exc).__name__}: {exc}")
+            self._append_tool_msg(
+                tool_call["id"], name,
+                f"Error: {name} failed with {type(exc).__name__}: {exc}. "
+                "Correct the arguments and try a different call, or finish "
+                "with the evidence you already have.",
+                msgs)
 
     # ------------------------------------------------------------------ #
     # Main loop
