@@ -26,6 +26,23 @@ VLLM_MM_PROCESSOR_CACHE_GB = 0.0
 VLLM_PREFIX_CACHING_ENABLED = False
 
 
+def _without_reasoning(text: str) -> str:
+    """Drop a leading reasoning block if the model emitted one anyway.
+
+    Turning thinking off in the chat template is the real fix; this is the
+    backstop for a template that emits the block regardless, because a caption
+    cache entry is written once and read by every later comparison. An unclosed
+    block means the budget ran out mid-reasoning and there is no caption in the
+    output at all, so the remainder is dropped rather than passed off as one.
+    """
+
+    stripped = text.strip()
+    if not stripped.startswith("<think>"):
+        return stripped
+    _, closed, after = stripped.partition("</think>")
+    return after.strip() if closed else ""
+
+
 class Qwen25VLCaptioner(BaseCaptioner):
     """Caption one or more images with Qwen2.5-VL-7B-Instruct.
 
@@ -102,17 +119,60 @@ class Qwen25VLCaptioner(BaseCaptioner):
         content.append({"type": "text", "text": prompt})
         return [{"role": "user", "content": content}]
 
-    def _to_vllm_input(self, messages: list[dict]) -> dict:
-        from qwen_vl_utils import process_vision_info
+    def _template_kwargs(self) -> dict:
+        """Turn reasoning off on the models that have it, and only those.
 
+        Qwen3.5 enables thinking by default. A captioner must not think: the
+        reasoning is billed against the same token budget as the caption, so at
+        a 1024-token cap the caption can come back empty, and whatever does come
+        back is a reasoning trace that would be cached and fed downstream as if
+        it were a description. Older templates have no such variable and would
+        reject the keyword, so it is passed only when the template reads it.
+        """
+
+        template = getattr(self.processor, "chat_template", None) or ""
+        if "enable_thinking" in template:
+            return {"enable_thinking": False}
+        return {}
+
+    def _vision_inputs(self, messages: list[dict]) -> list:
+        """Resolve the message images to what vLLM consumes.
+
+        qwen_vl_utils applies the min/max-pixel policy, so it stays the primary
+        path. It tracks the Qwen2.5 processor contract, though, and a newer model
+        family can be outside what the installed version understands; the images
+        here are already loaded PIL objects, so falling back to them directly
+        costs only that resizing policy rather than the run.
+        """
+
+        try:
+            from qwen_vl_utils import process_vision_info
+
+            image_inputs, video_inputs = process_vision_info(messages)
+            if video_inputs:
+                raise ValueError(
+                    "Qwen25VLCaptioner expects image inputs, not video inputs")
+            return image_inputs or []
+        except ImportError:
+            pass
+        except Exception:
+            if self.image_min_pixels is not None or self.image_max_pixels is not None:
+                raise
+        return [
+            item["image"]
+            for message in messages
+            for item in message["content"]
+            if item.get("type") == "image"
+        ]
+
+    def _to_vllm_input(self, messages: list[dict]) -> dict:
         text = self.processor.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            **self._template_kwargs(),
         )
-        image_inputs, video_inputs = process_vision_info(messages)
-        if video_inputs:
-            raise ValueError("Qwen25VLCaptioner expects image inputs, not video inputs")
+        image_inputs = self._vision_inputs(messages)
 
         multi_modal_data = {}
         if image_inputs:
@@ -174,4 +234,4 @@ class Qwen25VLCaptioner(BaseCaptioner):
                 json_schema=json_schema,
             ),
         )
-        return [output.outputs[0].text.strip() for output in outputs]
+        return [_without_reasoning(output.outputs[0].text) for output in outputs]

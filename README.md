@@ -8,12 +8,24 @@ caption. The model weights never move.
 
 ## Setting it up on a new host
 
-Pick the caption model, then run one command:
+One command:
 
 ```bash
 git clone https://github.com/cyshello/CAPO.git && cd CAPO && \
-  SR_CAPTION_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct bash setup_training_host.sh go
+  bash setup_training_host.sh go
 ```
+
+The caption model defaults to `Qwen/Qwen3.5-9B`; any other is
+`SR_CAPTION_MODEL_ID=<hf-model> bash setup_training_host.sh go`. Two things about
+Qwen3.5 are handled for you rather than left as a surprise. It exists in no
+released engine, so the setup installs nightly vLLM and `transformers` from main
+instead of the pinned versions — everything else stays pinned, since the engine
+is what the new model changes and the rest is the method. And it thinks by
+default: the captioner turns that off in the chat template, drops a reasoning
+block if one appears anyway, and the smoke gate fails the host if either the
+block or an empty caption survives. Reasoning tokens come out of the caption's
+own budget, so left alone this shows up as captions that are truncated
+deliberations — cached, and read as descriptions by every later comparison.
 
 `go` builds the conda environment, installs the package, downloads the models,
 verifies the evidence videos, checks that vLLM can load the caption model on this

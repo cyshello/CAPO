@@ -23,7 +23,12 @@ PROMPT_DELTA_WORKER_GPUS=${PROMPT_DELTA_WORKER_GPUS:-0,1,2,3}
 # keyed on this identity, so the captions produced here never collide with the
 # earlier model's -- and never reuse them either: this host starts cold and
 # re-captions every clip.
-SR_CAPTION_MODEL_ID=${SR_CAPTION_MODEL_ID:-Qwen/Qwen3-VL-8B-Instruct}
+#
+# Qwen3.5 needs the pre-release engine stack (nightly vLLM, transformers from
+# main) and has thinking on by default; setup_training_host.sh installs the
+# former and the captioner turns off the latter, because reasoning tokens come
+# out of the same budget as the caption.
+SR_CAPTION_MODEL_ID=${SR_CAPTION_MODEL_ID:-Qwen/Qwen3.5-9B}
 
 # The 5-iteration schedule the 3090 host is running: 4 evidence videos per
 # iteration out of the frozen 20-video cohort, held-out set of 15.

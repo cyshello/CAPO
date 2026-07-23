@@ -9,6 +9,7 @@
 # them, so only the evidence cohort's videos need to be present here.
 #
 # Usage (from inside this repository, on the training host):
+#   bash setup_training_host.sh go                    # uses Qwen/Qwen3.5-9B
 #   SR_CAPTION_MODEL_ID=<hf-model> bash setup_training_host.sh go
 #         set up everything and start the run; stops before spending anything
 #         if the videos or the API key are missing
@@ -30,7 +31,7 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONDA_ENV="${SR_CONDA_ENV:-capo}"
 PYVER="${PYVER:-3.11}"
-CAPTION_MODEL="${SR_CAPTION_MODEL_ID:-Qwen/Qwen3-VL-8B-Instruct}"
+CAPTION_MODEL="${SR_CAPTION_MODEL_ID:-Qwen/Qwen3.5-9B}"
 EMBED_MODEL="BAAI/bge-small-en-v1.5"
 GPUS="${PROMPT_DELTA_WORKER_GPUS:-0,1,2,3}"
 VIDEOMME_DATA_ROOT="${SR_VIDEOMME_DATA_ROOT:-/hub_data3/videomme_data}"
@@ -59,16 +60,49 @@ stage_check(){
   ok "system ready"
 }
 
+# Qwen3.5 is not in any released vLLM or transformers: its model card requires
+# vLLM from the nightly wheels and transformers from git main. Installing those
+# for a model that does not need them would throw away the pinned stack the
+# reference runs used, so the choice follows the caption model.
+needs_prerelease_stack(){
+  case "${CAPO_PRERELEASE_STACK:-auto}" in
+    1|true|yes) return 0 ;;
+    0|false|no) return 1 ;;
+  esac
+  case "$CAPTION_MODEL" in
+    *Qwen3.5*|*qwen3.5*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 stage_env(){
-  say "env: conda '$CONDA_ENV' + pinned stack"
   conda env list | grep -qE "^\s*$CONDA_ENV\s" || conda create -y -n "$CONDA_ENV" "python=$PYVER"
-  # requirements.txt pins the versions the reference runs used. Blackwell may
-  # need a newer vllm/torch than the pin; if the vLLM gate below fails, relax
-  # those two lines rather than the rest of the file.
-  conda run -n "$CONDA_ENV" pip install -r "$REPO_DIR/requirements.txt" || \
-    warn "pinned install failed -- on Blackwell try: pip install -U vllm torch, then re-run"
+  if needs_prerelease_stack; then
+    say "env: conda '$CONDA_ENV' + pre-release stack (required by $CAPTION_MODEL)"
+    # Everything except vllm/torch/transformers still comes from the pinned
+    # file: the DVD stack, the retrieval database, and the OpenAI client are not
+    # what the new model changes, and unpinning them would change the method.
+    grep -vE '^(vllm|torch|transformers)==' "$REPO_DIR/requirements.txt" \
+      > "$REPO_DIR/.requirements_no_engine.txt"
+    conda run -n "$CONDA_ENV" pip install -r "$REPO_DIR/.requirements_no_engine.txt" \
+      || warn "shared dependency install reported a problem"
+    rm -f "$REPO_DIR/.requirements_no_engine.txt"
+    conda run -n "$CONDA_ENV" pip install --pre vllm \
+      --extra-index-url https://wheels.vllm.ai/nightly \
+      || die "nightly vLLM install failed -- $CAPTION_MODEL needs it; check the wheel index"
+    conda run -n "$CONDA_ENV" pip install \
+      "transformers[serving] @ git+https://github.com/huggingface/transformers.git@main" \
+      || die "transformers from main failed to install -- $CAPTION_MODEL needs it"
+  else
+    say "env: conda '$CONDA_ENV' + pinned stack"
+    # requirements.txt pins the versions the reference runs used. Blackwell may
+    # need a newer vllm/torch than the pin; if the vLLM gate below fails, relax
+    # those two lines rather than the rest of the file.
+    conda run -n "$CONDA_ENV" pip install -r "$REPO_DIR/requirements.txt" || \
+      warn "pinned install failed -- on Blackwell try: pip install -U vllm torch, then re-run"
+  fi
   conda run -n "$CONDA_ENV" pip install huggingface_hub
-  py -c "import vllm,torch;print('  vllm',vllm.__version__,'torch',torch.__version__,'cuda',torch.version.cuda)"
+  py -c "import vllm,torch,transformers;print('  vllm',vllm.__version__,'torch',torch.__version__,'cuda',torch.version.cuda,'transformers',transformers.__version__)"
   ok "env ready"
 }
 
@@ -131,16 +165,28 @@ stage_creds(){
 }
 
 stage_smoke_vllm(){
-  say "GATE: vLLM can load $CAPTION_MODEL on this GPU"
-  CUDA_VISIBLE_DEVICES="${GPUS%%,*}" py - <<PY || die "vLLM failed to load the caption model -- bump vllm/torch, then re-run 'env' and this stage"
-from vllm import LLM, SamplingParams
-llm = LLM(model="$CAPTION_MODEL", dtype="bfloat16", max_model_len=8192,
-          limit_mm_per_prompt={"image": 1}, enforce_eager=True,
-          gpu_memory_utilization=0.85)
-out = llm.generate(["hi"], SamplingParams(max_tokens=4))
-print("  generated:", repr(out[0].outputs[0].text))
-PY
-  ok "caption model loads on this hardware"
+  say "GATE: $CAPTION_MODEL captions eight frames on this GPU"
+  # Through the repository's own captioner rather than a bare vLLM call, because
+  # what has to hold is the whole path: the chat template (including thinking
+  # being off), the vision-input resolution, and the eight-frames-per-request
+  # contract the rollout depends on. A bare `llm.generate(["hi"])` would pass on
+  # a model that then returns reasoning instead of captions.
+  local out
+  out=$(SR_CAPTION_MODEL_ID="$CAPTION_MODEL" CUDA_VISIBLE_DEVICES="${GPUS%%,*}" \
+    conda run --no-capture-output -n "$CONDA_ENV" python -m surrogate_rollout.scripts.smoke_qwen25vl_captioner \
+    --num-images 8 --max-tokens 128 2>&1) || {
+      printf '%s\n' "$out" | tail -20
+      die "the caption model failed to run -- see above; for a load failure bump vllm/torch and re-run 'env'"
+    }
+  printf '%s\n' "$out" | tail -6
+  case "$out" in
+    *"<think>"*) die "the model emitted a reasoning block: thinking is still on, so captions would be reasoning traces" ;;
+  esac
+  # An empty caption is the failure thinking produces when the reasoning eats the
+  # whole budget, and it would otherwise be cached as a legitimate description.
+  printf '%s\n' "$out" | awk '/^caption:/{found=1;next} found&&NF{ok=1} END{exit !(found&&ok)}' \
+    || die "the smoke run produced no caption text (empty output usually means the token budget went to reasoning)"
+  ok "captioning works end to end on this hardware"
 }
 
 stage_smoke_tests(){
