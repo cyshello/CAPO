@@ -75,6 +75,17 @@ def main(argv=None) -> int:
     # builder.free_form_generator (its module-local import of
     # build_free_form_generator). Process-local; incumbent run untouched.
     evidence_entry.build_free_form_generator = static_free_form_generator
+
+    # The evidence entry cross-checks the prepared component_config's generator
+    # identity against config.PROMPT_GENERATOR_{MODEL,BACKEND}_ID and refuses to
+    # start on a mismatch. config.PROMPT_GENERATOR_BACKEND_ID is hardcoded (not
+    # env-overridable), so for the static path we align config to the prepared
+    # 'static' identity here, in this process only. The generator is never
+    # called, so these values are pure provenance/gating markers.
+    from surrogate_rollout import config as _sr_config
+    _sr_config.PROMPT_GENERATOR_MODEL_ID = "static"
+    _sr_config.PROMPT_GENERATOR_BACKEND_ID = "static"
+
     return evidence_entry.main(argv)
 
 

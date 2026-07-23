@@ -1,17 +1,26 @@
 # Running caption_prompt_opt on another server (Pro 5000 x4)
 
-Yes — the same "go" pattern the incumbent uses
-(`surrogate_rollout/scripts/run_fresh_prompt_delta_iteration.sh`) works here.
-The launcher is `caption_prompt_opt/scripts/go_caption_prompt.sh` (prepare →
-static evidence → feedback/update/confirm), isolated in its own run roots and
-cache identities.
+Same "go" pattern as the incumbent `setup_training_host.sh go`, but for the
+caption-prompt path. One command sets up the host and launches the run:
 
 ```bash
-cd <CAPO checkout>                                  # the surrogate_rollout dir
-export SR_CAPTION_MODEL_ID=Qwen/Qwen3.5-9B          # captioner (see caveats!)
-export CAPTION_PROMPT_WORKER_GPUS=0,1,2,3           # 4 GPUs
-bash caption_prompt_opt/scripts/go_caption_prompt.sh
+cd <CAPO checkout named surrogate_rollout>
+export SR_CAPTION_MODEL_ID=Qwen/Qwen3.5-9B          # captioner
+export PROMPT_DELTA_WORKER_GPUS=0,1,2,3             # 4 GPUs
+bash caption_prompt_opt/scripts/setup_training_host.sh go
 ```
+
+This mirrors the reference experiment exactly — **20 evidence videos × 5
+iterations** — with the caption swaps: static generator (no prompt-generator
+call), caption-prompt updater, and promotion **pinned to
+`always_promote_measured_v1`** (held-out set reports, never gates). Isolated run
+roots + cache identities, so it can run beside a meta-prompt job.
+
+Script chain (all copies of the incumbent ones, caption-flavored):
+`setup_training_host.sh` → `run_caption_kiter.sh` (K-loop) →
+`run_caption_iteration.sh` (per iter: prepare → static evidence → feedback /
+caption-prompt update / confirm), with `watch_caption_experiment.sh` for
+unattended restarts.
 
 ## 1. Code
 - `caption_prompt_opt/` now lives **inside** the `surrogate_rollout` checkout
@@ -25,33 +34,32 @@ bash caption_prompt_opt/scripts/go_caption_prompt.sh
   `import surrogate_rollout` both resolve. Override with `SR_PROJECT_ROOT` if
   your checkout is elsewhere.
 
-## 2. Conda env (captioner runtime) — brand-new server
+## 2. What `setup_training_host.sh` does (brand-new server)
 
-The base bring-up is `docs/PORTABLE_SETUP.md` in the CAPO repo:
-`conda create -n local_llm_vllm python=3.11` + `pip install -r requirements.txt`
-+ `.env` + sync cohort media (`scripts/sync_cohort_data.sh`).
+Same staged bring-up as the reference `setup_training_host.sh` at the repo root,
+so it needs no separate setup script. Stages (run one with
+`bash caption_prompt_opt/scripts/setup_training_host.sh <stage>`):
 
-**One delta for this path:** `requirements.txt` pins `vllm==0.11.2`,
-`transformers==4.57.6`, `qwen-vl-utils==0.0.14` — those target **Qwen2.5-VL**.
-**Qwen3.5-9B / Qwen3-VL needs newer vLLM (nightly) + transformers.** So after the
-pinned install you must upgrade the captioner stack to a combo that recognizes
-the model's architecture.
+`check env install models data creds smoke-vllm smoke-tests launch go`
 
-`caption_prompt_opt/scripts/setup_new_server.sh` automates all of it (conda env,
-pinned deps, captioner-stack override, `.env`, model download, import check):
+- **env**: `conda create -n capo python=3.11`; for a `*Qwen3.5*` caption model it
+  auto-installs the **pre-release stack** (nightly vLLM + transformers from git
+  main), because `requirements.txt` pins `vllm==0.11.2` for Qwen2.5-VL. Override
+  the auto-detect with `CAPO_PRERELEASE_STACK=1|0`.
+- **install**: `pip install -e` the repo (so the checkout dir name stops
+  mattering) and verifies both `import surrogate_rollout` and
+  `import caption_prompt_opt`.
+- **models**: downloads the caption model + BGE embedder.
+- **data**: gates on the 20-video evidence cohort being present (does not sync;
+  prints the rsync command). Confirmation videos are not needed on this host.
+- **creds**: gates on `OPENAI_API_KEY` in `.env`.
+- **smoke-vllm**: captions 8 frames through the repo captioner and **fails if the
+  model emits a `<think>` block or an empty caption** — the Qwen3.5 thinking-off
+  gate.
+- **go**: all stages, then sources `scripts/env/gpt5mini_stack.sh` +
+  `scripts/env/training_host.sh` and launches the K-loop + watcher.
 
-```bash
-cd <CAPO checkout named surrogate_rollout>
-export SR_CAPTION_MODEL_ID=Qwen/Qwen3.5-9B
-export OPENAI_API_KEY=sk-...          # only if no .env yet
-# pin the verified combo (recommended); defaults just `pip install -U latest`:
-export CAPTION_STACK_SPEC='vllm==<ver> transformers==<ver> qwen-vl-utils==<ver>'
-export VLLM_PIP_EXTRA='--pre --extra-index-url https://wheels.vllm.ai/nightly'
-bash caption_prompt_opt/scripts/setup_new_server.sh
-```
-
-It does **not** create GPUs or sync media (data comes from a host that has it);
-it prints the remaining data-sync + run steps. Match CUDA to the Pro 5000s.
+It does **not** create GPUs or sync media. Match CUDA to the Pro 5000s.
 
 ## 3. Secrets — `surrogate_rollout/.env`
 - `OPENAI_API_KEY` (feedback / proposer / updater / DVD text backend — all
