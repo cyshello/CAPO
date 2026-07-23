@@ -23,7 +23,7 @@ elif [[ -f "$(dirname "$CPO_ROOT")/surrogate_rollout/scripts/run_prompt_delta_it
 else
   echo "cannot locate surrogate_rollout checkout; set SR_PROJECT_ROOT" >&2; exit 2
 fi
-LABEL="${PROMPT_DELTA_EXPERIMENT_LABEL:-20video_5iter_val15}"
+LABEL="${PROMPT_DELTA_EXPERIMENT_LABEL:-caption_20video_5iter}"
 WORKER_GPUS="${PROMPT_DELTA_WORKER_GPUS:-0,1,2,3}"
 EXPERIMENT_ROOT="$PROJECT_ROOT/runs/caption_prompt_${LABEL}_${EXPERIMENT_TIMESTAMP}"
 

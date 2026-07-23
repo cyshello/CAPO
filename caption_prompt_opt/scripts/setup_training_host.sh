@@ -204,8 +204,8 @@ stage_launch(){
   say "launch: the caption-prompt ${PROMPT_DELTA_ITERATION_COUNT:-5}-iteration run"
   cat <<EOF
   set -a
-  source scripts/env/gpt5mini_stack.sh
-  source scripts/env/training_host.sh
+  [ -f scripts/env/gpt5mini_stack.sh ] && source scripts/env/gpt5mini_stack.sh
+  source caption_prompt_opt/scripts/env/caption_training_host.sh
   set +a
   bash caption_prompt_opt/scripts/run_caption_kiter.sh
 
@@ -230,15 +230,21 @@ stage_go(){
   stage_smoke_vllm
   stage_smoke_tests
 
-  say "run: ${PROMPT_DELTA_ITERATION_COUNT:-5} iterations, captioner $CAPTION_MODEL, GPUs $GPUS, policy always_promote_measured_v1"
+  say "run: ${PROMPT_DELTA_ITERATION_COUNT:-5} iterations, captioner $CAPTION_MODEL, GPUs $GPUS, policy promote_and_enqueue_measurement_v1"
   cd "$REPO_DIR" || die "cannot enter $REPO_DIR"
-  # Reuse the incumbent profiles (identical optimizer stack + 20video/5iter
-  # schedule). Anything already exported wins over them.
+  # Optimizer stack: reuse the incumbent gpt5mini profile if present (it is on
+  # capo-main). Schedule/label/captioner: our own caption profile, because the
+  # reference scripts/env/training_host.sh is NOT on the capo-main snapshot.
+  # Anything already exported wins over both.
   set -a
+  if [ -f "$REPO_DIR/scripts/env/gpt5mini_stack.sh" ]; then
+    # shellcheck source=/dev/null
+    source "$REPO_DIR/scripts/env/gpt5mini_stack.sh"
+  else
+    warn "scripts/env/gpt5mini_stack.sh missing -- optimizer models fall back to config defaults"
+  fi
   # shellcheck source=/dev/null
-  source "$REPO_DIR/scripts/env/gpt5mini_stack.sh"
-  # shellcheck source=/dev/null
-  source "$REPO_DIR/scripts/env/training_host.sh"
+  source "$CPO_ROOT/scripts/env/caption_training_host.sh"
   set +a
   export PROMPT_DELTA_WORKER_GPUS="$GPUS"
 

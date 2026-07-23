@@ -101,7 +101,7 @@ if [[ ! "$EXPERIMENT_TIMESTAMP" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
   echo "PROMPT_DELTA_ITERATION_TIMESTAMP must use YYYYMMDD_HHMMSS" >&2
   exit 2
 fi
-EXPERIMENT_LABEL="${PROMPT_DELTA_EXPERIMENT_LABEL:-${#EVIDENCE_IDS[@]}video_${ITERATION_COUNT}iteration}"
+EXPERIMENT_LABEL="${PROMPT_DELTA_EXPERIMENT_LABEL:-caption_20video_5iter}"
 if [[ ! "$EXPERIMENT_LABEL" =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "PROMPT_DELTA_EXPERIMENT_LABEL contains unsupported characters" >&2
   exit 2
