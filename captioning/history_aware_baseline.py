@@ -56,7 +56,8 @@ HISTORY_SCHEMA_VERSION = "frozen_local_caption_history_v1"
 # caption" role (measured 2026-07-22 — instruction and caption came back
 # byte-identical on 4 of 5 mid-video segments, and repeated across segments).
 FREE_FORM_PROVIDER_OPENAI = "openai"
-FREE_FORM_PROVIDERS = (FREE_FORM_PROVIDER_OPENAI,)
+FREE_FORM_PROVIDER_STATIC = "static"
+FREE_FORM_PROVIDERS = (FREE_FORM_PROVIDER_OPENAI, FREE_FORM_PROVIDER_STATIC)
 DEFAULT_HISTORY_BLOCK_SECONDS = 300.0
 DEFAULT_MAX_HISTORY_CAPTIONS = 30
 PARALLEL_GROUP_SCHEDULER_VERSION = "history_block_gpu_scheduler_v1"
@@ -381,6 +382,20 @@ def build_free_form_generator(
                         if max_tokens is None else max_tokens),
             caption_fps=config.SAMPLE_FPS, template_text=template_text,
             meta_prompt_id=meta_prompt_id, backend_id=backend_id)
+    if provider == "static":
+        # Additive branch for the caption-prompt optimization path
+        # (caption_prompt_opt): emit the caption prompt verbatim per segment,
+        # NO model call. Lazily imported so this module has no dependency on
+        # caption_prompt_opt unless a spawned caption worker actually rebuilds a
+        # 'static' generator from its serialized config; the 'openai' path above
+        # is untouched.
+        from caption_prompt_opt.static_instruction_generator import (
+            StaticInstructionGenerator,
+        )
+        return StaticInstructionGenerator(
+            template_text=template_text, meta_prompt_id=meta_prompt_id,
+            model_id=model_id or "static", backend_id=backend_id,
+            max_tokens=(1 if max_tokens is None else max_tokens))
     raise ValueError(
         f"unknown free-form generator provider {provider!r} "
         f"(supported: {list(FREE_FORM_PROVIDERS)})")

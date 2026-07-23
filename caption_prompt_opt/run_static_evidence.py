@@ -67,6 +67,7 @@ def static_free_form_generator(
         meta_prompt_id=meta_prompt_id,
         model_id="static",
         backend_id=backend_id,
+        max_tokens=(1 if max_tokens is None else int(max_tokens)),
     )
 
 

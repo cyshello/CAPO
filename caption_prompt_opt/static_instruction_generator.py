@@ -51,6 +51,7 @@ class StaticInstructionGenerator:
         meta_prompt_id: str | None = None,
         model_id: str = "static",
         backend_id: str | None = None,
+        max_tokens: int = 1,
     ) -> None:
         if not isinstance(template_text, str) or not template_text.strip():
             raise ValueError("template_text (the caption instruction) is required")
@@ -59,6 +60,10 @@ class StaticInstructionGenerator:
         self.template_version = TEMPLATE_VERSION
         self.meta_prompt_id = meta_prompt_id or "caption_prompt_static"
         self.backend_id = backend_id or f"{PROVIDER}:{model_id}"
+        # No model call is made; carried only so the history-aware builder's
+        # worker-config serialization (which reads generator.max_tokens) works
+        # the same as for the OpenAI generator.
+        self.max_tokens = int(max_tokens)
         self.last_exchange: GeneratorExchange | None = None
 
     # ----------------------------- identity ------------------------------- #
