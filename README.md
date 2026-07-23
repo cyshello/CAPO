@@ -22,6 +22,16 @@ with a log path printed. Nothing is spent before the two gates only a human can
 pass: the video files and a funded API key. If either is missing it stops and
 prints exactly what to supply — including the `rsync` line for the videos.
 
+The run is started under `scripts/watch_prompt_delta_experiment.sh`, so it
+survives crashes without anyone watching it. A vLLM engine dying mid-iteration is
+a real failure mode, and unattended it would otherwise stop the whole experiment
+until a person noticed. Every stage is write-once and skips when its artifact
+already exists, so the watcher relaunches the driver on the same timestamp and it
+resumes instead of recomputing; it drains any vLLM process still holding the
+worker GPUs first, and gives up after `PROMPT_DELTA_MAX_RESTARTS` (20) so a
+deterministic failure cannot spin forever. `CAPO_FOREGROUND=1` runs the driver
+unwatched in the current shell instead.
+
 `bash setup_training_host.sh all` does the same setup but never launches, and
 each stage re-runs on its own:
 `check env install models data creds smoke-vllm smoke-tests launch go`.

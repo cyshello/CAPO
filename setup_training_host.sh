@@ -197,24 +197,50 @@ stage_go(){
   set +a
 
   if [ -n "${CAPO_FOREGROUND:-}" ]; then
+    warn "foreground: no watcher, so a crash ends the run until you restart it"
     exec bash "$REPO_DIR/scripts/run_prompt_delta_two_iteration_10video_pool.sh"
   fi
-  # Days of runtime; a dropped ssh session must not take the run with it.
+
+  # Every stage is write-once and skips when its artifact exists, so a crashed
+  # driver relaunched on the same timestamp resumes rather than recomputes. That
+  # is what makes an unattended restart safe -- and necessary: a vLLM engine can
+  # die mid-iteration, and without something to relaunch the driver the run just
+  # stops until a person notices. The watcher does that, drains any vLLM orphan
+  # still holding the worker GPUs first, and gives up after MAX_RESTARTS so a
+  # deterministic failure cannot spin forever.
+  export PROMPT_DELTA_ITERATION_TIMESTAMP="${PROMPT_DELTA_ITERATION_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}"
+  local ts="$PROMPT_DELTA_ITERATION_TIMESTAMP"
   mkdir -p "$REPO_DIR/runs"
-  local log="$REPO_DIR/runs/launch_$(date -u +%Y%m%d_%H%M%S).log"
-  nohup bash "$REPO_DIR/scripts/run_prompt_delta_two_iteration_10video_pool.sh" \
-    > "$log" 2>&1 &
+  local log="$REPO_DIR/runs/experiment_${ts}.log"
+  local watchlog="$REPO_DIR/runs/watch_${ts}.log"
+
+  # The driver starts first. The watcher's loop waits for a driver to disappear
+  # before doing anything, so starting it alone would spend a restart and a
+  # backoff before the first iteration ever began.
+  setsid nohup bash "$REPO_DIR/scripts/run_prompt_delta_two_iteration_10video_pool.sh" \
+    >> "$log" 2>&1 < /dev/null &
   local pid=$!
   sleep 5
-  if kill -0 "$pid" 2>/dev/null; then
-    ok "running: pid $pid"
-    echo "  log:    tail -f $log"
-    echo "  stop:   kill $pid"
-    echo "  (CAPO_FOREGROUND=1 runs it in this shell instead)"
-  else
+  if ! kill -0 "$pid" 2>/dev/null; then
     warn "the run exited within five seconds -- last lines:"
     tail -20 "$log"
     return 1
+  fi
+  # The watcher relaunches the driver with its own environment, so it has to
+  # inherit the profiles sourced above; that is why it is started from here and
+  # not from a bare shell.
+  setsid nohup bash "$REPO_DIR/scripts/watch_prompt_delta_experiment.sh" "$ts" "$log" \
+    >> "$watchlog" 2>&1 < /dev/null &
+  ok "running: driver pid $pid, watcher pid $!, timestamp $ts"
+  echo "  log:     tail -f $log"
+  echo "  watcher: tail -f $watchlog   (restarts, GPU drains, give-up)"
+  echo "  restarts allowed: ${PROMPT_DELTA_MAX_RESTARTS:-20}"
+  echo "  stop:    pkill -f watch_prompt_delta_experiment && kill $pid"
+  echo "  resume after a full stop: re-run with PROMPT_DELTA_ITERATION_TIMESTAMP=$ts"
+  echo "  (CAPO_FOREGROUND=1 runs the driver in this shell, unwatched)"
+  if ! grep -q TELEGRAM_BOT_TOKEN "$ENV_FILE" 2>/dev/null; then
+    echo "  no TELEGRAM_BOT_TOKEN in $ENV_FILE -- restart alerts stay silent, which"
+    echo "  is fine; the watcher log records them either way."
   fi
 }
 
