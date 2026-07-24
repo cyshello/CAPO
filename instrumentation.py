@@ -291,7 +291,7 @@ def _wrap_router_factory(make_router, recorder: RunRecorder):
                                         for m in (messages or [])),
                     "response_chars": len(str((resp or {}).get("content") or "")),
                     "has_tool_calls": bool((resp or {}).get("tool_calls")),
-                    "usage": None,  # DVD's return shape drops usage; never estimate
+                    "usage": (resp or {}).get("_usage"),  # exact tokens when the backend supplies them
                     "latency_seconds": time.time() - t0,
                     "error": error,
                 })

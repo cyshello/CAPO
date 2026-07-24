@@ -197,6 +197,14 @@ def _build_static_confirmation(args) -> LazyDVDMetaPromptConfirmationEvaluator:
 
 def build_caption_prompt_components(args) -> tuple[Any, Any, Any]:
     """Feedback (reused), caption-prompt updater, static-generator confirmation."""
+    # build_checkpoint_g_components cross-checks the prepared runtime's
+    # prompt_generator identity against config.PROMPT_GENERATOR_{MODEL,BACKEND}_ID
+    # and aborts on a mismatch. On the static path the prepared runtime says
+    # 'static', so align config to it in this process only (the generator is
+    # never called; this is the same alignment run_static_evidence does for the
+    # evidence process's own cross-check).
+    config.PROMPT_GENERATOR_MODEL_ID = "static"
+    config.PROMPT_GENERATOR_BACKEND_ID = "static"
     feedback, updater, _incumbent_confirmation = build_checkpoint_g_components(
         args)
     return feedback, _wrap_updater(updater), _build_static_confirmation(args)

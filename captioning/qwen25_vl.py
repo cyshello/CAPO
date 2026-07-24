@@ -174,4 +174,29 @@ class Qwen25VLCaptioner(BaseCaptioner):
                 json_schema=json_schema,
             ),
         )
+        # vLLM exposes exact token counts per request (prompt_token_ids already
+        # includes the vision tokens for the sampled frames). Stash the per-item
+        # usage on the instance so the single-caption path and the GPU-worker
+        # handlers can forward it without changing the list[str] return contract.
+        self._last_batch_usage = [
+            {
+                "prompt_tokens": len(output.prompt_token_ids or ()),
+                "completion_tokens": len(output.outputs[0].token_ids or ()),
+            }
+            for output in outputs
+        ]
+        # Minimal, IPC-free token accounting: when SR_QWEN_USAGE_LOG is set,
+        # append one record per caption to a per-process JSONL. prompt_sha16
+        # lets a post-run script split totals by caption prompt (e.g. baseline
+        # vs intervention). Absent the env var this is a no-op.
+        _usage_log = os.environ.get("SR_QWEN_USAGE_LOG")
+        if _usage_log:
+            import json as _json
+            import hashlib as _hashlib
+            with open(f"{_usage_log}.{os.getpid()}.jsonl", "a") as _fh:
+                for _usage, _prompt in zip(self._last_batch_usage, prompts):
+                    _rec = dict(_usage)
+                    _rec["prompt_sha16"] = _hashlib.sha256(
+                        _prompt.encode("utf-8")).hexdigest()[:16]
+                    _fh.write(_json.dumps(_rec) + "\n")
         return [output.outputs[0].text.strip() for output in outputs]

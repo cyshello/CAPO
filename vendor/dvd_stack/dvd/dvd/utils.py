@@ -143,14 +143,34 @@ def call_openai_model_with_tools(
     
     # Get the message from the response
     message = response_data['choices'][0]['message']
-    
+
+    # Carry OpenAI's usage block (prompt/completion/reasoning tokens) back to
+    # the caller under a private key. Callers that don't read it are unaffected;
+    # the instrumentation recorder picks it up for exact token accounting.
+    usage = response_data.get('usage')
+
+    # Direct, IPC-free usage log independent of the instrumentation router
+    # (whose recording wrapper does not currently reach this call path). When
+    # SR_OPENAI_USAGE_LOG is set, append one record per call to a per-process
+    # JSONL. Point the training driver and the measurement worker at different
+    # paths to split their totals. No-op when the env var is absent.
+    _usage_log = os.environ.get("SR_OPENAI_USAGE_LOG")
+    if _usage_log and usage:
+        try:
+            with open(f"{_usage_log}.{os.getpid()}.jsonl", "a") as _fh:
+                _fh.write(json.dumps({"model": model_name, **usage}) + "\n")
+        except Exception:
+            pass
+
     # Check if there's a tool call in the response
     if "tool_calls" in message:
         # Return the entire message object when tools are being used
+        message['_usage'] = usage
         return message
     else:
         # If there's no tool call, just return the text content
-        return {"content": message['content'].strip(), "tool_calls": None}
+        return {"content": message['content'].strip(), "tool_calls": None,
+                "_usage": usage}
 
 class AzureOpenAIEmbeddingService:  
     @staticmethod  
