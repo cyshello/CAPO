@@ -42,7 +42,7 @@ export PYTHONPATH="$REPO_PARENT:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # FFmpeg/TLS chain resolves the system libp11-kit/libffi and dies with
 # "undefined symbol: ffi_type_pointer, version LIBFFI_BASE_7.0". Prepend the env
 # lib dir so conda's libffi wins.
-_CONDA_ENV_PREFIX="$(conda info --base 2>/dev/null)/envs/$SR_CONDA_ENV"
+_CONDA_ENV_PREFIX="$(conda run -n "$SR_CONDA_ENV" bash -lc 'printf %s "$CONDA_PREFIX"' 2>/dev/null)"
 [ -d "$_CONDA_ENV_PREFIX/lib" ] && export LD_LIBRARY_PATH="$_CONDA_ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 : "${OPENAI_API_KEY:?OPENAI_API_KEY is missing from $PROJECT_ROOT/.env}"
 
