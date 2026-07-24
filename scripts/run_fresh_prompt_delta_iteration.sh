@@ -73,7 +73,7 @@ for _budget in "$OPTIMIZER_MAX_OUTPUT_TOKENS" "$GENERATOR_MAX_OUTPUT_TOKENS"; do
     exit 2
   fi
 done
-MODEL_IDENTITY="captioner=Qwen/Qwen2.5-VL-7B-Instruct;prompt_generator=${GENERATOR_MODEL_ID};dvd_tool=${SR_ORCHESTRATOR_TOOL_MODEL:-gpt-4o};dvd_fallback=gpt-5.5"
+MODEL_IDENTITY="captioner=${SR_CAPTION_MODEL_ID:-Qwen/Qwen2.5-VL-7B-Instruct};prompt_generator=${GENERATOR_MODEL_ID};dvd_tool=${SR_ORCHESTRATOR_TOOL_MODEL:-gpt-4o};dvd_fallback=gpt-5.5"
 
 # Held-out measurement can run inline or on its own GPUs. Deferring it keeps a
 # measurement failure -- or a measurement worker that is not running yet -- from
