@@ -150,6 +150,17 @@ CAPTION_DECODING = {
     "max_frames_per_clip": None,  # run_dvd derives sample_fps * clip_secs
     "image_max_pixels": 200704,
 }
+# Reasoning-tuned captioners (Qwen3.5+) think before answering unless the chat
+# template is told not to, and the same prompt then yields a different caption.
+# That makes the flag part of the caption identity: a cache written with it one
+# way must not answer a request made the other way. It joins the decoding dict
+# only when enabled, so the default identity -- and every cache already written
+# under it, including every Qwen2.5-VL cache -- is unchanged.
+CAPTION_ENABLE_THINKING = os.environ.get(
+    "SR_CAPTION_ENABLE_THINKING", "0") not in ("0", "false", "False", "")
+if CAPTION_ENABLE_THINKING:
+    CAPTION_DECODING["enable_thinking"] = True
+
 CAPTION_SUBJECT_REGISTRY_MODE = os.environ.get(
     "SR_CAPTION_SUBJECT_REGISTRY_MODE", "empty").strip().lower()
 if CAPTION_SUBJECT_REGISTRY_MODE not in {"empty", "optional"}:
