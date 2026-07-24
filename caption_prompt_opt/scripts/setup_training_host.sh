@@ -102,9 +102,14 @@ stage_env(){
   # FFmpeg/TLS chain loads. An env with an older libffi fails with
   # "undefined symbol: ffi_type_pointer, version LIBFFI_BASE_7.0" (and can break
   # other tools too). Install both from conda-forge so the env's libffi matches.
-  say "env: FFmpeg + libffi (conda-forge) for torchcodec video decode"
-  conda install -y -n "$CONDA_ENV" -c conda-forge ffmpeg 'libffi>=3.4' || \
-    warn "conda-forge ffmpeg/libffi install failed -- video decode may error"
+  # conda-forge ffmpeg also pulls a recent ICU/libstdc++; a defaults-channel env
+  # has an older libstdcxx/libgcc runtime, so without upgrading those the load
+  # fails with "GLIBCXX_3.4.30 not found (required by libicuuc)". Install the
+  # runtime libs from conda-forge together so the whole stack is ABI-consistent.
+  say "env: FFmpeg + libffi + libstdcxx/libgcc (conda-forge) for torchcodec"
+  conda install -y -n "$CONDA_ENV" -c conda-forge \
+    ffmpeg 'libffi>=3.4' libstdcxx-ng libgcc-ng || \
+    warn "conda-forge video-decode runtime install failed -- decode may error"
   conda run -n "$CONDA_ENV" python -c "import torchcodec" 2>/dev/null && \
     ok "torchcodec loads" || warn "torchcodec still not importable -- check FFmpeg/libffi"
   py -c "import vllm,torch,transformers;print('  vllm',vllm.__version__,'torch',torch.__version__,'cuda',torch.version.cuda,'transformers',transformers.__version__)"
