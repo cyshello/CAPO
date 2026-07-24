@@ -187,7 +187,7 @@ if [[ ! -f "$INPUT_ROOT/manifest.json" ]]; then
     --api-key-environment-variable OPENAI_API_KEY \
     --timeout-seconds 600 \
     --proposer-model-id "$OPTIMIZER_MODEL_ID" \
-    --proposer-context-limit 128000 \
+    --proposer-context-limit 300000 \
     --proposer-maximum-output-tokens "$OPTIMIZER_MAX_OUTPUT_TOKENS" \
     --proposer-temperature 0.0 \
     --proposer-policy-version fresh_prompt_delta_proposer_gpt4o_per_qa_isolated_v6 \
@@ -196,12 +196,12 @@ if [[ ! -f "$INPUT_ROOT/manifest.json" ]]; then
     --selection-policy source_qa_localized_trajectory_segments_v2_global_only_excluded \
     --global-inspection-boundary-tolerance-seconds 10 \
     --feedback-model-id "$OPTIMIZER_MODEL_ID" \
-    --feedback-context-limit 128000 \
+    --feedback-context-limit 300000 \
     --feedback-maximum-output-tokens "$OPTIMIZER_MAX_OUTPUT_TOKENS" \
     --feedback-temperature 0.0 \
     --feedback-policy-version episode_feedback_request_v12_directional_gpt4o \
     --updater-model-id "$OPTIMIZER_MODEL_ID" \
-    --updater-context-limit 128000 \
+    --updater-context-limit 300000 \
     --updater-maximum-output-tokens "$OPTIMIZER_MAX_OUTPUT_TOKENS" \
     --updater-temperature 0.0 \
     --updater-policy-version "$UPDATER_POLICY_VERSION" \
