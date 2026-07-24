@@ -11,12 +11,6 @@ set -a
 source "$PROJECT_ROOT/.env"
 set +a
 export PYTHONPATH="$(dirname "$PROJECT_ROOT"):$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-# `conda run` does not put the env's lib dir on the loader path, so torchcodec's
-# FFmpeg/TLS chain resolves the system libp11-kit/libffi and dies with
-# "undefined symbol: ffi_type_pointer, version LIBFFI_BASE_7.0". Prepend the env
-# lib dir so conda's libffi wins.
-_CONDA_ENV_PREFIX="$(conda run -n "$SR_CONDA_ENV" bash -lc 'printf %s "$CONDA_PREFIX"' 2>/dev/null)"
-[ -d "$_CONDA_ENV_PREFIX/lib" ] && export LD_LIBRARY_PATH="$_CONDA_ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 : "${OPENAI_API_KEY:?OPENAI_API_KEY is missing from $PROJECT_ROOT/.env}"
 
 RUN_TIMESTAMP="${FRESH_PROMPT_DELTA_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}"

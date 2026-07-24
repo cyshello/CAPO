@@ -97,13 +97,14 @@ stage_env(){
       warn "pinned install failed -- on Blackwell try: pip install -U vllm torch, then re-run"
   fi
   conda run -n "$CONDA_ENV" pip install huggingface_hub
-  # torchcodec (pulled in by Qwen-VL video decoding) needs FFmpeg 5+ and a
-  # matching libffi; a fresh host often has only FFmpeg 4, which fails with
-  # "libavutil.so.57: cannot open shared object file" / a LIBFFI_BASE_7.0 symbol
-  # error. conda-forge ffmpeg brings a self-consistent libav*/libffi/glib stack.
-  say "env: FFmpeg (conda-forge) for torchcodec video decode"
-  conda install -y -n "$CONDA_ENV" -c conda-forge ffmpeg || \
-    warn "conda-forge ffmpeg install failed -- video decode may error; install FFmpeg 5+ manually"
+  # torchcodec (pulled in by Qwen-VL video decoding) needs FFmpeg 5+ AND a libffi
+  # new enough (>=3.4, providing LIBFFI_BASE_7.0) for the system libp11-kit the
+  # FFmpeg/TLS chain loads. An env with an older libffi fails with
+  # "undefined symbol: ffi_type_pointer, version LIBFFI_BASE_7.0" (and can break
+  # other tools too). Install both from conda-forge so the env's libffi matches.
+  say "env: FFmpeg + libffi (conda-forge) for torchcodec video decode"
+  conda install -y -n "$CONDA_ENV" -c conda-forge ffmpeg 'libffi>=3.4' || \
+    warn "conda-forge ffmpeg/libffi install failed -- video decode may error"
   conda run -n "$CONDA_ENV" python -c "import torchcodec" 2>/dev/null && \
     ok "torchcodec loads" || warn "torchcodec still not importable -- check FFmpeg/libffi"
   py -c "import vllm,torch,transformers;print('  vllm',vllm.__version__,'torch',torch.__version__,'cuda',torch.version.cuda,'transformers',transformers.__version__)"
