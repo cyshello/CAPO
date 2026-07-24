@@ -195,6 +195,19 @@ stage_smoke_vllm(){
   esac
   printf '%s\n' "$out" | awk '/^caption:/{found=1;next} found&&NF{ok=1} END{exit !(found&&ok)}' \
     || die "the smoke run produced no caption text (empty output usually means the token budget went to reasoning)"
+  # The check above cannot fire for a Qwen3.5-style template: it writes the
+  # OPENING <think> into the prompt, so the tag never appears in the model's
+  # output even while every caption is a reasoning trace. Judge the caption
+  # body instead -- a trace opens by restating the task or numbering its own
+  # analysis steps, which a caption never does.
+  local first
+  first=$(printf '%s\n' "$out" | awk '/^caption:/{found=1;next} found&&NF{print;exit}')
+  case "$first" in
+    "The user "*|"The task "*|"I need to"*|"I'll "*|"Let me"*|"Okay,"*|"First,"*|\
+    "We need to"*|"**"[0-9]*)
+      printf '  first caption line: %s\n' "$first" >&2
+      die "the caption opens with a reasoning preamble: thinking is on. The captioner passes enable_thinking=SR_CAPTION_ENABLE_THINKING (default 0) -- check that captioning/qwen25_vl.py forwards it and that the model's chat template honors it" ;;
+  esac
   ok "captioning works end to end on this hardware"
 }
 

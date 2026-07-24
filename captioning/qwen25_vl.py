@@ -21,6 +21,11 @@ from .base import (
 )
 
 _MODEL_ID = os.environ.get("SR_CAPTION_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
+# Reasoning-tuned Qwen models (Qwen3.5+) emit a <think> block before the
+# answer by default; captions must be the answer only. The chat template
+# honors enable_thinking=False (older templates simply ignore the variable).
+_ENABLE_THINKING = os.environ.get(
+    "SR_CAPTION_ENABLE_THINKING", "0") not in ("0", "false", "False", "")
 VLLM_MM_CACHE_POLICY_VERSION = "qwen25_vl_mm_cache_disabled_v1"
 VLLM_MM_PROCESSOR_CACHE_GB = 0.0
 VLLM_PREFIX_CACHING_ENABLED = False
@@ -109,6 +114,7 @@ class Qwen25VLCaptioner(BaseCaptioner):
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=_ENABLE_THINKING,
         )
         image_inputs, video_inputs = process_vision_info(messages)
         if video_inputs:
