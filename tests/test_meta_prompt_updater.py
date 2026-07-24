@@ -327,22 +327,26 @@ def test_injected_backend_uses_strict_parser_and_returns_provisional_result():
         "provider": "fixture_injected", "model": "fixture-updater"}
 
 
-def test_candidate_cannot_embed_episode_segment_or_qa_identifiers():
+def test_candidate_is_not_screened_for_provenance_identifiers():
+    # The provenance-ID screen was removed: the request is ID-free by
+    # construction, so the screen only ever false-fired on common words that an
+    # LLM-authored supporting ID happened to equal. A candidate that contains
+    # such a token must now parse instead of forcing a spurious no_update.
     parent = parent_fixture()
     feedbacks = feedback_fixtures()
     request = build_meta_prompt_update_request(
         parent, feedbacks, updater_policy_version=POLICY)
-    for forbidden in (
+    for token in (
             feedbacks[0].episode_id,
             feedbacks[0].observations[0].supporting_segment_ids[0],
             feedbacks[0].observations[1].supporting_qa_ids[0]):
         value = response(
             [feedbacks[0].feedback_id],
-            candidate=f"Inspect visible continuity for {forbidden}.")
-        with pytest.raises(
-                MetaPromptUpdaterParseError, match="provenance-only"):
-            parse_meta_prompt_update_response(
-                dumps_canonical(value), request=request, feedbacks=feedbacks)
+            candidate=f"Inspect visible continuity for {token}.")
+        decision, _, _ = parse_meta_prompt_update_response(
+            dumps_canonical(value), request=request, feedbacks=feedbacks)
+        assert decision.decision == "update"
+        assert token in decision.candidate_meta_prompt
 
 
 def test_parent_is_not_mutated_and_candidate_id_uses_canonical_inputs():

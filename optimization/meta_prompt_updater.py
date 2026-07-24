@@ -369,66 +369,13 @@ def build_meta_prompt_update_request(
     )
 
 
-def _contains_exact_identifier(text: str, identifier: str) -> bool:
-    """Match a known provenance ID as a complete identifier token.
-
-    Delimiters are defined explicitly instead of using substring matching, so
-    a short ID such as ``qa-1`` does not reject unrelated ``qa-10`` text.
-    """
-    return re.search(
-        rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])",
-        text,
-    ) is not None
-
-
-def validate_meta_prompt_candidate_content(
-    decision: MetaPromptUpdateDecision,
-    feedbacks: tuple[EpisodeFeedback, ...],
-    feedback_memories: Sequence[CompactFeedbackMemoryRecord] | None = None,
-    historical_memories: Sequence[EpisodeFeedbackMemoryRecord] | None = None,
-) -> None:
-    if decision.candidate_meta_prompt is None:
-        return
-    forbidden_ids = {
-        identifier
-        for feedback in feedbacks
-        for identifier in (
-            feedback.feedback_id,
-            feedback.episode_id,
-            *(item for evidence in (
-                *feedback.observations, *feedback.counterevidence)
-              for item in (
-                  *evidence.supporting_segment_ids,
-                  *evidence.supporting_qa_ids)),
-        )
-        if identifier
-    }
-    if feedback_memories is not None:
-        forbidden_ids.update(
-            identifier
-            for record in feedback_memories
-            for identifier in (
-                record.memory_id, record.provenance.feedback_id,
-                record.provenance.episode_id, record.provenance.video_id,
-                *record.provenance.qa_ids, *record.provenance.segment_ids)
-            if identifier)
-    if historical_memories is not None:
-        forbidden_ids.update(
-            identifier for record in historical_memories for identifier in (
-                record.memory_id, record.feedback_id, record.episode_id,
-                record.candidate_id) if identifier)
-    present = sorted(
-        identifier for identifier in forbidden_ids
-        if _contains_exact_identifier(
-            decision.candidate_meta_prompt, identifier))
-    if present:
-        raise ValueError(
-            "candidate meta-prompt contains provenance-only identifiers: "
-            f"{present}")
-    # Whether the candidate depends on runtime-unavailable inputs is stated in
-    # the updater prompt, not matched here. A word search cannot tell "use the
-    # QA answer" from "do not use the QA answer", so it rejected candidates
-    # that were obeying the instruction.
+# The candidate meta-prompt is intentionally not screened for provenance IDs.
+# The updater request is ID-free by construction -- feedback, episode, QA and
+# segment identifiers are stripped before the model sees it -- so the model has
+# no real identifier to leak. A word-boundary screen against the stripped IDs
+# only ever fired on common English words that happened to equal an LLM-authored
+# supporting ID (e.g. a feedback that wrote "multiple" as a supporting_qa_id),
+# rejecting an otherwise valid candidate twice and forcing a spurious no_update.
 
 
 def parse_meta_prompt_update_response(
@@ -465,8 +412,6 @@ def parse_meta_prompt_update_response(
                           if item in known)
         if supported != decision.supporting_feedback_ids:
             decision = replace(decision, supporting_feedback_ids=supported)
-        validate_meta_prompt_candidate_content(
-            decision, ordered, feedback_memories, historical_memories)
         restored = meta_prompt_update_decision_from_json(
             json.loads(dumps_canonical(decision)))
         if restored != decision:
@@ -677,8 +622,6 @@ class DeterministicMockMetaPromptUpdater:
                     "synthesis was performed."),
                 supporting_feedback_ids=supporting_ids,
             )
-            validate_meta_prompt_candidate_content(
-                decision, ordered, feedback_memories, historical_memories)
             identity = {
                 "parent_meta_prompt_id": parent.meta_prompt_id,
                 "updater_policy_version": self.updater_policy_version,

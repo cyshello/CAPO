@@ -272,7 +272,10 @@ def test_existing_output_directory_is_write_once_and_skips_call(tmp_path):
     assert marker.read_text() == "keep"
 
 
-def test_known_ids_are_rejected_only_on_exact_token_boundaries():
+def test_candidate_containing_a_known_id_token_is_not_rejected():
+    # The provenance-ID screen was removed. A candidate that contains a known
+    # supporting-ID token -- whether embedded (no boundary) or as a whole token
+    # -- now parses instead of forcing a spurious no_update.
     parent = parent_fixture()
     feedbacks = feedback_fixtures()
     request = build_meta_prompt_update_request(
@@ -282,19 +285,15 @@ def test_known_ids_are_rejected_only_on_exact_token_boundaries():
         for feedback in feedbacks
         for evidence in (*feedback.observations, *feedback.counterevidence)
         for segment in evidence.supporting_segment_ids)
-    value = response([item.feedback_id for item in feedbacks])
-    value["candidate_meta_prompt"] = \
-        f"Preserve visible continuity for {known_segment}suffix conditions."
-    decision, candidate_id, status = parse_meta_prompt_update_response(
-        dumps_canonical(value), request=request, feedbacks=feedbacks)
-    assert decision.candidate_meta_prompt == value["candidate_meta_prompt"]
-    assert candidate_id and status == "provisional"
-
-    value["candidate_meta_prompt"] = \
-        f"Preserve visible continuity for {known_segment}."
-    with pytest.raises(MetaPromptUpdaterParseError, match="identifiers"):
-        parse_meta_prompt_update_response(
+    for candidate in (
+            f"Preserve visible continuity for {known_segment}suffix conditions.",
+            f"Preserve visible continuity for {known_segment}."):
+        value = response([item.feedback_id for item in feedbacks])
+        value["candidate_meta_prompt"] = candidate
+        decision, candidate_id, status = parse_meta_prompt_update_response(
             dumps_canonical(value), request=request, feedbacks=feedbacks)
+        assert decision.candidate_meta_prompt == candidate
+        assert candidate_id and status == "provisional"
 
 
 def test_runtime_availability_wording_is_left_to_the_prompt():
