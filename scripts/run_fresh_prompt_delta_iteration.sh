@@ -64,7 +64,12 @@ WORKER_RESULT_TIMEOUT_SECONDS="${FRESH_PROMPT_DELTA_WORKER_RESULT_TIMEOUT_SECOND
 # iteration was measured with; the GPT-5 family needs a larger output budget
 # because reasoning tokens are billed and capped as output.
 OPTIMIZER_MODEL_ID="${FRESH_PROMPT_DELTA_OPTIMIZER_MODEL_ID:-gpt-4o}"
-GENERATOR_MODEL_ID="${FRESH_PROMPT_DELTA_GENERATOR_MODEL_ID:-gpt-4o-mini}"
+# The evidence guard requires the prepared prompt_generator_model_id to equal
+# config.PROMPT_GENERATOR_MODEL_ID (env SR_PROMPT_GENERATOR_MODEL_ID). Fall back
+# to SR_PROMPT_GENERATOR_MODEL_ID so setting only that env keeps the two in sync
+# (otherwise config sees SR_... but the prepared config keeps this default ->
+# "fresh prompt-delta requires the active OpenAI prompt generator").
+GENERATOR_MODEL_ID="${FRESH_PROMPT_DELTA_GENERATOR_MODEL_ID:-${SR_PROMPT_GENERATOR_MODEL_ID:-gpt-4o-mini}}"
 OPTIMIZER_MAX_OUTPUT_TOKENS="${FRESH_PROMPT_DELTA_OPTIMIZER_MAX_OUTPUT_TOKENS:-4096}"
 GENERATOR_MAX_OUTPUT_TOKENS="${FRESH_PROMPT_DELTA_GENERATOR_MAX_OUTPUT_TOKENS:-512}"
 for _budget in "$OPTIMIZER_MAX_OUTPUT_TOKENS" "$GENERATOR_MAX_OUTPUT_TOKENS"; do
