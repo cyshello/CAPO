@@ -246,8 +246,11 @@ if [[ "${FRESH_PROMPT_DELTA_MEASURE_PARENT:-false}" == "true" && "$PROMOTION_POL
 fi
 
 
+# Evidence entry is swappable so a variant (e.g. full-recaption) can reuse this
+# whole shell — and thus identical model/cohort/optimizer settings — and change
+# only the evidence step. Default is the incumbent selective evidence entry.
 conda run --no-capture-output -n "$SR_CONDA_ENV" \
-  python "$PROJECT_ROOT/scripts/run_fresh_prompt_delta_evidence.py" \
+  python "$PROJECT_ROOT/${FRESH_PROMPT_DELTA_EVIDENCE_ENTRY:-scripts/run_fresh_prompt_delta_evidence.py}" \
   --prepared-inputs "$INPUT_ROOT" \
   --parent-meta-prompt "$PARENT" \
   --split-manifest "$SPLIT" \
