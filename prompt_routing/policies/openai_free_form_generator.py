@@ -26,6 +26,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 from surrogate_rollout import config
+from surrogate_rollout import token_ledger
 from surrogate_rollout.optimization.openai_chat_model_profile import (
     adapt_chat_completions_body,
     is_reasoning_chat_model,
@@ -166,8 +167,11 @@ class OpenAIFreeFormInstructionGenerator:
                 if response.status_code != 200:
                     raise FreeFormGenerationError(
                         f"HTTP {response.status_code}: {response.text[:300]}")
-                text = (response.json()["choices"][0]["message"]["content"]
-                        or "").strip()
+                data = response.json()
+                text = (data["choices"][0]["message"]["content"] or "").strip()
+                # Additive token accounting only (vision + text of this call).
+                token_ledger.record(
+                    "prompt_generator", self.model_id, data.get("usage"))
                 if text:
                     return text
                 last_error = FreeFormGenerationError("empty completion")

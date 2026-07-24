@@ -31,6 +31,21 @@ OUTPUT_ROOT="${RUN_ROOT}_output"
 STATE_ROOT="${FRESH_PROMPT_DELTA_STATE_ROOT:-${RUN_ROOT}_state}"
 CACHE_ROOT="${FRESH_PROMPT_DELTA_CACHE_ROOT:-${RUN_ROOT}_cache}"
 FEEDBACK_MEMORY_BANK_ROOT="${FRESH_PROMPT_DELTA_MEMORY_BANK_ROOT:-$PROJECT_ROOT/runs/prompt_delta_feedback_memory_bank}"
+
+# Token accounting (additive only). Every model call in both phases and their
+# GPU-worker subprocesses appends usage into this per-iteration ledger dir; the
+# EXIT trap sums it and prints a per-source token report when the iteration ends.
+# Set SR_TOKEN_LEDGER_DIR yourself to override, or unset all three below to skip.
+export SR_TOKEN_LEDGER_DIR="${SR_TOKEN_LEDGER_DIR:-${RUN_ROOT}_tokens}"
+mkdir -p "$SR_TOKEN_LEDGER_DIR"
+export SR_QWEN_USAGE_LOG="${SR_QWEN_USAGE_LOG:-$SR_TOKEN_LEDGER_DIR/qwen}"
+export SR_OPENAI_USAGE_LOG="${SR_OPENAI_USAGE_LOG:-$SR_TOKEN_LEDGER_DIR/dvd_openai}"
+_report_token_usage() {
+  python "$PROJECT_ROOT/scripts/report_token_usage.py" \
+    "$SR_TOKEN_LEDGER_DIR" 2>/dev/null || true
+}
+trap _report_token_usage EXIT
+
 PARENT="${FRESH_PROMPT_DELTA_PARENT_META_PROMPT:-$PROJECT_ROOT/optimization/prompts/init_meta_prompt.json}"
 BASELINE_RESUME_DIR="${FRESH_PROMPT_DELTA_BASELINE_RESUME_DIR:-}"
 BASELINE_RESUME_ARGS=()

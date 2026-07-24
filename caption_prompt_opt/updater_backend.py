@@ -39,6 +39,14 @@ class SystemPromptOverrideUpdaterBackend:
         self._text = system_instruction.strip()
         self._replaced_base = replaced_base
 
+    def __getattr__(self, name: str) -> Any:
+        # Transparent decorator: forward every attribute this wrapper does not
+        # define itself (provider, model_id, updater_policy_version,
+        # prepare_messages, call_count, last_* ...) to the wrapped backend, so
+        # callers that inspect the backend see the inner implementation.
+        # Only __call__ and fit_user_request are intercepted to swap the prompt.
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
     def _swap(self, system_instruction: str) -> str:
         # Preserve any appended text (e.g. the retry rejection note) by swapping
         # only the known baked prefix; fall back to our text otherwise.

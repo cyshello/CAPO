@@ -106,8 +106,8 @@ def test_supported_feedback_still_carries_its_prose():
         _feedback("supported", "when a trophy is held up, name it"), None)
     assert projection["caption_or_trajectory_evidence"] == [
         "Observed: the intervention captions named the trophy."]
-    assert projection["recommended_strategy_change"] == \
-        "when a trophy is held up, name it"
+    # recommended_strategy_change is withheld from the updater payload.
+    assert "recommended_strategy_change" not in projection
 
 
 @pytest.mark.parametrize("status", [
@@ -116,7 +116,7 @@ def test_supported_feedback_still_carries_its_prose():
 def test_abstaining_feedback_contributes_no_prose(status):
     projection = _updater_feedback_projection(_feedback(status), None)
     assert projection["caption_or_trajectory_evidence"] == []
-    assert projection["recommended_strategy_change"] is None
+    assert "recommended_strategy_change" not in projection
     assert projection["observable_trigger"] is None
     assert projection["caption_operation"] is None
 

@@ -45,6 +45,11 @@ them as: when it is important, relevant, useful, key, when it helps answer
 the question, when it resolves an error, when it improves performance, or
 when it is needed for correctness.
 
+Keep observable_trigger and caption_operation short: one concise clause each,
+naming a single condition and a single action, ideally within about twenty
+words. State the frame/history property plainly; do not enumerate several
+sub-conditions or pack multiple cases into one field.
+
 Keep QA outcomes, transitions, and utility judgements in outcome_summary,
 generator_diagnosis, and confidence only.
 

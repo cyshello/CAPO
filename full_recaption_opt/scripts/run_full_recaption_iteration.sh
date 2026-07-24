@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# Operator-run only: one fresh caption-PROMPT iteration from the current parent.
-# Faithful copy of scripts/run_fresh_prompt_delta_iteration.sh, with exactly the
-# caption-path swaps:
-#   * evidence entry  -> caption_prompt_opt/run_static_evidence.py (static gen)
+# Operator-run only: one fresh FULL-RECAPTION iteration from the current parent.
+# Copy of caption_prompt_opt/scripts/run_caption_iteration.sh, differing only in
+# the evidence entry so the delta is applied to EVERY baseline segment (full
+# recaption) instead of the source-QA-localized subset:
+#   * evidence entry  -> full_recaption_opt/run_full_recaption_evidence.py
 #   * component factory-> caption_prompt_opt.factory:build_caption_prompt_components
-#   * parent default  -> caption_prompt_opt/prompts/init_caption_prompt.json
+#                        (reused; the update phase and confirmation are identical)
+#   * parent default  -> caption_prompt_opt/prompts/init_caption_prompt.json (reused)
 #   * prompt-generator identity -> static (no model call; cross-check aligned in
-#     run_static_evidence)
-#   * cache / pipeline identities -> isolated static caption-prompt namespace
-#   * run dirs prefixed caption_prompt_iteration_
+#     run_full_recaption_evidence)
+#   * cache / pipeline identities -> isolated full-recaption namespace
+#   * run dirs prefixed full_recaption_iteration_
 # Keeps the FRESH_PROMPT_DELTA_* env names so the K-iteration launcher drives it
 # the same way the incumbent one drives run_fresh_prompt_delta_iteration.sh.
 # This script performs paid/model work; do not let an assistant run it.
 
 set -euo pipefail
 
+# CPO_ROOT here points at full_recaption_opt (this script's package): its own
+# evidence launcher lives here, while the component factory and the init caption
+# prompt are reused from the sibling caption_prompt_opt package by explicit path.
 CPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -n "${SR_PROJECT_ROOT:-}" ]]; then
   PROJECT_ROOT="$SR_PROJECT_ROOT"
@@ -46,14 +51,14 @@ if [[ ! "$WORKER_GPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
   exit 2
 fi
 
-# Isolated run roots (caption_prompt_iteration_* — never collide with a meta run).
-RUN_ROOT="$PROJECT_ROOT/runs/caption_prompt_iteration_${RUN_TIMESTAMP}"
+# Isolated run roots (full_recaption_iteration_* — never collide with caption/meta).
+RUN_ROOT="$PROJECT_ROOT/runs/full_recaption_iteration_${RUN_TIMESTAMP}"
 INPUT_ROOT="${RUN_ROOT}_inputs"
 EVIDENCE_ROOT="${RUN_ROOT}_evidence"
 OUTPUT_ROOT="${RUN_ROOT}_output"
 STATE_ROOT="${FRESH_PROMPT_DELTA_STATE_ROOT:-${RUN_ROOT}_state}"
 CACHE_ROOT="${FRESH_PROMPT_DELTA_CACHE_ROOT:-${RUN_ROOT}_cache}"
-FEEDBACK_MEMORY_BANK_ROOT="${FRESH_PROMPT_DELTA_MEMORY_BANK_ROOT:-$PROJECT_ROOT/runs/caption_prompt_feedback_memory_bank}"
+FEEDBACK_MEMORY_BANK_ROOT="${FRESH_PROMPT_DELTA_MEMORY_BANK_ROOT:-$PROJECT_ROOT/runs/full_recaption_feedback_memory_bank}"
 
 # Token accounting (additive only). Same block as the incumbent fresh shell: the
 # shared, instrumented model-call seams already cover every CAPO path (feedback,
@@ -70,7 +75,7 @@ _report_token_usage() {
 }
 trap _report_token_usage EXIT
 
-PARENT="${FRESH_PROMPT_DELTA_PARENT_META_PROMPT:-$CPO_ROOT/prompts/init_caption_prompt.json}"
+PARENT="${FRESH_PROMPT_DELTA_PARENT_META_PROMPT:-$PROJECT_ROOT/caption_prompt_opt/prompts/init_caption_prompt.json}"
 BASELINE_RESUME_DIR="${FRESH_PROMPT_DELTA_BASELINE_RESUME_DIR:-}"
 BASELINE_RESUME_ARGS=()
 if [[ -n "$BASELINE_RESUME_DIR" ]]; then
@@ -91,8 +96,8 @@ fi
 UPDATER_POLICY_VERSION="${FRESH_PROMPT_DELTA_UPDATER_POLICY_VERSION:-caption_prompt_updater_v1}"
 
 # Static caption-prompt identities (isolated from any meta run).
-EVAL_PIPELINE_IDENTITY="dvd_history_aware_static_caption_prompt_paired_v1"
-CACHE_RESET_IDENTITY="caption_prompt_static_clean_${RUN_TIMESTAMP}"
+EVAL_PIPELINE_IDENTITY="dvd_history_aware_static_full_recaption_paired_v1"
+CACHE_RESET_IDENTITY="full_recaption_static_clean_${RUN_TIMESTAMP}"
 # prompt_generator is VESTIGIAL under the static path (no model call). Marked
 # 'static' everywhere; run_static_evidence aligns config.PROMPT_GENERATOR_* so
 # the evidence cross-check passes.
@@ -106,7 +111,7 @@ MODEL_IDENTITY="captioner=${SR_CAPTION_MODEL_ID:-Qwen/Qwen2.5-VL-7B-Instruct};pr
 PROMOTION_POLICY="${FRESH_PROMPT_DELTA_PROMOTION_POLICY:-promote_and_enqueue_measurement_v1}"
 MEASUREMENT_QUEUE_ARGS=()
 if [[ "$PROMOTION_POLICY" == "promote_and_enqueue_measurement_v1" ]]; then
-  MEASUREMENT_QUEUE_DIR="${FRESH_PROMPT_DELTA_MEASUREMENT_QUEUE_DIR:-$PROJECT_ROOT/runs/caption_prompt_measurement_queue}"
+  MEASUREMENT_QUEUE_DIR="${FRESH_PROMPT_DELTA_MEASUREMENT_QUEUE_DIR:-$PROJECT_ROOT/runs/full_recaption_measurement_queue}"
   mkdir -p "$MEASUREMENT_QUEUE_DIR"
   MEASUREMENT_QUEUE_ARGS+=(--measurement-queue-dir "$MEASUREMENT_QUEUE_DIR")
 fi
@@ -246,7 +251,7 @@ if [[ "${FRESH_PROMPT_DELTA_MEASURE_PARENT:-false}" == "true" && "$PROMOTION_POL
     --meta-prompt "$PARENT" \
     --confirmation-cases "$INPUT_ROOT/confirmation_cases.json" \
     --output-dir "$PARENT_MEASUREMENT_ROOT" \
-      --iteration-id "iteration_0_initial_caption_prompt_${RUN_TIMESTAMP}" \
+      --iteration-id "iteration_0_initial_full_recaption_${RUN_TIMESTAMP}" \
     --model-identity "$MODEL_IDENTITY" \
     --decoding-settings "$INPUT_ROOT/paired_decoding_settings.json" \
       --cache-reset-identity "$CACHE_RESET_IDENTITY" \
@@ -254,7 +259,7 @@ if [[ "${FRESH_PROMPT_DELTA_MEASURE_PARENT:-false}" == "true" && "$PROMOTION_POL
 fi
 
 conda run --no-capture-output -n "$SR_CONDA_ENV" \
-  python "$CPO_ROOT/run_static_evidence.py" \
+  python "$CPO_ROOT/run_full_recaption_evidence.py" \
   --prepared-inputs "$INPUT_ROOT" \
   --parent-meta-prompt "$PARENT" \
   --split-manifest "$SPLIT" \
@@ -314,7 +319,7 @@ fi
 
 conda run --no-capture-output -n "$SR_CONDA_ENV" \
   python "$PROJECT_ROOT/scripts/run_prompt_delta_iteration.py" \
-  --iteration-id "caption_prompt_${RUN_TIMESTAMP}" \
+  --iteration-id "full_recaption_${RUN_TIMESTAMP}" \
   --parent-meta-prompt "$PARENT" \
   "${EPISODE_ARGS[@]}" \
   --confirmation-cases "$INPUT_ROOT/confirmation_cases.json" \

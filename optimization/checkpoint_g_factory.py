@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from surrogate_rollout import config
+from surrogate_rollout import token_ledger
 from surrogate_rollout.captioning.history_aware_baseline import (
     HistoryAwareBaselineCaptionViewBuilder,
 )
@@ -107,6 +108,11 @@ class _OpenAITransport:
         value = json.loads(raw)
         if not isinstance(value, Mapping):
             raise TypeError("provider response envelope must be an object")
+        # Additive token accounting only; return value is unchanged. Covers the
+        # feedback, proposer, and updater stages, which all reach this base
+        # request(). No-op unless SR_TOKEN_LEDGER_DIR is set.
+        token_ledger.record(
+            "openai_optimizer", body.get("model"), value.get("usage"))
         return value
 
     def feedback(self, body: Mapping[str, Any]) -> str:

@@ -247,9 +247,9 @@ def _updater_feedback_projection(
         # rest is still transmitted as an observation, so the updater sees the
         # episode happened, without a lesson it is not entitled to draw.
         "attribution_status": feedback.attribution_status,
-        "recommended_strategy_change": (
-            _id_free_text(feedback.recommended_strategy_change)
-            if supported else None),
+        # recommended_strategy_change is deliberately withheld from the updater
+        # payload: it is delta-prompt intervention advice, not a rule the updater
+        # should adopt. It still flows into compact memory (feedback_memory.py).
         "observable_trigger": (
             _id_free_text(feedback.observable_trigger)
             if supported else None),

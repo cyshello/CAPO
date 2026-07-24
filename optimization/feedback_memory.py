@@ -46,11 +46,9 @@ EPISODE_MEMORY_RECORD_POLICY_VERSION = "provider_authored_episode_memory_v1"
 EPISODE_MEMORY_CARRY_OVER_POLICY_VERSION = \
     "rebase_parent_scoped_episode_memory_on_promotion_v1"
 
-_WORD_RE = re.compile(r"\b[\w'-]+\b", flags=re.UNICODE)
 _CAUSAL_RE = re.compile(
     r"\b(?:caused|led\s+to|corrected|resulted\s+in)\b",
     flags=re.IGNORECASE)
-_MARKDOWN_RE = re.compile(r"(?:```|^\s*[-*#>]\s|\n)", flags=re.MULTILINE)
 _EFFECT_ORDER = (
     "wrong_to_correct", "correct_to_wrong", "correct_to_correct",
     "wrong_to_wrong",
@@ -82,19 +80,14 @@ def _file_sha256(path: str) -> str:
 
 
 def validate_compact_feedback_text(value: str, *, field_name: str) -> None:
+    # Word-count, sentence-count, markdown, and causal-verb limits used to be
+    # enforced here. They read tokens rather than meaning and rejected memories
+    # that followed the instruction (e.g. a multi-clause observable_trigger), and
+    # the feedback stage has no retry to absorb a rejection. Only non-emptiness
+    # is required now; causal wording is still surfaced as a non-fatal grounding
+    # conflict (see _CAUSAL_RE at the conflict scan).
     if not isinstance(value, str) or not value.strip():
         raise CompactFeedbackMemoryError(f"{field_name} must be non-empty")
-    if len(_WORD_RE.findall(value)) > 30:
-        raise CompactFeedbackMemoryError(f"{field_name} exceeds 30 words")
-    if _MARKDOWN_RE.search(value):
-        raise CompactFeedbackMemoryError(
-            f"{field_name} must be one plain-text sentence")
-    if len(re.findall(r"[.!?](?=\s|$)", value)) > 1:
-        raise CompactFeedbackMemoryError(
-            f"{field_name} must contain at most one sentence")
-    if _CAUSAL_RE.search(value):
-        raise CompactFeedbackMemoryError(
-            f"{field_name} contains prohibited causal wording")
 
 
 def validate_compact_feedback_memory_record(
@@ -286,13 +279,18 @@ def _runtime_condition(
     identifier_replacements: Mapping[str, str],
 ) -> str:
     candidate = None
-    rule = feedback.recommended_strategy_change
+    # Source the memory's runtime condition from observable_trigger (a clean
+    # frame/history condition), not recommended_strategy_change (delta-prompt
+    # intervention advice), so the delta-instruction phrasing never reaches the
+    # updater's historical memory.
+    rule = feedback.observable_trigger
     if rule is not None and not _contains_exact_identifier(
             rule, identifier_replacements):
         candidate = _safe_sentence(rule)
-    if candidate and re.match(
-            r"^(?:if|when|while|during|where)\b", candidate,
-            flags=re.IGNORECASE):
+    # observable_trigger is already constrained by the feedback generator to be a
+    # concrete frame/history condition (vague phrasings are forbidden), so no
+    # when-clause form is required; use it directly when present and id-free.
+    if candidate:
         return candidate
     return (
         "The current frames or bounded history match the recorded "
@@ -398,8 +396,8 @@ def build_compact_feedback_memories(
                     "feedback cites segment change while captions match")
             feedback_prose = " ".join(
                 item for item in (
-                    feedback.outcome_summary, feedback.generator_diagnosis,
-                    feedback.recommended_strategy_change) if item)
+                    feedback.outcome_summary, feedback.generator_diagnosis)
+                if item)
             if attribution != "direct" and _CAUSAL_RE.search(feedback_prose):
                 conflicts.append(
                     "feedback uses causal wording without direct trajectory grounding")

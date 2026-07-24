@@ -17,6 +17,9 @@ Write the meta-prompt without assuming such information; all conditions and prio
 - caption_or_trajectory_evidence describes the caption behavior that actually occurred and its downstream effects.
 - historical_experience contains earlier examples of potentially useful attention targets, not mandatory rules or output formats.
 - parent_meta_prompt is the current meta-prompt.
+- recommended_strategy_change is just a feedback for delta prompt intervention. 
+
+Thus, if a feeback claims "When requiring a visible logos , require the captioner to emit the original descriptive caption unchanged..." then it refers to recommend a delta prompt, not the meta prompt.
 
 # HOW TO UPDATE
 Now, considering the feedbacks, generate a meta prompt that can generate an instruction for captioner, that will finally generate captions supports downstream reasoning.
@@ -33,13 +36,12 @@ prohibition on writing the caption, and plain-text output contract. Re-evaluate
 and freely remove all other behavioral rules.
 
 - Do not simply append objects in the rulesor include parenthetical examples in the candidate_meta_prompt.; find a common and **GENERAL** word to explain it.
- 
-- Before returning, remove every object, setting, attribute, or example copied from the feedback and merge the rules again.
 
-- Do not retain a list of three or more sibling object or scene categories in the candidate_meta_prompt. Replace the list with the shared observable property or semantic captioning behavior.
+- Before returning, remove every object, setting, attribute, or example copied
+from the feedback and merge the rules again.
 
 - IMPORTANT : Before adding a new rule, compare it with the existing rules and merge rules that address the same underlying captioning difficulty.
-- IMPORTANT : the feedback and caption_operation might seem they are assuming an instruction or QA task, but meta prompt is NOT. DO NOT assume any instruction or request in meta prompt.
+- IMPORTANT : the feedback and caption_operation might seem they are assuming an instruction or QA task, but meta prompt is NOT. Since the task will be appeared after meta prompt phase, DO NOT assume any instruction or request in meta prompt.
 
 # FORHIBITTED
 - DO NOT write specific example, attributes or object names that are shown in the feedback on meta prompt.

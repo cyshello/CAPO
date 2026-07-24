@@ -112,7 +112,7 @@ def test_grounding_wins_and_noop_invalid_are_deterministic():
             supporting_segment_ids=(segment_id,),
             supporting_qa_ids=(), evidence_type="caption_change",
             transition_type=None),),
-        recommended_strategy_change=(
+        observable_trigger=(
             f"When reviewing {episode.qa_outcomes[0].qa_id}, inspect context."))
     sanitized = build_compact_feedback_memories(
         feedback=id_bearing, episode=episode,

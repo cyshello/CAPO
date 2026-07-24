@@ -30,6 +30,11 @@ fi
 REPO_PARENT="$(dirname "$REPO_DIR")"
 
 CONDA_ENV="${SR_CONDA_ENV:-capo}"
+# Propagate the resolved env name to the launched run driver, whose own default
+# (local_llm_vllm) otherwise disagrees with the env this setup builds/uses, so
+# `go` would create one env and `conda run` another. Exporting makes setup the
+# single source of truth; a user override (SR_CONDA_ENV=...) still wins.
+export SR_CONDA_ENV="$CONDA_ENV"
 PYVER="${PYVER:-3.11}"
 CAPTION_MODEL="${SR_CAPTION_MODEL_ID:-Qwen/Qwen3.5-9B}"
 EMBED_MODEL="BAAI/bge-small-en-v1.5"
