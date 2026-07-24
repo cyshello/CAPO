@@ -97,6 +97,15 @@ stage_env(){
       warn "pinned install failed -- on Blackwell try: pip install -U vllm torch, then re-run"
   fi
   conda run -n "$CONDA_ENV" pip install huggingface_hub
+  # torchcodec (pulled in by Qwen-VL video decoding) needs FFmpeg 5+ and a
+  # matching libffi; a fresh host often has only FFmpeg 4, which fails with
+  # "libavutil.so.57: cannot open shared object file" / a LIBFFI_BASE_7.0 symbol
+  # error. conda-forge ffmpeg brings a self-consistent libav*/libffi/glib stack.
+  say "env: FFmpeg (conda-forge) for torchcodec video decode"
+  conda install -y -n "$CONDA_ENV" -c conda-forge ffmpeg || \
+    warn "conda-forge ffmpeg install failed -- video decode may error; install FFmpeg 5+ manually"
+  conda run -n "$CONDA_ENV" python -c "import torchcodec" 2>/dev/null && \
+    ok "torchcodec loads" || warn "torchcodec still not importable -- check FFmpeg/libffi"
   py -c "import vllm,torch,transformers;print('  vllm',vllm.__version__,'torch',torch.__version__,'cuda',torch.version.cuda,'transformers',transformers.__version__)"
   ok "env ready"
 }
