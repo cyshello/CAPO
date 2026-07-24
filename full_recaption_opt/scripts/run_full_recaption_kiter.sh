@@ -36,5 +36,8 @@ fi
 export FRESH_PROMPT_DELTA_EVIDENCE_ENTRY="full_recaption_opt/run_full_recaption_evidence.py"
 # Distinct label -> isolated experiment/state/cache/memory dirs from any meta run.
 export PROMPT_DELTA_EXPERIMENT_LABEL="${PROMPT_DELTA_EXPERIMENT_LABEL:-full_recaption_20video_4iteration}"
+# Promotion policy and the measurement queue come from the pool preset below, so
+# this variant and the meta run it is compared against share one policy; the
+# queue is derived from the label above, keeping the two sets of requests apart.
 
 exec bash "$PROJECT_ROOT/scripts/run_prompt_delta_four_iteration_20video_pool.sh" "$@"

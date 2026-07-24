@@ -12,6 +12,11 @@
 #   DVD tool call        2.2s            (gpt-4o was 1.3s)
 #   feedback   high    ~100s per episode; medium is roughly a third of that
 
+# Captioner. The cache key reads the same variable, so a different model can
+# never collide with a cache written by another one. Left as a `:-` default so
+# an explicit export still wins.
+SR_CAPTION_MODEL_ID=${SR_CAPTION_MODEL_ID:-Qwen/Qwen3.5-9B}
+
 SR_ORCHESTRATOR_TOOL_MODEL=gpt-5-mini
 SR_DVD_REASONING_EFFORT=minimal
 # gpt-5-mini rejected one evidence video's transcript as prompt-policy
