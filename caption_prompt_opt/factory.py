@@ -52,6 +52,7 @@ from surrogate_rollout.prompt_routing.persistence import (
 )
 
 from caption_prompt_opt.confirmation import StaticGeneratorConfirmationEvaluator
+from caption_prompt_opt.feedback_backend import TruncatingEpisodeFeedbackProvider
 from caption_prompt_opt.updater_backend import SystemPromptOverrideUpdaterBackend
 
 _PROMPT_DIRECTORY = Path(__file__).resolve().parent / "prompts"
@@ -67,6 +68,19 @@ def _load_updater_prompt() -> str:
 
 
 CAPTION_UPDATER_SYSTEM_INSTRUCTION = _load_updater_prompt()
+
+
+def _wrap_feedback(feedback: Any) -> None:
+    """Replace the feedback generator's provider with a context-fitting one.
+
+    LLMEpisodeFeedbackGenerator holds its backend on ``response_provider`` and
+    calls it (and its preflight/count_tokens) each episode, so swapping that
+    attribute in place is enough; nothing else in the generator changes.
+    """
+    provider = getattr(feedback, "response_provider", None)
+    if provider is None:
+        raise TypeError("feedback generator exposes no response_provider to wrap")
+    feedback.response_provider = TruncatingEpisodeFeedbackProvider(provider)
 
 
 def _wrap_updater(updater: LLMMetaPromptUpdater) -> LLMMetaPromptUpdater:
@@ -207,4 +221,9 @@ def build_caption_prompt_components(args) -> tuple[Any, Any, Any]:
     config.PROMPT_GENERATOR_BACKEND_ID = "static"
     feedback, updater, _incumbent_confirmation = build_checkpoint_g_components(
         args)
+    # The feedback provider hard-fails when one episode's request (its DVD tool
+    # evidence in particular) exceeds context. On the caption path we accept
+    # lossy truncation, so wrap its provider to fit the per-episode payload to
+    # the budget before preflight rejects it.
+    _wrap_feedback(feedback)
     return feedback, _wrap_updater(updater), _build_static_confirmation(args)
