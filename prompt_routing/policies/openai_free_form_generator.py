@@ -34,6 +34,7 @@ from surrogate_rollout.optimization.openai_chat_model_profile import (
     adapt_chat_completions_body,
     is_reasoning_chat_model,
 )
+from surrogate_rollout.prompt_routing import generator_response_cache as grc
 from surrogate_rollout.prompt_routing import static_meta_replace_body as smrb
 from surrogate_rollout.prompt_routing.free_form_instruction_generator import (
     FREE_FORM_ROUTING_MODE,
@@ -79,6 +80,7 @@ class OpenAIFreeFormInstructionGenerator:
         template_text: str | None = None,
         meta_prompt_id: str | None = None,
         backend_id: str | None = None,
+        response_cache_root: str | None = None,
     ) -> None:
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
@@ -96,7 +98,11 @@ class OpenAIFreeFormInstructionGenerator:
         self.template_version = smrb.META_PROMPT_VERSION
         self.meta_prompt_id = meta_prompt_id or smrb.META_PROMPT_ID
         self.backend_id = backend_id or f"{PROVIDER}:{model_id}"
+        # Explicit root wins; otherwise the run's environment decides, and an
+        # unset variable leaves the generator calling the provider every time.
+        self.response_cache_root = response_cache_root
         self.last_exchange: GeneratorExchange | None = None
+        self.last_response_cache_hit: bool = False
 
     # ----------------------------- identity ------------------------------- #
     @property
@@ -240,8 +246,29 @@ class OpenAIFreeFormInstructionGenerator:
             request, meta_prompt_text=self.template)
         request_hash = sha256_text(prompt)
 
+        # Reuse is keyed by this exact request plus the provider settings that
+        # decide the answer, so a different meta prompt renders a different
+        # request and can never read this entry. See generator_response_cache.
+        cache_root = (self.response_cache_root
+                      or config.generator_response_cache_root())
+        cache_key = grc.GeneratorResponseCacheKey(
+            request_hash=request_hash,
+            base_url=self.base_url,
+            model_id=self.model_id,
+            backend_id=self.backend_id,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            reasoning_effort=config.GENERATOR_REASONING_EFFORT,
+        )
         started = time.monotonic()
-        raw = self._complete(generator_frames, prompt)
+        raw = grc.load(cache_root, video_id=context.video_id,
+                       segment_id=context.segment_id, key=cache_key)
+        self.last_response_cache_hit = raw is not None
+        if raw is None:
+            raw = self._complete(generator_frames, prompt)
+            grc.store(cache_root, video_id=context.video_id,
+                      segment_id=context.segment_id, key=cache_key,
+                      raw_response=raw)
         elapsed = time.monotonic() - started
 
         self.last_exchange = GeneratorExchange(
@@ -259,4 +286,5 @@ class OpenAIFreeFormInstructionGenerator:
             parser_path="plain_text",
             request_hash=request_hash,
             generation_seconds=elapsed,
+            cache_hit=self.last_response_cache_hit,
         )

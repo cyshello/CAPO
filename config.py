@@ -29,6 +29,23 @@ CAPTION_CACHE_ROOT = os.environ.get(
 )
 CACHE_MANIFEST_PATH = os.path.join(CAPTION_CACHE_ROOT, "cache_manifest.jsonl")
 
+# The free-form generator's answer is a paid sampled call whose text becomes
+# part of the caption cache key, so re-sampling it on a resumed run invalidates
+# every caption downstream of it. Point this at the run's own cache root to let
+# the generator reuse its answer to an identical request; unset = no reuse.
+GENERATOR_RESPONSE_CACHE_VARIABLE = "SR_GENERATOR_CACHE_ROOT"
+
+
+def generator_response_cache_root() -> str | None:
+    """Root for cached generator responses, or None when reuse is off.
+
+    Read per call rather than captured at import: a run entry point sets the
+    variable from the run's cache root before any caption worker is spawned,
+    and spawned workers read it back out of the inherited environment.
+    """
+    return os.environ.get(GENERATOR_RESPONSE_CACHE_VARIABLE, "").strip() or None
+
+
 # ----------------------------- dataset ------------------------------------ #
 # Benchmark selection is env-overridable (SR_BENCHMARK / SR_BENCHMARK_SPLIT)
 # so alternative datasets (e.g. lvbench) can run without editing defaults.

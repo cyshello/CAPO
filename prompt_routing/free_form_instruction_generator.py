@@ -60,6 +60,10 @@ class GeneratedCaptionInstruction:
     parser_path: str
     request_hash: str
     generation_seconds: float
+    # True when the provider was not called because an identical request was
+    # already answered in this run's generator cache. Reporting only: it stays
+    # out of the routing decision, whose payload feeds persisted artifacts.
+    cache_hit: bool = False
 
 
 @dataclass(frozen=True)

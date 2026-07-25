@@ -50,6 +50,7 @@ from surrogate_rollout.optimization.policies.episode_feedback_provider import (
 from surrogate_rollout.optimization.context_budget import (
     PROVIDER_CONTEXT_SAFETY_MARGIN_TOKENS,
 )
+from surrogate_rollout.prompt_routing import generator_response_cache
 from surrogate_rollout.prompt_routing.persistence import (
     scaffold_contract_from_json,
     scaffold_policy_from_json,
@@ -339,6 +340,11 @@ def build_checkpoint_g_components(args):
     bank_version = "bank_v9999"
     router_version = "router_v9999"
     def construct_confirmation():
+        # Same reuse the evidence phase gets: a measurement that restarts
+        # regenerates identical instructions, so its caption cache still
+        # resolves instead of recaptioning the held-out cohort from scratch.
+        generator_response_cache.configure_default_root(
+            str(_required(runtime, "cache_root")))
         for path in (config.PROMPT_SENS_ROOT, config.DVD_ROOT):
             if path not in os.sys.path:
                 os.sys.path.insert(0, path)

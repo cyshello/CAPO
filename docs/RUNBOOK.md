@@ -53,6 +53,16 @@ Completed immutable artifacts are reused only when identity and hashes match.
 If regenerating feedback only, move aside the output `feedback/` directory and
 the matching `input_identity.json`; do not delete evidence episodes.
 
+Segment-level resume additionally needs generator reuse. The generated
+instruction is part of the caption cache key, so a re-sampled instruction
+misses every caption after it; the run entry points therefore set
+`SR_GENERATOR_CACHE_ROOT` to the run's own `cache_root`, and the generator
+replays its stored answer to an identical request. Export the variable to send
+reuse elsewhere, or export it empty to turn it off for one run. Entries live in
+`<cache_root>/generator_v1/<video>/<segment>/` and are keyed by the rendered
+request (meta prompt included), so parent and candidate prompts never share
+one.
+
 ## Verification
 
 Focused model-free verification:

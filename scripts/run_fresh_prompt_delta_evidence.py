@@ -33,6 +33,7 @@ from surrogate_rollout.optimization.baseline_phase import (
     BaselinePhaseRunner,
     load_completed_baseline_for_read_only_resume,
 )
+from surrogate_rollout.prompt_routing import generator_response_cache
 from surrogate_rollout.optimization.checkpoint_g_factory import (
     _BoundedOpenAITransport, _exact_counter,
 )
@@ -162,6 +163,11 @@ def main(argv=None) -> int:
         return 0
 
     runtime = component["runtime"]
+    # Generator answers are reused from this run's own cache root, so a restart
+    # regenerates the identical instruction and the caption cache below it
+    # still resolves. Set before any caption worker is spawned; the workers
+    # inherit it.
+    generator_response_cache.configure_default_root(runtime.get("cache_root"))
     provider_cfg = component["provider"]
     proposer_cfg = component["prompt_delta_proposer"]
     expected = {
