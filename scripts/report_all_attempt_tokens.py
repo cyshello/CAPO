@@ -21,11 +21,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from surrogate_rollout import token_ledger  # noqa: E402
 
-DEFAULT_LEDGER_DIRECTORIES = (
-    "runs/fresh_prompt_delta_iteration_20260724_203509_tokens",
-    "runs/fresh_prompt_delta_iteration_20260724_203757_tokens",
-    "runs/fresh_prompt_delta_iteration_20260725_080528_tokens",
-)
+# Every iteration writes its own ledger dir (run_fresh_prompt_delta_iteration.sh
+# exports SR_TOKEN_LEDGER_DIR=<run root>_tokens), and a restarted attempt appends
+# new per-PID files to the same one. Discovering them keeps later iterations in
+# the total without editing this list.
+DEFAULT_LEDGER_GLOB = "runs/fresh_prompt_delta_iteration_*_tokens"
+
+
+def default_ledger_directories(root: str | None = None) -> list[str]:
+    base = Path(root or ".")
+    return sorted(str(path) for path in base.glob(DEFAULT_LEDGER_GLOB)
+                  if path.is_dir())
 # USD per million tokens, provider list price.
 PRICES = {"gpt-5-mini": (0.25, 2.00), "gpt-4o": (2.50, 10.00),
           "gpt-4o-mini": (0.15, 0.60)}
@@ -59,7 +65,7 @@ def _models_per_component(directory: str) -> dict[str, str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("ledger_dirs", nargs="*",
-                        default=list(DEFAULT_LEDGER_DIRECTORIES))
+                        default=default_ledger_directories())
     parser.add_argument("--json", action="store_true",
                         help="Emit the combined report as JSON.")
     args = parser.parse_args(argv)
