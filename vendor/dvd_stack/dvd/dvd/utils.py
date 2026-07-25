@@ -12,6 +12,37 @@ import requests
 from azure.identity import AzureCliCredential
 
 
+# Transport failures that say nothing about the request, so the identical call
+# can succeed a moment later. Added 2026-07-25: a resolver blip
+# ("Failed to resolve 'api.openai.com'") matched none of the patterns below, so
+# the decorator fell through to `return None` -- a silent non-answer that
+# callers read as a model reply. These are retried like a rate limit instead.
+_TRANSIENT_TRANSPORT_MARKERS = (
+    "failed to resolve",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "no address associated with hostname",
+    "connection aborted",
+    "connection reset",
+    "connection refused",
+    "remote end closed connection",
+    "max retries exceeded",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "temporarily unavailable",
+)
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    if isinstance(exc, (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ChunkedEncodingError)):
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_TRANSPORT_MARKERS)
+
+
 def retry_with_exponential_backoff(
     func,
     initial_delay: float = 1,
@@ -34,7 +65,8 @@ def retry_with_exponential_backoff(
             except Exception as e:
                 if "rate limit" in str(e).lower() or "timed out" in str(e) \
                                     or "Too Many Requests" in str(e) or "Forbidden for url" in str(e) \
-                                    or "internal" in str(e).lower():
+                                    or "internal" in str(e).lower() \
+                                    or _is_transient_transport_error(e):
                     # Increment retries
                     num_retries += 1
 

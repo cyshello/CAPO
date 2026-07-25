@@ -17,6 +17,7 @@ REPO_PARENT = REPO_ROOT.parent
 if str(REPO_PARENT) not in sys.path:
     sys.path.insert(0, str(REPO_PARENT))
 
+from surrogate_rollout import network_retry
 from surrogate_rollout.optimization.meta_prompt_update_execution import (
     MetaPromptUpdateExecutionError,
     OpenAICompatibleMetaPromptUpdaterBackend,
@@ -38,7 +39,12 @@ class ProviderTransportError(RuntimeError):
 
 
 class SingleOpenAIChatTransport:
-    """Exactly-one-attempt transport; no retry, repair, or fallback."""
+    """Exactly-one-call transport; no repair or fallback.
+
+    The single call is semantic: `network_retry` may resend the identical body
+    after a transient transport failure, and the one-call guard still holds
+    because a resend is not a second call.
+    """
 
     def __init__(self, *, endpoint: str, api_key: str, timeout_seconds: int) -> None:
         if not endpoint:
@@ -51,6 +57,30 @@ class SingleOpenAIChatTransport:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.call_count = 0
+
+    def _read_once(self, request: urllib.request.Request) -> str:
+        """One transport attempt.
+
+        The error body is read here, once, and carried on the raised exception:
+        `HTTPError.read()` can only be consumed by whoever reaches it first, and
+        with retries in play that is no longer the caller.
+        """
+        try:
+            with urllib.request.urlopen(
+                    request, timeout=self.timeout_seconds) as response:
+                return response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raw_error = exc.read().decode("utf-8", errors="replace")
+            reason = f"provider returned HTTP {exc.code}"
+            if network_retry.is_transient_http_status(exc.code):
+                headers = getattr(exc, "headers", None)
+                transient = network_retry.TransientTransportError(
+                    reason,
+                    retry_after_seconds=network_retry.parse_retry_after(
+                        headers.get("Retry-After") if headers else None))
+                transient.raw_error = raw_error
+                raise transient from exc
+            raise ProviderTransportError(reason, raw_error=raw_error) from exc
 
     def __call__(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
         if self.call_count:
@@ -66,13 +96,16 @@ class SingleOpenAIChatTransport:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(
-                    request, timeout=self.timeout_seconds) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raw_error = exc.read().decode("utf-8", errors="replace")
+            raw = network_retry.retry_transient(
+                lambda: self._read_once(request),
+                description=f"{body.get('model')} updater request")
+        except ProviderTransportError:
+            raise
+        except network_retry.TransientTransportError as exc:
             raise ProviderTransportError(
-                f"provider returned HTTP {exc.code}", raw_error=raw_error) from exc
+                str(exc),
+                raw_error=getattr(exc, "raw_error", f"{type(exc).__name__}: {exc}"),
+            ) from exc
         except BaseException as exc:
             raise ProviderTransportError(
                 f"provider transport failed: {type(exc).__name__}: {exc}",

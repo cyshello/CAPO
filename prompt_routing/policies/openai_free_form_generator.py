@@ -11,7 +11,9 @@ them, and the same text repeated across segments — the condition collapsed int
 one caption per block. A hosted model keeps the two roles separate.
 
 Paid: normally one vision request per segment (up to three identical transport
-attempts under the configured retry policy). Frames follow the shared frame
+attempts under the configured retry policy, plus the transient-transport retries
+in `network_retry`, which repeat the same bytes after a DNS/connection/5xx
+failure and bill only when the provider actually answers). Frames follow the shared frame
 policy — a 0.5 fps subset at half resolution — so a generator request carries
 a few small images instead of ten full-size ones at the current 1 FPS decode.
 Those images dominate the request's token cost, so the subsample is the lever
@@ -26,6 +28,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 from surrogate_rollout import config
+from surrogate_rollout import network_retry
 from surrogate_rollout import token_ledger
 from surrogate_rollout.optimization.openai_chat_model_profile import (
     adapt_chat_completions_body,
@@ -123,9 +126,36 @@ class OpenAIFreeFormInstructionGenerator:
         return sha256_text(dumps_canonical(self.configuration_identity))
 
     # ------------------------------ calls --------------------------------- #
-    def _complete(self, frames: Sequence[str], prompt: str) -> str:
+    def _post_once(
+        self, headers: Mapping[str, str], payload: Mapping[str, Any],
+    ) -> str:
+        """One vision request. Returns the completion text, possibly empty.
+
+        A transient provider status is raised as `TransientTransportError` so
+        `network_retry` repeats the identical request; every other non-200 is a
+        rejection of this request and fails immediately.
+        """
         import requests
 
+        response = requests.post(
+            f"{self.base_url}/chat/completions", headers=dict(headers),
+            json=dict(payload), timeout=self.timeout)
+        if response.status_code != 200:
+            detail = f"HTTP {response.status_code}: {response.text[:300]}"
+            if network_retry.is_transient_http_status(response.status_code):
+                raise network_retry.TransientTransportError(
+                    detail, retry_after_seconds=network_retry.parse_retry_after(
+                        response.headers.get("Retry-After")))
+            raise FreeFormGenerationError(detail)
+        data = response.json()
+        # Additive token accounting only (vision + text of this call). Recorded
+        # per answered request, so retried attempts that never reached the
+        # provider contribute nothing.
+        token_ledger.record(
+            "prompt_generator", self.model_id, data.get("usage"))
+        return (data["choices"][0]["message"]["content"] or "").strip()
+
+    def _complete(self, frames: Sequence[str], prompt: str) -> str:
         if not self.api_key:
             raise FreeFormGenerationError(
                 "the OpenAI free-form generator requires OPENAI_API_KEY")
@@ -161,17 +191,12 @@ class OpenAIFreeFormInstructionGenerator:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             try:
-                response = requests.post(
-                    f"{self.base_url}/chat/completions", headers=headers,
-                    json=payload, timeout=self.timeout)
-                if response.status_code != 200:
-                    raise FreeFormGenerationError(
-                        f"HTTP {response.status_code}: {response.text[:300]}")
-                data = response.json()
-                text = (data["choices"][0]["message"]["content"] or "").strip()
-                # Additive token accounting only (vision + text of this call).
-                token_ledger.record(
-                    "prompt_generator", self.model_id, data.get("usage"))
+                # The inner retry covers requests that never got an answer; this
+                # loop covers answers that came back unusable (an empty
+                # completion), which is a different failure and is charged for.
+                text = network_retry.retry_transient(
+                    lambda: self._post_once(headers, payload),
+                    description=f"{self.model_id} free-form generator request")
                 if text:
                     return text
                 last_error = FreeFormGenerationError("empty completion")

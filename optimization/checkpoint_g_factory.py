@@ -2,7 +2,10 @@
 
 Every provider/runtime value comes from the operator-supplied JSON file.  This
 module has no model, path, context-window, threshold, or worker defaults and
-performs no retry, repair, fallback, or automatic request splitting.
+performs no repair, fallback, or automatic request splitting.  The only retry is
+`network_retry`'s: a request that never reached the provider (DNS, connection
+reset, 429/5xx) is resent byte-identically.  It is not a second semantic call,
+so it neither changes a stage's output nor consumes a provider-call budget.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from surrogate_rollout import config
+from surrogate_rollout import network_retry
 from surrogate_rollout import token_ledger
 from surrogate_rollout.captioning.history_aware_baseline import (
     HistoryAwareBaselineCaptionViewBuilder,
@@ -82,7 +86,12 @@ def _real_identity(value: Any, name: str) -> str:
 
 
 class _OpenAITransport:
-    """One HTTP request per invocation; no retry, repair, or fallback."""
+    """One provider request per invocation; no repair or fallback.
+
+    "One request" is a semantic count: `network_retry` may resend the identical
+    body after a transient transport failure, which is why the budgeted subclass
+    below stays correct while a resolver outage passes.
+    """
 
     def __init__(self, *, endpoint: str, api_key: str, timeout_seconds: int):
         if not endpoint or not api_key or timeout_seconds <= 0:
@@ -92,19 +101,31 @@ class _OpenAITransport:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
 
+    def _read_once(self, request: urllib.request.Request) -> str:
+        try:
+            with urllib.request.urlopen(
+                    request, timeout=self.timeout_seconds) as response:
+                return response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            message = f"OpenAI API returned HTTP {exc.code}: {detail}"
+            if network_retry.is_transient_http_status(exc.code):
+                headers = getattr(exc, "headers", None)
+                raise network_retry.TransientTransportError(
+                    message,
+                    retry_after_seconds=network_retry.parse_retry_after(
+                        headers.get("Retry-After") if headers else None),
+                ) from exc
+            raise RuntimeError(message) from exc
+
     def request(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
         request = urllib.request.Request(
             self.endpoint, data=dumps_canonical(body).encode("utf-8"),
             headers={"Authorization": f"Bearer {self.api_key}",
                      "Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(
-                    request, timeout=self.timeout_seconds) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"OpenAI API returned HTTP {exc.code}: {detail}") from exc
+        raw = network_retry.retry_transient(
+            lambda: self._read_once(request),
+            description=f"{body.get('model')} optimizer request")
         value = json.loads(raw)
         if not isinstance(value, Mapping):
             raise TypeError("provider response envelope must be an object")

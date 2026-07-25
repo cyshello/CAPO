@@ -101,6 +101,19 @@ def _reasoning_effort(variable_name: str) -> str | None:
 INTERVENTION_QA_RETRY_ATTEMPTS = int(
     os.environ.get("SR_INTERVENTION_QA_RETRY_ATTEMPTS", "3"))
 
+# How long a single provider request may keep retrying a transient transport
+# failure (DNS, connection reset, 429/5xx) before the caller sees the error.
+# Fifteen minutes rides out a resolver or edge blip without letting a real
+# outage stall a run for an hour; a retried request is byte-identical to the
+# first attempt, so nothing about the run's identity or accounting changes.
+# See network_retry.py for the transient/permanent split.
+NETWORK_RETRY_DEADLINE_SECONDS = float(
+    os.environ.get("SR_NETWORK_RETRY_DEADLINE_SECONDS", "900"))
+NETWORK_RETRY_INITIAL_DELAY_SECONDS = float(
+    os.environ.get("SR_NETWORK_RETRY_INITIAL_DELAY_SECONDS", "2"))
+NETWORK_RETRY_MAXIMUM_DELAY_SECONDS = float(
+    os.environ.get("SR_NETWORK_RETRY_MAXIMUM_DELAY_SECONDS", "60"))
+
 # Structural compaction of the tool evidence in the feedback payload.
 COMPACT_TOOL_EVIDENCE = os.environ.get(
     "SR_COMPACT_TOOL_EVIDENCE", "0") not in ("0", "false", "False", "")
