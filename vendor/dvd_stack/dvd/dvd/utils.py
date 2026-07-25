@@ -34,7 +34,37 @@ _TRANSIENT_TRANSPORT_MARKERS = (
 )
 
 
+# Provider statuses that reject nothing about the request, so resending the
+# identical bytes is the repair. Added 2026-07-25 after the second run died on
+# one of them: OpenAI answered HTTP 500 "The server had an error processing your
+# request", whose text matches none of the markers above -- not "internal", not
+# "service unavailable" -- so the decorator printed it and returned None, and
+# the caption worker read that non-answer as a fatal failure.
+_TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503,
+                                          504, 529})
+# Wall-clock budget for one request's transient failures, shared with the
+# harness's own retry policy (surrogate_rollout/network_retry.py) so both paths
+# ride out an incident of the same length.
+_RETRY_DEADLINE_VARIABLE = "SR_NETWORK_RETRY_DEADLINE_SECONDS"
+_DEFAULT_RETRY_DEADLINE_SECONDS = 900.0
+_MAXIMUM_RETRY_DELAY_SECONDS = 60.0
+
+
+class TransientHTTPStatusError(Exception):
+    """A provider status that carries no verdict on the request itself."""
+
+
+def _retry_deadline_seconds() -> float:
+    try:
+        return float(os.environ.get(_RETRY_DEADLINE_VARIABLE, "").strip()
+                     or _DEFAULT_RETRY_DEADLINE_SECONDS)
+    except ValueError:
+        return _DEFAULT_RETRY_DEADLINE_SECONDS
+
+
 def _is_transient_transport_error(exc: BaseException) -> bool:
+    if isinstance(exc, TransientHTTPStatusError):
+        return True
     if isinstance(exc, (requests.exceptions.ConnectionError,
                         requests.exceptions.Timeout,
                         requests.exceptions.ChunkedEncodingError)):
@@ -56,8 +86,14 @@ def retry_with_exponential_backoff(
         # Initialize variables
         num_retries = 0
         delay = initial_delay
+        # A transport failure is bounded by wall clock, not by attempt count:
+        # eight doublings give up after four minutes, which is shorter than a
+        # provider incident and long enough to lose a whole run's work.
+        started = time.monotonic()
+        deadline = _retry_deadline_seconds()
 
-        # Loop until a successful response or max_retries is hit or an exception is raised
+        # Loop until a successful response, the retry budget is spent, or an
+        # exception is raised
         while True:
             try:
                 return func(*args, **kwargs)
@@ -70,14 +106,19 @@ def retry_with_exponential_backoff(
                     # Increment retries
                     num_retries += 1
 
-                    # Check if max retries has been reached
-                    if num_retries > max_retries:
-                        print("Max retries reached. Exiting.")
+                    elapsed = time.monotonic() - started
+                    if elapsed > deadline:
+                        print(f"Transient failures for {elapsed:.0f}s exceeded "
+                              f"the {deadline:.0f}s retry deadline. Exiting.")
                         return None
 
-                    # Increment the delay
-                    delay *= exponential_base * (1 + jitter * random.random())
-                    print(f"Retrying in {delay} seconds for {str(e)}...")
+                    # Increment the delay, capped so a long incident is retried
+                    # steadily instead of at hour-long intervals
+                    delay = min(delay * exponential_base
+                                * (1 + jitter * random.random()),
+                                _MAXIMUM_RETRY_DELAY_SECONDS)
+                    print(f"Retrying in {delay} seconds "
+                          f"(attempt {num_retries}) for {str(e)}...")
                     # Sleep for the delay
                     time.sleep(delay)
                 else:
@@ -169,7 +210,12 @@ def call_openai_model_with_tools(
   
     if response.status_code != 200:
         error_text = response.text
-        raise Exception(f"OpenAI API returned status {response.status_code}: {error_text}")  
+        detail = f"OpenAI API returned status {response.status_code}: {error_text}"
+        if response.status_code in _TRANSIENT_HTTP_STATUS_CODES:
+            # Resending the identical bytes is the repair; a rejection (400/401,
+            # unknown model) still fails on the first attempt.
+            raise TransientHTTPStatusError(detail)
+        raise Exception(detail)
       
     response_data = response.json()  
     
