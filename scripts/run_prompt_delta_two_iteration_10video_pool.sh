@@ -110,6 +110,36 @@ for ordinal in $(seq 1 "$ITERATION_COUNT"); do
     previous_csv="$(IFS=,; echo "${previous[*]}")"
   fi
 
+  # A finished iteration is read, not recomputed. Its artifacts are write-once
+  # and its input_identity records the worker GPUs it ran on, so re-entering it
+  # after the operator changed PROMPT_DELTA_WORKER_GPUS raises an
+  # immutable-artifact conflict instead of resuming (observed 2026-07-26 when a
+  # run moved from two GPUs to four). Replaying the completed iterations was
+  # only ever a no-op; skipping them makes that explicit and lets the GPU list
+  # change between iterations, which each iteration's identity records.
+  completed_result="$PROJECT_ROOT/runs/fresh_prompt_delta_iteration_${run_timestamp}_output/iteration_result.json"
+  completed_evidence="$PROJECT_ROOT/runs/fresh_prompt_delta_iteration_${run_timestamp}_evidence/fresh_evidence_manifest.json"
+  if [[ -f "$completed_result" ]] && jq -e '
+      .status == "no_update" or .status == "promoted" or .status == "rolled_back"
+    ' "$completed_result" >/dev/null; then
+    active_id="$(jq -r '.active_meta_prompt_id' "$completed_result")"
+    if [[ -z "$active_id" || "$active_id" == "null" ]]; then
+      echo "completed iteration result has no active meta-prompt id: $completed_result" >&2
+      exit 1
+    fi
+    CURRENT_PARENT="$STATE_ROOT/versions/${active_id}.json"
+    test -f "$CURRENT_PARENT"
+    COMPLETED_ITERATIONS+=("$run_timestamp")
+    echo "iteration $ordinal already complete ($run_timestamp, $(jq -r '.status' "$completed_result")); skipping" >&2
+    continue
+  fi
+  if [[ -f "$completed_evidence" ]] && [[ "$(jq -r '.status' "$completed_evidence")" == \
+        "no_eligible_proposal_evidence" ]]; then
+    COMPLETED_ITERATIONS+=("$run_timestamp")
+    echo "iteration $ordinal already complete ($run_timestamp, no_eligible_proposal_evidence); skipping" >&2
+    continue
+  fi
+
   FRESH_PROMPT_DELTA_MEASURE_PARENT="$([[ "$ordinal" -eq 1 ]] && echo true || echo false)" \
   FRESH_PROMPT_DELTA_TIMESTAMP="$run_timestamp" \
   FRESH_PROMPT_DELTA_WORKER_GPUS="$GPUS" \
