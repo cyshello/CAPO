@@ -28,12 +28,35 @@ from typing import Any, Mapping
 from surrogate_rollout.optimization import fresh_prompt_delta_evidence as _ev
 
 
+# A captions file carries the merged registries alongside the segments
+# (evaluation/full_rollout.py writes captions["subject_registry"]), and the rest
+# of the stack skips exactly these keys when it walks a captions mapping
+# (evaluation/dvd_qa.py, evaluation/selective_rollout.py, dvd_runner.py).
+NON_SEGMENT_CAPTION_KEYS = ("subject_registry", "character_registry")
+
+
 def _all_baseline_segments(baseline_video_manifest_path: str) -> tuple[str, ...]:
     baseline = _ev._read_json(baseline_video_manifest_path)
     captions = _ev._read_json(baseline["captions_path"])
     # segment_id is "<start>_<end>"; order by start time for a deterministic set.
-    return tuple(sorted(
-        captions.keys(), key=lambda segment_id: float(segment_id.split("_", 1)[0])))
+    # 2026-07-25: the registry key reached this sort the first time a
+    # full-recaption run got past the baseline phase, and float("subject") ended
+    # the run after four videos of captioning. An unknown non-segment key still
+    # raises: silently dropping one would shrink the recaption scope instead.
+    ordered: list[tuple[float, str]] = []
+    for segment_id in captions:
+        if segment_id in NON_SEGMENT_CAPTION_KEYS:
+            continue
+        try:
+            start = float(str(segment_id).split("_", 1)[0])
+        except ValueError as exc:
+            raise ValueError(
+                f"baseline captions hold an unrecognized key {segment_id!r} "
+                f"that is neither a '<start>_<end>' segment id nor one of "
+                f"{NON_SEGMENT_CAPTION_KEYS}: {baseline['captions_path']}"
+            ) from exc
+        ordered.append((start, segment_id))
+    return tuple(segment_id for _, segment_id in sorted(ordered))
 
 
 class FullRecaptionInterventionRunner(_ev.PromptDeltaInterventionRunner):
