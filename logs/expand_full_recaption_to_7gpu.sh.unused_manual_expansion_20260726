@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Wait for the LVBench static-meta run to finish, then move the full-recaption
+# run from 4 GPUs to 7.
+#
+# Why a watcher: the GPU list is part of the baseline input fingerprint, so the
+# switch is not a live resize -- the driver has to be stopped, the in-flight
+# iteration's evidence root set aside, and the driver relaunched on the new
+# list. Completed iterations are read and skipped (pool driver, 35cedcf), so
+# nothing already finished is recomputed, and the in-flight iteration replays
+# from the caption/generator caches, which carry no GPU in their keys.
+#
+# GPU 2 is left out: another user's process holds ~2 GB there. 0,1,3 come back
+# from LVBench; 4,5,6,7 are already ours.
+#
+# Acts only on a clean LVBench completion (all shards gone AND 1549 QA
+# recorded). If the shards disappear without completing, this logs and keeps
+# waiting -- taking those GPUs would block the relaunch that a crashed LVBench
+# needs.
+set -uo pipefail
+
+PROJECT_ROOT=/home/seungmin/youngseo/surrogate_rollout
+LVBENCH_OUTPUT=/home/seungmin/youngseo/baseline_AAAI2027/output_static_meta_5mini_minimal
+LAUNCHER="$PROJECT_ROOT/logs/resume_full_recaption_gpu57_20260725_080528.sh"
+WATCH_LOG="$PROJECT_ROOT/logs/expand_to_7gpu_watch.log"
+NEW_GPUS="0,1,3,4,5,6,7"
+EXPECTED_QA=1549
+POLL_SECONDS=120
+DEADLINE_SECONDS=$((12 * 3600))
+
+say() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$WATCH_LOG"; }
+
+lvbench_shards_alive() { pgrep -fc "run_static_meta_dvd_lvbench" 2>/dev/null || echo 0; }
+lvbench_qa_count() { find "$LVBENCH_OUTPUT/videos" -name result.json 2>/dev/null | wc -l; }
+driver_pgid() {
+  ps -eo pgid,cmd | grep '[r]un_full_recaption_evidence' | awk '{print $1}' | sort -u | head -1
+}
+
+say "watcher started; waiting for LVBench (expect $EXPECTED_QA QA), then $NEW_GPUS"
+started=$(date +%s)
+while true; do
+  alive="$(lvbench_shards_alive)"
+  qa="$(lvbench_qa_count)"
+  if [[ "$alive" -eq 0 ]]; then
+    if [[ "$qa" -ge "$EXPECTED_QA" ]]; then
+      say "LVBench complete: $qa QA, no shards alive -- expanding"
+      break
+    fi
+    say "LVBench shards gone at $qa/$EXPECTED_QA QA: NOT expanding (a crashed run needs its GPUs back). Waiting."
+  fi
+  if (( $(date +%s) - started > DEADLINE_SECONDS )); then
+    say "deadline reached without a clean LVBench completion; exiting without acting"
+    exit 0
+  fi
+  sleep "$POLL_SECONDS"
+done
+
+accuracy="$(find "$LVBENCH_OUTPUT/videos" -name result.json -exec jq -r '.score // empty' {} \; 2>/dev/null |
+  awk '{n++; s+=$1} END {if (n) printf "%.1f%% (n=%d)", 100*s/n, n}')"
+say "LVBench final accuracy: ${accuracy:-unknown}"
+
+PGID="$(driver_pgid)"
+if [[ -z "$PGID" ]]; then
+  say "full-recaption driver is not running; nothing to switch. Exiting."
+  exit 0
+fi
+
+# The in-flight iteration is the newest evidence root with no iteration result.
+INFLIGHT=""
+for root in $(ls -dt "$PROJECT_ROOT"/runs/fresh_prompt_delta_iteration_*_evidence 2>/dev/null); do
+  ts="$(basename "$root" | sed -E 's/fresh_prompt_delta_iteration_(.*)_evidence/\1/')"
+  if [[ ! -f "$PROJECT_ROOT/runs/fresh_prompt_delta_iteration_${ts}_output/iteration_result.json" ]]; then
+    INFLIGHT="$root"
+    break
+  fi
+done
+if [[ -z "$INFLIGHT" ]]; then
+  say "no in-flight iteration evidence root found; exiting without acting"
+  exit 0
+fi
+say "in-flight iteration: $(basename "$INFLIGHT") ($(find "$INFLIGHT" -path '*segment_state*' -name '*.json' | wc -l) segments, $(find "$INFLIGHT" -name video_complete.json | wc -l) videos complete)"
+
+say "stopping driver pgid $PGID"
+kill -TERM -"$PGID"; sleep 25; kill -KILL -"$PGID" 2>/dev/null; sleep 5
+if [[ -n "$(driver_pgid)" ]]; then
+  say "driver did not stop; aborting so nothing is half-switched"
+  exit 1
+fi
+
+QUARANTINE="${INFLIGHT}.gpu4_$(date +%Y%m%d_%H%M%S)"
+mv "$INFLIGHT" "$QUARANTINE" && say "quarantined $(basename "$QUARANTINE")"
+
+sed -i -E "s|^export PROMPT_DELTA_WORKER_GPUS=.*$|export PROMPT_DELTA_WORKER_GPUS=$NEW_GPUS|" "$LAUNCHER"
+say "launcher now: $(grep -E '^export PROMPT_DELTA_WORKER_GPUS=' "$LAUNCHER")"
+
+LOG="$PROJECT_ROOT/logs/full_recaption_gpu7_$(date -u +%Y%m%d_%H%M%S).log"
+setsid nohup bash "$LAUNCHER" > "$LOG" 2>&1 < /dev/null &
+say "relaunched on $NEW_GPUS; log $LOG"
+
+sleep 180
+WORKERS="$(ls "${INFLIGHT}/worker_logs" 2>/dev/null | tr '\n' ' ')"
+say "workers after restart: ${WORKERS:-none yet}"
+say "errors in new log: $(grep -icE 'Traceback|conflict|stale inputs' "$LOG")"
+say "watcher done"

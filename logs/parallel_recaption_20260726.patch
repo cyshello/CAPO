@@ -1,0 +1,44 @@
+diff --git a/full_recaption_opt/run_full_recaption_evidence.py b/full_recaption_opt/run_full_recaption_evidence.py
+index f37f26e..9f340a1 100755
+--- a/full_recaption_opt/run_full_recaption_evidence.py
++++ b/full_recaption_opt/run_full_recaption_evidence.py
+@@ -9,10 +9,16 @@ respect (LLM prompt generator, updater, captioner, DVD QA, cohort), so any
+ difference is attributable to selective-vs-full intervention alone.
+ 
+ Mechanism (one process-local rebind): swap
+-``PromptDeltaInterventionRunner`` -> ``FullRecaptionInterventionRunner`` on the
+-evidence entry. The OpenAI free-form prompt generator is left ACTIVE (this is the
+-meta path, not the static caption path), and the proposer stays localized so its
+-untruncated request does not overflow — only the recaption apply-scope grows.
++``PromptDeltaInterventionRunner`` -> ``ParallelFullRecaptionInterventionRunner``
++on the evidence entry. The OpenAI free-form prompt generator is left ACTIVE (this
++is the meta path, not the static caption path), and the proposer stays localized
++so its untruncated request does not overflow — only the recaption apply-scope
++grows.
++
++The runner is the full-recaption one with its caption loop fanned out across the
++already-running GPU pool; see ``parallel_intervention_runner``. Recaption scope
++and episode contents are unchanged — set
++``FULL_RECAPTION_MAX_IN_FLIGHT=1`` to get the sequential loop back.
+ 
+ Usage: identical CLI to scripts/run_fresh_prompt_delta_evidence.py (the meta
+ iteration shell invokes this when FRESH_PROMPT_DELTA_EVIDENCE_ENTRY points here).
+@@ -29,13 +35,16 @@ for _ancestor in (Path(__file__).resolve().parents[1],
+         sys.path.insert(0, str(_ancestor))
+ 
+ from surrogate_rollout.scripts import run_fresh_prompt_delta_evidence as evidence_entry
+-from full_recaption_opt.full_recaption_runner import FullRecaptionInterventionRunner
++from full_recaption_opt.parallel_intervention_runner import (
++    ParallelFullRecaptionInterventionRunner,
++)
+ 
+ 
+ def main(argv=None) -> int:
+     # Full recaption: apply the delta to every baseline segment. Nothing else is
+     # changed — the meta path's free-form generator and updater are untouched.
+-    evidence_entry.PromptDeltaInterventionRunner = FullRecaptionInterventionRunner
++    evidence_entry.PromptDeltaInterventionRunner = (
++        ParallelFullRecaptionInterventionRunner)
+     return evidence_entry.main(argv)
+ 
+ 
