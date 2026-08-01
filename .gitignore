@@ -13,3 +13,9 @@ vendor/dvd_stack/dvd/run_workspace/
 
 # Datasets are synced separately, never committed.
 data/
+
+# Local Hugging Face hub mirror (~5G). Re-downloaded, never committed.
+hub_data_kt/
+
+# Run logs. The launchers, patches and as-run snapshots beside them are kept.
+logs/*.log
